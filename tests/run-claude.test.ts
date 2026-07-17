@@ -363,7 +363,117 @@ describe("runClaude", () => {
     );
     finish(child);
     await promise;
-    expect(onToolUse).toHaveBeenCalledWith({ name: "Edit" });
+    expect(onToolUse).toHaveBeenCalledWith({
+      name: "Edit",
+      summary: "src/Button.tsx",
+      input: { file_path: "src/Button.tsx" },
+    });
+  });
+
+  it("summarizes each known tool by its most identifying input field", async () => {
+    const cases: Array<{
+      name: string;
+      input: Record<string, unknown>;
+      summary: string | undefined;
+    }> = [
+      { name: "Read", input: { file_path: "a.ts" }, summary: "a.ts" },
+      { name: "Bash", input: { command: "pnpm test" }, summary: "pnpm test" },
+      { name: "Grep", input: { pattern: "TODO" }, summary: "TODO" },
+      { name: "WebFetch", input: { url: "https://x.dev" }, summary: "https://x.dev" },
+      { name: "WebSearch", input: { query: "vitest" }, summary: "vitest" },
+      { name: "TodoWrite", input: { todos: [] }, summary: undefined },
+      {
+        name: "mcp__linear__create_issue",
+        input: { title: "Bug" },
+        summary: undefined,
+      },
+    ];
+
+    for (const c of cases) {
+      const child = makeFakeChild();
+      const onToolUse = vi.fn();
+      const promise = runClaude({
+        prompt: "x",
+        cwd: "/tmp",
+        spawnFn: (() => child) as never,
+        onToolUse,
+      });
+      child.stdout.write(
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [{ type: "tool_use", id: "t", name: c.name, input: c.input }],
+          },
+        }) + "\n",
+      );
+      finish(child);
+      await promise;
+      expect(onToolUse).toHaveBeenCalledWith({
+        name: c.name,
+        ...(c.summary !== undefined ? { summary: c.summary } : {}),
+        input: c.input,
+      });
+    }
+  });
+
+  it("collapses a multiline command into a one-line summary", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: "t",
+              name: "Bash",
+              input: { command: "pnpm build\n  && pnpm test" },
+            },
+          ],
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onToolUse).toHaveBeenCalledWith({
+      name: "Bash",
+      summary: "pnpm build && pnpm test",
+      input: { command: "pnpm build\n  && pnpm test" },
+    });
+  });
+
+  it("omits the summary when the input field is empty or whitespace", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", id: "t", name: "Bash", input: { command: "   " } },
+          ],
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onToolUse).toHaveBeenCalledWith({
+      name: "Bash",
+      input: { command: "   " },
+    });
   });
 
   it("handles split JSONL lines across multiple stdout chunks", async () => {

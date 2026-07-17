@@ -4,6 +4,16 @@ import { AbortError, TimeoutError } from "./errors.js";
 
 export const SIGTERM_GRACE_MS = 2000;
 
+/** Collapse a raw tool field into the one-line, non-empty form promised by a
+ * tool-use summary. Runs of whitespace (including newlines in a multiline
+ * command) become single spaces; an empty or whitespace-only value yields
+ * undefined so callers can omit the summary entirely. */
+export function normalizeSummary(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const summary = value.replace(/\s+/g, " ").trim();
+  return summary || undefined;
+}
+
 export function filterEnv(
   base: NodeJS.ProcessEnv,
   stripped: readonly string[],

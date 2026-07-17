@@ -4,6 +4,7 @@ import {
   createLineSplitter,
   filterEnv,
   isMissingExecutable,
+  normalizeSummary,
   signalProcessTree,
   watchLifecycle,
   writePrompt,
@@ -50,6 +51,33 @@ function toolName(item: Record<string, unknown>): string | null {
       return "TodoWrite";
     default:
       return null;
+  }
+}
+
+/** Pull a one-line target out of a Codex stream item: the command it ran, the
+ * file(s) it changed, or the query it searched. Returns undefined when the item
+ * carries nothing meaningful to summarize. */
+function summarizeCodexTool(item: Record<string, unknown>): string | undefined {
+  switch (item.type) {
+    case "command_execution":
+      return normalizeSummary(item.command);
+    case "web_search":
+      return normalizeSummary(item.query);
+    case "file_change": {
+      if (!Array.isArray(item.changes)) return undefined;
+      const paths = item.changes
+        .map((change) =>
+          change && typeof change === "object"
+            ? normalizeSummary((change as Record<string, unknown>).path)
+            : undefined,
+        )
+        .filter((path): path is string => path !== undefined);
+      if (paths.length === 1) return paths[0];
+      if (paths.length > 1) return `${paths.length} files`;
+      return undefined;
+    }
+    default:
+      return undefined;
   }
 }
 
@@ -152,7 +180,12 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
       const id = typeof item.id === "string" ? item.id : `${item.type}:${name}`;
       if (emittedTools.has(id)) return;
       emittedTools.add(id);
-      opts.onToolUse?.({ name });
+      const summary = summarizeCodexTool(item);
+      opts.onToolUse?.({
+        name,
+        ...(summary !== undefined ? { summary } : {}),
+        input: item,
+      });
     };
 
     const splitter = createLineSplitter(handleLine);

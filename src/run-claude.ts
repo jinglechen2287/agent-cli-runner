@@ -4,6 +4,7 @@ import {
   createLineSplitter,
   filterEnv,
   isMissingExecutable,
+  normalizeSummary,
   watchLifecycle,
   writePrompt,
 } from "./internal.js";
@@ -33,6 +34,42 @@ interface AssistantContentBlock {
   type: string;
   text?: string;
   name?: string;
+  input?: Record<string, unknown>;
+}
+
+/** Pull a one-line target out of a Claude tool's `input`: the file it touched,
+ * the command it ran, the pattern it searched, and so on. Returns undefined
+ * for tools whose input has no single meaningful target (e.g. TodoWrite) or
+ * for MCP tools, whose inputs are arbitrary. */
+function summarizeClaudeTool(
+  name: string,
+  input: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!input) return undefined;
+  const str = (key: string): string | undefined => normalizeSummary(input[key]);
+  switch (name) {
+    case "Read":
+    case "Edit":
+    case "MultiEdit":
+    case "Write":
+      return str("file_path");
+    case "NotebookEdit":
+      return str("notebook_path") ?? str("file_path");
+    case "Bash":
+      return str("command");
+    case "Grep":
+    case "Glob":
+      return str("pattern");
+    case "WebFetch":
+      return str("url");
+    case "WebSearch":
+      return str("query");
+    case "Task":
+    case "Agent":
+      return str("description");
+    default:
+      return undefined;
+  }
 }
 
 interface StreamLine {
@@ -116,7 +153,12 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
           if (block.type === "text" && typeof block.text === "string") {
             texts.push(block.text);
           } else if (block.type === "tool_use" && typeof block.name === "string") {
-            opts.onToolUse?.({ name: block.name });
+            const summary = summarizeClaudeTool(block.name, block.input);
+            opts.onToolUse?.({
+              name: block.name,
+              ...(summary !== undefined ? { summary } : {}),
+              ...(block.input ? { input: block.input } : {}),
+            });
           }
         }
         if (texts.length > 0) {

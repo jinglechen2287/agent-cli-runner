@@ -211,11 +211,63 @@ describe("runCodex", () => {
     expect(onSessionId).toHaveBeenCalledWith("thread-1");
     expect(onAssistantText).toHaveBeenCalledWith("Done");
     expect(onToolUse.mock.calls).toEqual([
-      [{ name: "Bash" }],
-      [{ name: "Edit" }],
-      [{ name: "TodoWrite" }],
+      [
+        {
+          name: "Bash",
+          summary: "pnpm test",
+          input: { id: "tool-1", type: "command_execution", command: "pnpm test" },
+        },
+      ],
+      [{ name: "Edit", input: { id: "tool-2", type: "file_change", changes: [] } }],
+      [{ name: "TodoWrite", input: { id: "tool-3", type: "todo_list", items: [] } }],
     ]);
     expect(result).toEqual({ text: "Done", exitCode: 0, sessionId: "thread-1" });
+  });
+
+  it("summarizes a single file change by its path and a search by its query", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+
+    const events = [
+      {
+        type: "item.completed",
+        item: {
+          id: "f1",
+          type: "file_change",
+          changes: [{ path: "src/app.ts", kind: "modified" }],
+        },
+      },
+      {
+        type: "item.completed",
+        item: { id: "s1", type: "web_search", query: "codex json schema" },
+      },
+    ];
+    for (const event of events) child.stdout.write(JSON.stringify(event) + "\n");
+    finish(child);
+    await promise;
+
+    expect(onToolUse.mock.calls.map(([info]) => info)).toEqual([
+      {
+        name: "Edit",
+        summary: "src/app.ts",
+        input: {
+          id: "f1",
+          type: "file_change",
+          changes: [{ path: "src/app.ts", kind: "modified" }],
+        },
+      },
+      {
+        name: "WebSearch",
+        summary: "codex json schema",
+        input: { id: "s1", type: "web_search", query: "codex json schema" },
+      },
+    ]);
   });
 
   it.each([

@@ -32,6 +32,11 @@ var CodexTurnError = class extends Error {
 import { spawn as nodeSpawn } from "child_process";
 import { StringDecoder } from "string_decoder";
 var SIGTERM_GRACE_MS = 2e3;
+function normalizeSummary(value) {
+  if (typeof value !== "string") return void 0;
+  const summary = value.replace(/\s+/g, " ").trim();
+  return summary || void 0;
+}
 function filterEnv(base, stripped) {
   const env = {};
   const normalize = (key) => process.platform === "win32" ? key.toUpperCase() : key;
@@ -153,6 +158,33 @@ var CLAUDE_STRIPPED_ENV_VARS = [
   "CLAUDE_CODE_ENTRYPOINT",
   "CLAUDE_CODE_SESSION_ACCESS_TOKEN"
 ];
+function summarizeClaudeTool(name, input) {
+  if (!input) return void 0;
+  const str = (key) => normalizeSummary(input[key]);
+  switch (name) {
+    case "Read":
+    case "Edit":
+    case "MultiEdit":
+    case "Write":
+      return str("file_path");
+    case "NotebookEdit":
+      return str("notebook_path") ?? str("file_path");
+    case "Bash":
+      return str("command");
+    case "Grep":
+    case "Glob":
+      return str("pattern");
+    case "WebFetch":
+      return str("url");
+    case "WebSearch":
+      return str("query");
+    case "Task":
+    case "Agent":
+      return str("description");
+    default:
+      return void 0;
+  }
+}
 async function runClaude(opts) {
   if (opts.newSessionId && opts.resumeSessionId) {
     throw new Error(
@@ -217,7 +249,12 @@ async function runClaude(opts) {
           if (block.type === "text" && typeof block.text === "string") {
             texts.push(block.text);
           } else if (block.type === "tool_use" && typeof block.name === "string") {
-            opts.onToolUse?.({ name: block.name });
+            const summary = summarizeClaudeTool(block.name, block.input);
+            opts.onToolUse?.({
+              name: block.name,
+              ...summary !== void 0 ? { summary } : {},
+              ...block.input ? { input: block.input } : {}
+            });
           }
         }
         if (texts.length > 0) {
@@ -280,6 +317,25 @@ function toolName(item) {
       return "TodoWrite";
     default:
       return null;
+  }
+}
+function summarizeCodexTool(item) {
+  switch (item.type) {
+    case "command_execution":
+      return normalizeSummary(item.command);
+    case "web_search":
+      return normalizeSummary(item.query);
+    case "file_change": {
+      if (!Array.isArray(item.changes)) return void 0;
+      const paths = item.changes.map(
+        (change) => change && typeof change === "object" ? normalizeSummary(change.path) : void 0
+      ).filter((path) => path !== void 0);
+      if (paths.length === 1) return paths[0];
+      if (paths.length > 1) return `${paths.length} files`;
+      return void 0;
+    }
+    default:
+      return void 0;
   }
 }
 function fatalEventError(event) {
@@ -367,7 +423,12 @@ async function runCodex(opts) {
       const id = typeof item.id === "string" ? item.id : `${item.type}:${name}`;
       if (emittedTools.has(id)) return;
       emittedTools.add(id);
-      opts.onToolUse?.({ name });
+      const summary = summarizeCodexTool(item);
+      opts.onToolUse?.({
+        name,
+        ...summary !== void 0 ? { summary } : {},
+        input: item
+      });
     };
     const splitter = createLineSplitter(handleLine);
     child.stdout?.on("data", (chunk) => splitter.push(chunk));

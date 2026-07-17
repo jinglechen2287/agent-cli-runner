@@ -13,4 +13,5 @@ export type {
   CommonRunOptions,
   RunResult,
   SpawnFn,
+  ToolUseInfo,
 } from "./types.js";

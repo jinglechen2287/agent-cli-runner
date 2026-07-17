@@ -2,15 +2,26 @@ import { SpawnOptions, ChildProcess } from 'node:child_process';
 
 /** Injectable spawn primitive so hosts and tests can substitute their own. */
 type SpawnFn = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
+/** What the agent did when it invoked a tool. `name` is always present; the
+ * richer fields are best-effort and provider-normalized. */
+interface ToolUseInfo {
+    /** Provider-normalized tool name (e.g. "Edit", "Bash", or an MCP tool id). */
+    name: string;
+    /** One-line, human-readable summary of what the tool acted on — a file
+     * path, shell command, search pattern, URL, or query. Omitted when the CLI
+     * reported nothing meaningful to summarize. */
+    summary?: string;
+    /** Best-effort raw tool input as reported by the CLI (the Claude tool_use
+     * `input`, or the Codex stream item), when available. */
+    input?: Record<string, unknown>;
+}
 interface AgentCallbacks {
     /** Fired once with the CLI's session/thread id as soon as it is known. */
     onSessionId?: (id: string) => void;
     /** Fired for each completed assistant message. */
     onAssistantText?: (text: string) => void;
     /** Fired when the agent invokes a tool (deduplicated per tool invocation). */
-    onToolUse?: (info: {
-        name: string;
-    }) => void;
+    onToolUse?: (info: ToolUseInfo) => void;
     /** Raw stderr chunks from the CLI process. */
     onStderr?: (chunk: string) => void;
 }
@@ -95,4 +106,4 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, CodexTurnError, type CommonRunOptions, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, CodexTurnError, type CommonRunOptions, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type ToolUseInfo, runClaude, runCodex };
