@@ -1,0 +1,45 @@
+{
+  "name": "agent-cli-runner",
+  "version": "0.1.0",
+  "description": "Spawn and stream the Claude Code and Codex CLIs from Node or Bun: session resume, JSONL event parsing, abort/timeout handling.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jinglechen2287/agent-cli-runner.git"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "codex",
+    "cli",
+    "agent"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
