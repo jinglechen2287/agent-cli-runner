@@ -233,6 +233,23 @@ function summarizeClaudeTool(name, input) {
       return void 0;
   }
 }
+function claudeTodoPlanItems(name, input) {
+  if (name !== "TodoWrite" || !input || !Array.isArray(input.todos)) return void 0;
+  const items = [];
+  for (const raw of input.todos) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return void 0;
+    const record = raw;
+    const text = normalizeSummary(record.content) ?? normalizeSummary(record.activeForm);
+    const status = normalizeSummary(record.status)?.toLowerCase().replace(/\s+/g, "_");
+    if (!text || !status) return void 0;
+    items.push({ text, status });
+  }
+  return items.length > 0 ? items : void 0;
+}
+function planCompletionSummary(planItems) {
+  const completed = planItems.filter((item) => item.status === "completed").length;
+  return `${completed}/${planItems.length} steps completed`;
+}
 function toClaudeUsage(usage, model, contextWindow) {
   const input = toTokenCount(usage.input_tokens);
   const cacheRead = toTokenCount(usage.cache_read_input_tokens);
@@ -337,12 +354,14 @@ async function runClaude(opts) {
           if (block.type === "text" && typeof block.text === "string") {
             texts.push(block.text);
           } else if (block.type === "tool_use" && typeof block.name === "string") {
-            const summary = summarizeClaudeTool(block.name, block.input);
+            const planItems = claudeTodoPlanItems(block.name, block.input);
+            const summary = planItems ? planCompletionSummary(planItems) : summarizeClaudeTool(block.name, block.input);
             opts.onToolUse?.({
               ...typeof block.id === "string" ? { callId: block.id } : {},
               name: block.name,
               ...summary !== void 0 ? { summary } : {},
-              ...block.input ? { input: block.input } : {}
+              ...block.input ? { input: block.input } : {},
+              ...planItems ? { planItems } : {}
             });
           }
         }

@@ -434,6 +434,73 @@ describe("runClaude", () => {
     }
   });
 
+  it("normalizes Claude TodoWrite todos into a plan snapshot", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: "t",
+              name: "TodoWrite",
+              input: {
+                todos: [
+                  { content: "Map plumbing", status: "completed", activeForm: "Mapping" },
+                  { content: "Wire endpoint", status: "in_progress", activeForm: "Wiring" },
+                  { content: "Verify", status: "pending", activeForm: "Verifying" },
+                ],
+              },
+            },
+          ],
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onToolUse).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "TodoWrite",
+        summary: "1/3 steps completed",
+        planItems: [
+          { text: "Map plumbing", status: "completed" },
+          { text: "Wire endpoint", status: "in_progress" },
+          { text: "Verify", status: "pending" },
+        ],
+      }),
+    );
+  });
+
+  it("leaves an empty TodoWrite without a plan snapshot", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", id: "t", name: "TodoWrite", input: { todos: [] } }],
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onToolUse).toHaveBeenCalledWith({ callId: "t", name: "TodoWrite", input: { todos: [] } });
+  });
+
   it("collapses a multiline command into a one-line summary", async () => {
     const child = makeFakeChild();
     const onToolUse = vi.fn();

@@ -10,7 +10,7 @@ import {
   watchLifecycle,
   writePrompt,
 } from "./internal.js";
-import type { CommonRunOptions, RunResult } from "./types.js";
+import type { CommonRunOptions, RunResult, ToolPlanItem } from "./types.js";
 import { contextWindowForModel, type TokenUsage } from "./usage.js";
 
 /** Nesting-guard variables the Claude CLI uses to refuse running inside
@@ -91,6 +91,33 @@ function summarizeClaudeTool(
     default:
       return undefined;
   }
+}
+
+/** Normalize Claude's TodoWrite `todos` array into the shared plan-item shape,
+ * mirroring the Codex plan snapshot so both providers render the same
+ * checklist. A malformed entry invalidates the whole list so consumers never
+ * present a misleading partial plan. */
+function claudeTodoPlanItems(
+  name: string,
+  input: Record<string, unknown> | undefined,
+): ToolPlanItem[] | undefined {
+  if (name !== "TodoWrite" || !input || !Array.isArray(input.todos)) return undefined;
+  const items: ToolPlanItem[] = [];
+  for (const raw of input.todos) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const record = raw as Record<string, unknown>;
+    const text = normalizeSummary(record.content) ?? normalizeSummary(record.activeForm);
+    const status = normalizeSummary(record.status)?.toLowerCase().replace(/\s+/g, "_");
+    if (!text || !status) return undefined;
+    items.push({ text, status });
+  }
+  return items.length > 0 ? items : undefined;
+}
+
+/** "N/M steps completed" — the same plan summary Codex reports. */
+function planCompletionSummary(planItems: ToolPlanItem[]): string {
+  const completed = planItems.filter((item) => item.status === "completed").length;
+  return `${completed}/${planItems.length} steps completed`;
 }
 
 /** The `usage` block on a Claude `assistant` message and the `result` event.
@@ -256,12 +283,16 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
           if (block.type === "text" && typeof block.text === "string") {
             texts.push(block.text);
           } else if (block.type === "tool_use" && typeof block.name === "string") {
-            const summary = summarizeClaudeTool(block.name, block.input);
+            const planItems = claudeTodoPlanItems(block.name, block.input);
+            const summary = planItems
+              ? planCompletionSummary(planItems)
+              : summarizeClaudeTool(block.name, block.input);
             opts.onToolUse?.({
               ...(typeof block.id === "string" ? { callId: block.id } : {}),
               name: block.name,
               ...(summary !== undefined ? { summary } : {}),
               ...(block.input ? { input: block.input } : {}),
+              ...(planItems ? { planItems } : {}),
             });
           }
         }
