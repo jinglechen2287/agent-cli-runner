@@ -64,6 +64,8 @@ type SpawnFn = (command: string, args: readonly string[], options: SpawnOptions)
 /** What the agent did when it invoked a tool. `name` is always present; the
  * richer fields are best-effort and provider-normalized. */
 interface ToolUseInfo {
+    /** Provider-reported id that ties this invocation to its eventual result. */
+    callId?: string;
     /** Provider-normalized tool name (e.g. "Edit", "Bash", or an MCP tool id). */
     name: string;
     /** One-line, human-readable summary of what the tool acted on — a file
@@ -74,6 +76,14 @@ interface ToolUseInfo {
      * `input`, or the Codex stream item), when available. */
     input?: Record<string, unknown>;
 }
+/** A completed tool result as reported by the provider. Hosts should treat
+ * `content` as opaque unless they recognize the corresponding tool. */
+interface ToolResultInfo {
+    /** Matches {@link ToolUseInfo.callId}. */
+    callId: string;
+    content: unknown;
+    isError?: boolean;
+}
 interface AgentCallbacks {
     /** Fired once with the CLI's session/thread id as soon as it is known. */
     onSessionId?: (id: string) => void;
@@ -81,6 +91,8 @@ interface AgentCallbacks {
     onAssistantText?: (text: string) => void;
     /** Fired when the agent invokes a tool (deduplicated per tool invocation). */
     onToolUse?: (info: ToolUseInfo) => void;
+    /** Fired when the provider reports the result for a tool invocation. */
+    onToolResult?: (info: ToolResultInfo) => void;
     /** Raw stderr chunks from the CLI process. */
     onStderr?: (chunk: string) => void;
     /** Fired with a normalized context-usage snapshot whenever the CLI reports
@@ -182,4 +194,4 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, CodexTurnError, type CommonRunOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolUseInfo, contextWindowForModel, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, CodexTurnError, type CommonRunOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, runClaude, runCodex };

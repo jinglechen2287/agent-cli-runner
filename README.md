@@ -28,6 +28,7 @@ const first = await runClaude({
   appendSystemPrompt: "You are editing a running web app.",
   onAssistantText: (text) => console.log(text),
   onToolUse: ({ name }) => console.log(`tool: ${name}`),
+  onToolResult: ({ callId }) => console.log(`tool result: ${callId}`),
 });
 
 // Follow-up turn: resume it.
@@ -68,7 +69,7 @@ interface RunResult {
 | `timeoutMs` | Optional wall-clock limit; same kill path, rejects `TimeoutError`. No timeout by default. |
 | `env` | Base child environment (default `process.env`). Nesting-guard variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ACCESS_TOKEN` for Claude; `CODEX_THREAD_ID` for Codex) are always stripped. |
 | `spawnFn` | Injectable spawn primitive for tests. |
-| `onSessionId`, `onAssistantText`, `onToolUse`, `onStderr` | Streaming callbacks. Codex tool items are mapped to Claude-style tool names (`command_execution` → `Bash`, `file_change` → `Edit`, …). |
+| `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onStderr` | Streaming callbacks. Claude tool uses and results share a provider call ID so hosts can correlate them. Codex tool items are mapped to Claude-style tool names (`command_execution` → `Bash`, `file_change` → `Edit`, …). |
 
 ### Claude-specific
 

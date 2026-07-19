@@ -11,6 +11,8 @@ export type SpawnFn = (
 /** What the agent did when it invoked a tool. `name` is always present; the
  * richer fields are best-effort and provider-normalized. */
 export interface ToolUseInfo {
+  /** Provider-reported id that ties this invocation to its eventual result. */
+  callId?: string;
   /** Provider-normalized tool name (e.g. "Edit", "Bash", or an MCP tool id). */
   name: string;
   /** One-line, human-readable summary of what the tool acted on — a file
@@ -22,6 +24,15 @@ export interface ToolUseInfo {
   input?: Record<string, unknown>;
 }
 
+/** A completed tool result as reported by the provider. Hosts should treat
+ * `content` as opaque unless they recognize the corresponding tool. */
+export interface ToolResultInfo {
+  /** Matches {@link ToolUseInfo.callId}. */
+  callId: string;
+  content: unknown;
+  isError?: boolean;
+}
+
 export interface AgentCallbacks {
   /** Fired once with the CLI's session/thread id as soon as it is known. */
   onSessionId?: (id: string) => void;
@@ -29,6 +40,8 @@ export interface AgentCallbacks {
   onAssistantText?: (text: string) => void;
   /** Fired when the agent invokes a tool (deduplicated per tool invocation). */
   onToolUse?: (info: ToolUseInfo) => void;
+  /** Fired when the provider reports the result for a tool invocation. */
+  onToolResult?: (info: ToolResultInfo) => void;
   /** Raw stderr chunks from the CLI process. */
   onStderr?: (chunk: string) => void;
   /** Fired with a normalized context-usage snapshot whenever the CLI reports

@@ -33,11 +33,15 @@ export interface RunClaudeOptions extends CommonRunOptions {
   resumeSessionId?: string;
 }
 
-interface AssistantContentBlock {
+interface ClaudeContentBlock {
   type: string;
   text?: string;
+  id?: string;
   name?: string;
   input?: Record<string, unknown>;
+  tool_use_id?: string;
+  content?: unknown;
+  is_error?: boolean;
 }
 
 /** Pull a one-line target out of a Claude tool's `input`: the file it touched,
@@ -70,6 +74,14 @@ function summarizeClaudeTool(
     case "Task":
     case "Agent":
       return str("description");
+    case "TaskCreate":
+      return str("subject");
+    case "TaskUpdate": {
+      const taskId = str("taskId");
+      const status = str("status")?.replace(/_/g, " ");
+      if (taskId && status) return `Task #${taskId} · ${status}`;
+      return taskId ? `Task #${taskId}` : status;
+    }
     default:
       return undefined;
   }
@@ -102,7 +114,7 @@ interface StreamLine {
   subtype?: string;
   session_id?: string;
   result?: string;
-  message?: { content?: AssistantContentBlock[]; usage?: ClaudeUsage; model?: string };
+  message?: { content?: ClaudeContentBlock[]; usage?: ClaudeUsage; model?: string };
   usage?: ClaudeUsage;
   modelUsage?: Record<string, ClaudeModelUsage>;
 }
@@ -240,6 +252,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
           } else if (block.type === "tool_use" && typeof block.name === "string") {
             const summary = summarizeClaudeTool(block.name, block.input);
             opts.onToolUse?.({
+              ...(typeof block.id === "string" ? { callId: block.id } : {}),
               name: block.name,
               ...(summary !== undefined ? { summary } : {}),
               ...(block.input ? { input: block.input } : {}),
@@ -263,6 +276,19 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
           emitUsage(
             toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model)),
           );
+        }
+        return;
+      }
+      if (parsed.type === "user" && parsed.message?.content) {
+        for (const block of parsed.message.content) {
+          if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
+            continue;
+          }
+          opts.onToolResult?.({
+            callId: block.tool_use_id,
+            content: block.content,
+            ...(typeof block.is_error === "boolean" ? { isError: block.is_error } : {}),
+          });
         }
         return;
       }

@@ -364,6 +364,7 @@ describe("runClaude", () => {
     finish(child);
     await promise;
     expect(onToolUse).toHaveBeenCalledWith({
+      callId: "t1",
       name: "Edit",
       summary: "src/Button.tsx",
       input: { file_path: "src/Button.tsx" },
@@ -381,6 +382,16 @@ describe("runClaude", () => {
       { name: "Grep", input: { pattern: "TODO" }, summary: "TODO" },
       { name: "WebFetch", input: { url: "https://x.dev" }, summary: "https://x.dev" },
       { name: "WebSearch", input: { query: "vitest" }, summary: "vitest" },
+      {
+        name: "TaskCreate",
+        input: { subject: "Ship task indicators" },
+        summary: "Ship task indicators",
+      },
+      {
+        name: "TaskUpdate",
+        input: { taskId: "12", status: "in_progress" },
+        summary: "Task #12 · in progress",
+      },
       { name: "TodoWrite", input: { todos: [] }, summary: undefined },
       {
         name: "mcp__linear__create_issue",
@@ -409,6 +420,7 @@ describe("runClaude", () => {
       finish(child);
       await promise;
       expect(onToolUse).toHaveBeenCalledWith({
+        callId: "t",
         name: c.name,
         ...(c.summary !== undefined ? { summary: c.summary } : {}),
         input: c.input,
@@ -443,6 +455,7 @@ describe("runClaude", () => {
     finish(child);
     await promise;
     expect(onToolUse).toHaveBeenCalledWith({
+      callId: "t",
       name: "Bash",
       summary: "pnpm build && pnpm test",
       input: { command: "pnpm build\n  && pnpm test" },
@@ -471,8 +484,42 @@ describe("runClaude", () => {
     finish(child);
     await promise;
     expect(onToolUse).toHaveBeenCalledWith({
+      callId: "t",
       name: "Bash",
       input: { command: "   " },
+    });
+  });
+
+  it("emits Claude tool results with their matching call id", async () => {
+    const child = makeFakeChild();
+    const onToolResult = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolResult,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "user",
+        message: {
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "task-create-1",
+              content: "Task #7 created successfully: Ship task indicators",
+              is_error: false,
+            },
+          ],
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onToolResult).toHaveBeenCalledWith({
+      callId: "task-create-1",
+      content: "Task #7 created successfully: Ship task indicators",
+      isError: false,
     });
   });
 

@@ -215,6 +215,14 @@ function summarizeClaudeTool(name, input) {
     case "Task":
     case "Agent":
       return str("description");
+    case "TaskCreate":
+      return str("subject");
+    case "TaskUpdate": {
+      const taskId = str("taskId");
+      const status = str("status")?.replace(/_/g, " ");
+      if (taskId && status) return `Task #${taskId} \xB7 ${status}`;
+      return taskId ? `Task #${taskId}` : status;
+    }
     default:
       return void 0;
   }
@@ -325,6 +333,7 @@ async function runClaude(opts) {
           } else if (block.type === "tool_use" && typeof block.name === "string") {
             const summary = summarizeClaudeTool(block.name, block.input);
             opts.onToolUse?.({
+              ...typeof block.id === "string" ? { callId: block.id } : {},
               name: block.name,
               ...summary !== void 0 ? { summary } : {},
               ...block.input ? { input: block.input } : {}
@@ -343,6 +352,19 @@ async function runClaude(opts) {
           emitUsage(
             toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model))
           );
+        }
+        return;
+      }
+      if (parsed.type === "user" && parsed.message?.content) {
+        for (const block of parsed.message.content) {
+          if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
+            continue;
+          }
+          opts.onToolResult?.({
+            callId: block.tool_use_id,
+            content: block.content,
+            ...typeof block.is_error === "boolean" ? { isError: block.is_error } : {}
+          });
         }
         return;
       }
