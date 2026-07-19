@@ -461,6 +461,68 @@ describe("runCodex", () => {
     ]);
   });
 
+  it("resolves a web_search query nested under action, exposing it on the input", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+
+    child.stdout.write(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          id: "s2",
+          type: "web_search",
+          action: {
+            type: "search",
+            query: "figma monthly active users 2025",
+            queries: ["figma monthly active users 2025", "figma s-1 mau"],
+          },
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+
+    const [info] = onToolUse.mock.calls.at(-1)!;
+    expect(info.name).toBe("WebSearch");
+    expect(info.summary).toBe("figma monthly active users 2025");
+    // toolCallDetails reads input.query, so it must be surfaced there too.
+    expect((info.input as { query?: string }).query).toBe("figma monthly active users 2025");
+  });
+
+  it("falls back to the first of action.queries when no single query is set", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+
+    child.stdout.write(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          id: "s3",
+          type: "web_search",
+          action: { type: "search", queries: ["first query", "second query"] },
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+
+    const [info] = onToolUse.mock.calls.at(-1)!;
+    expect(info.summary).toBe("first query");
+    expect((info.input as { query?: string }).query).toBe("first query");
+  });
+
   it("normalizes current todo_list and legacy plan_update items", async () => {
     const child = makeFakeChild();
     const onToolUse = vi.fn();

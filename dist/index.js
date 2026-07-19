@@ -605,12 +605,32 @@ function codexPlanItems(item) {
   }
   return items.length > 0 ? items : void 0;
 }
+function codexWebSearchQuery(item) {
+  const direct = normalizeSummary(item.query);
+  if (direct) return direct;
+  const action = item.action;
+  if (!action || typeof action !== "object" || Array.isArray(action)) return void 0;
+  const record = action;
+  const query = normalizeSummary(record.query);
+  if (query) return query;
+  if (Array.isArray(record.queries)) {
+    for (const candidate of record.queries) {
+      const normalized = normalizeSummary(candidate);
+      if (normalized) return normalized;
+    }
+  }
+  return void 0;
+}
+function codexToolInput(item) {
+  if (item.type !== "web_search") return item;
+  return { ...item, query: codexWebSearchQuery(item) };
+}
 function summarizeCodexTool(item, planItems) {
   switch (item.type) {
     case "command_execution":
       return normalizeSummary(item.command);
     case "web_search":
-      return normalizeSummary(item.query);
+      return codexWebSearchQuery(item);
     case "file_change": {
       if (!Array.isArray(item.changes)) return void 0;
       const paths = item.changes.map(
@@ -731,7 +751,7 @@ async function runCodex(opts) {
         name,
         ...summary !== void 0 ? { summary } : {},
         ...planItems !== void 0 ? { planItems } : {},
-        input: item
+        input: codexToolInput(item)
       });
     };
     const splitter = createLineSplitter(handleLine);

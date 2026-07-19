@@ -255,6 +255,34 @@ function codexPlanItems(item: Record<string, unknown>): ToolPlanItem[] | undefin
   return items.length > 0 ? items : undefined;
 }
 
+/** Codex nests a web_search's query under `action.query` (with `action.queries`
+ * for multi-query searches); older/flat items put it directly on `query`.
+ * Resolve whichever is present so the query survives into the transcript. */
+function codexWebSearchQuery(item: Record<string, unknown>): string | undefined {
+  const direct = normalizeSummary(item.query);
+  if (direct) return direct;
+  const action = item.action;
+  if (!action || typeof action !== "object" || Array.isArray(action)) return undefined;
+  const record = action as Record<string, unknown>;
+  const query = normalizeSummary(record.query);
+  if (query) return query;
+  if (Array.isArray(record.queries)) {
+    for (const candidate of record.queries) {
+      const normalized = normalizeSummary(candidate);
+      if (normalized) return normalized;
+    }
+  }
+  return undefined;
+}
+
+/** The raw stream item to retain as the tool's `input`. web_search hides its
+ * query under `action`, so lift it to the top level where `toolCallDetails`
+ * (which reads `input.query`) can find it. */
+function codexToolInput(item: Record<string, unknown>): Record<string, unknown> {
+  if (item.type !== "web_search") return item;
+  return { ...item, query: codexWebSearchQuery(item) };
+}
+
 /** Pull a one-line target or plan completion count out of a Codex stream item.
  * Returns undefined when the item carries nothing meaningful to summarize. */
 function summarizeCodexTool(
@@ -265,7 +293,7 @@ function summarizeCodexTool(
     case "command_execution":
       return normalizeSummary(item.command);
     case "web_search":
-      return normalizeSummary(item.query);
+      return codexWebSearchQuery(item);
     case "file_change": {
       if (!Array.isArray(item.changes)) return undefined;
       const paths = item.changes
@@ -408,7 +436,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
         name,
         ...(summary !== undefined ? { summary } : {}),
         ...(planItems !== undefined ? { planItems } : {}),
-        input: item,
+        input: codexToolInput(item),
       });
     };
 
