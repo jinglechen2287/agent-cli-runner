@@ -22,6 +22,15 @@ export function toTokenCount(value: unknown): number {
     : 0;
 }
 
+/** Coerce a CLI-reported context-window size into a positive integer, or
+ * undefined when missing or malformed — callers fall back to the model-id
+ * family rules instead of trusting a bogus wire value. */
+export function toContextWindow(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
 export function filterEnv(
   base: NodeJS.ProcessEnv,
   stripped: readonly string[],

@@ -33,8 +33,9 @@ export interface AgentCallbacks {
   onStderr?: (chunk: string) => void;
   /** Fired with a normalized context-usage snapshot whenever the CLI reports
    * token counts. Claude fires it per assistant message (live) and once more
-   * with authoritative window data at the end; Codex fires it once when the
-   * turn completes. Each call supersedes the last. */
+   * at the end with the authoritative window merged into the last snapshot;
+   * Codex fires it once when the turn completes, with turn-cumulative counts
+   * (see {@link TokenUsage}). Each call supersedes the last. */
   onUsage?: (usage: TokenUsage) => void;
 }
 

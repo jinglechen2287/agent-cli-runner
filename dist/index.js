@@ -40,6 +40,9 @@ function normalizeSummary(value) {
 function toTokenCount(value) {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
 }
+function toContextWindow(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : void 0;
+}
 function filterEnv(base, stripped) {
   const env = {};
   const normalize = (key) => process.platform === "win32" ? key.toUpperCase() : key;
@@ -239,13 +242,15 @@ function pickPrimaryModel(modelUsage, preferred) {
   if (preferred) {
     const base = baseModelId(preferred);
     const match = entries.find(([key]) => baseModelId(key) === base);
-    if (match) return { model: match[0], contextWindow: match[1].contextWindow };
+    if (match) return { model: match[0], contextWindow: toContextWindow(match[1].contextWindow) };
   }
   let best = entries[0];
   for (const entry of entries) {
-    if ((entry[1].contextWindow ?? 0) > (best[1].contextWindow ?? 0)) best = entry;
+    if ((toContextWindow(entry[1].contextWindow) ?? 0) > (toContextWindow(best[1].contextWindow) ?? 0)) {
+      best = entry;
+    }
   }
-  return { model: best[0], contextWindow: best[1].contextWindow };
+  return { model: best[0], contextWindow: toContextWindow(best[1].contextWindow) };
 }
 async function runClaude(opts) {
   if (opts.newSessionId && opts.resumeSessionId) {
@@ -276,6 +281,7 @@ async function runClaude(opts) {
     let lastAssistantText;
     let resultText;
     let lastAssistantModel;
+    let lastMessageUsage;
     let lastUsage;
     const emitUsage = (usage) => {
       lastUsage = usage;
@@ -333,6 +339,7 @@ async function runClaude(opts) {
         const model = parsed.message.model;
         if (model) lastAssistantModel = model;
         if (parsed.message.usage) {
+          lastMessageUsage = parsed.message.usage;
           emitUsage(
             toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model))
           );
@@ -342,11 +349,12 @@ async function runClaude(opts) {
       if (parsed.type === "result") {
         if (parsed.session_id) emitSessionId(parsed.session_id);
         if (typeof parsed.result === "string") resultText = parsed.result;
-        if (parsed.usage) {
+        const occupancy = lastMessageUsage ?? parsed.usage;
+        if (occupancy) {
           const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
           const model = primary?.model ?? lastAssistantModel;
           const contextWindow = primary?.contextWindow ?? contextWindowForModel(model);
-          emitUsage(toClaudeUsage(parsed.usage, model, contextWindow));
+          emitUsage(toClaudeUsage(occupancy, model, contextWindow));
         }
       }
     };
@@ -499,6 +507,8 @@ async function runCodex(opts) {
         const input = toTokenCount(event.usage.input_tokens);
         const cached = toTokenCount(event.usage.cached_input_tokens);
         const usage = {
+          // Turn-cumulative, the best signal Codex exec exposes: an upper
+          // bound on occupancy that is exact only for single-request turns.
           contextTokens: input,
           inputTokens: Math.max(0, input - cached),
           cachedInputTokens: cached,

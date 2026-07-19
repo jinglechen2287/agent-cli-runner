@@ -720,7 +720,7 @@ describe("runClaude", () => {
     finish(child);
     const result = await promise;
     const finalUsage = {
-      contextTokens: 2 + 15099 + 6490,
+      contextTokens: 2 + 15099,
       inputTokens: 2,
       cachedInputTokens: 15099,
       outputTokens: 6,
@@ -729,6 +729,106 @@ describe("runClaude", () => {
     };
     expect(onUsage).toHaveBeenLastCalledWith(finalUsage);
     expect(result.usage).toEqual(finalUsage);
+  });
+
+  it("keeps the last per-message occupancy at result instead of the turn's cumulative totals", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+    // A two-request turn. The result event's usage sums both requests
+    // (10+8 input, 4780+280 cache writes, 17418+22198 cache reads), so it does
+    // NOT describe context occupancy — the last message's usage does.
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-opus-4-8",
+          content: [{ type: "tool_use", id: "t", name: "Bash", input: { command: "ls" } }],
+          usage: {
+            input_tokens: 10,
+            cache_creation_input_tokens: 4780,
+            cache_read_input_tokens: 17418,
+            output_tokens: 90,
+          },
+        },
+      }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-opus-4-8",
+          content: [{ type: "text", text: "done" }],
+          usage: {
+            input_tokens: 8,
+            cache_creation_input_tokens: 280,
+            cache_read_input_tokens: 22198,
+            output_tokens: 195,
+          },
+        },
+      }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "result",
+        result: "done",
+        usage: {
+          input_tokens: 18,
+          cache_creation_input_tokens: 5060,
+          cache_read_input_tokens: 39616,
+          output_tokens: 285,
+        },
+        modelUsage: { "claude-opus-4-8[1m]": { contextWindow: 1_000_000 } },
+      }) + "\n",
+    );
+    finish(child);
+    const result = await promise;
+    expect(result.usage).toEqual({
+      contextTokens: 8 + 280 + 22198,
+      inputTokens: 8,
+      cachedInputTokens: 22198,
+      outputTokens: 195,
+      model: "claude-opus-4-8[1m]",
+      contextWindow: 1_000_000,
+    });
+  });
+
+  it("ignores a malformed modelUsage contextWindow and falls back to the family rule", async () => {
+    const child = makeFakeChild();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-opus-4-8",
+          content: [{ type: "text", text: "hi" }],
+          usage: { input_tokens: 5, output_tokens: 3 },
+        },
+      }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "result",
+        result: "hi",
+        usage: { input_tokens: 5, output_tokens: 3 },
+        modelUsage: { "claude-opus-4-8": { contextWindow: "huge" } },
+      }) + "\n",
+    );
+    finish(child);
+    const result = await promise;
+    expect(result.usage).toMatchObject({
+      model: "claude-opus-4-8",
+      contextWindow: 200_000,
+    });
   });
 
   it("attributes result usage to the responding model even when its message carried no usage", async () => {

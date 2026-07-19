@@ -4,24 +4,26 @@
  */
 
 /**
- * Token counts for the most recent model request the CLI reported — not
- * cumulative across the whole session, so `contextTokens` tracks how full the
- * window is *right now*.
+ * Normalized token counts for the turn. Precision differs by provider: Claude
+ * reports per-request usage, so `contextTokens` tracks how full the window is
+ * *right now*; Codex `exec --json` only reports totals summed across the
+ * turn's requests, so there `contextTokens` is an upper bound on occupancy —
+ * exact for a single-request turn, overstated once the turn ran tools.
  */
 export interface TokenUsage {
   /**
-   * Tokens occupying the model's context window as of the latest request:
-   * fresh input + cache reads + cache writes. The headline "how full is the
-   * context" number.
+   * Tokens occupying the model's context window: fresh input + cache reads +
+   * cache writes. The headline "how full is the context" number — exact for
+   * Claude, an upper bound for Codex (see the interface note).
    */
   contextTokens: number;
-  /** Fresh (non-cached) input tokens of the latest request. */
+  /** Fresh (non-cached) input tokens. */
   inputTokens: number;
   /** Input tokens served from cache (Claude cache reads; Codex cached input). */
   cachedInputTokens: number;
   /**
-   * Output tokens of the latest request, including reasoning tokens when the
-   * provider reports them separately (Codex does).
+   * Output tokens, including reasoning tokens when the provider reports them
+   * separately (Codex does).
    */
   outputTokens: number;
   /**
@@ -44,7 +46,9 @@ export interface TokenUsage {
  * Codex `exec --json` never reports a window, so a host that knows which Codex
  * model it launched can resolve one from here. Values track the Codex model
  * catalog; Anthropic models are handled by the family rules in
- * {@link contextWindowForModel} instead.
+ * {@link contextWindowForModel} instead. A static table drifts as catalogs
+ * change — hosts should prefer passing an explicit `contextWindow` for models
+ * this package predates.
  */
 export const KNOWN_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   "gpt-5.2": 272_000,

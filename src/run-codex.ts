@@ -38,9 +38,11 @@ export interface RunCodexOptions extends CommonRunOptions {
   contextWindow?: number;
 }
 
-/** The `usage` block on a Codex `turn.completed` event. `input_tokens` is the
- * full input for the turn (which includes `cached_input_tokens`), so it already
- * equals the context occupancy — no need to add the cached count on top. */
+/** The `usage` block on a Codex `turn.completed` event. `input_tokens` already
+ * includes `cached_input_tokens`, so the cached count is never added on top.
+ * All counts are summed across every request in the turn (`exec --json`
+ * exposes no per-request usage), so on a turn with tool calls `input_tokens`
+ * overstates the final context occupancy. */
 interface CodexUsage {
   input_tokens?: number;
   cached_input_tokens?: number;
@@ -194,6 +196,8 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
         const input = toTokenCount(event.usage.input_tokens);
         const cached = toTokenCount(event.usage.cached_input_tokens);
         const usage: TokenUsage = {
+          // Turn-cumulative, the best signal Codex exec exposes: an upper
+          // bound on occupancy that is exact only for single-request turns.
           contextTokens: input,
           inputTokens: Math.max(0, input - cached),
           cachedInputTokens: cached,

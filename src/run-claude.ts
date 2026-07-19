@@ -5,6 +5,7 @@ import {
   filterEnv,
   isMissingExecutable,
   normalizeSummary,
+  toContextWindow,
   toTokenCount,
   watchLifecycle,
   writePrompt,
@@ -77,7 +78,10 @@ function summarizeClaudeTool(
 /** The `usage` block on a Claude `assistant` message and the `result` event.
  * `cache_read_input_tokens` are prior context replayed from cache;
  * `cache_creation_input_tokens` are tokens written to cache this request. Both
- * occupy the context window alongside the fresh `input_tokens`. */
+ * occupy the context window alongside the fresh `input_tokens`. On a message
+ * the counts describe that one request; on `result` they are summed across
+ * every request in the turn, so only a single-request turn's result usage
+ * doubles as an occupancy snapshot. */
 interface ClaudeUsage {
   input_tokens?: number;
   output_tokens?: number;
@@ -87,9 +91,10 @@ interface ClaudeUsage {
 
 /** Per-model rollup on the `result` event. Claude bills each model it used in
  * the turn (a turn may spend a small sub-agent model too) and, crucially,
- * reports each model's `contextWindow` here — the authoritative window size. */
+ * reports each model's `contextWindow` here — the authoritative window size.
+ * Straight out of JSON.parse, so fields are unvalidated until read. */
 interface ClaudeModelUsage {
-  contextWindow?: number;
+  contextWindow?: unknown;
 }
 
 interface StreamLine {
@@ -141,13 +146,15 @@ function pickPrimaryModel(
   if (preferred) {
     const base = baseModelId(preferred);
     const match = entries.find(([key]) => baseModelId(key) === base);
-    if (match) return { model: match[0], contextWindow: match[1].contextWindow };
+    if (match) return { model: match[0], contextWindow: toContextWindow(match[1].contextWindow) };
   }
   let best = entries[0]!;
   for (const entry of entries) {
-    if ((entry[1].contextWindow ?? 0) > (best[1].contextWindow ?? 0)) best = entry;
+    if ((toContextWindow(entry[1].contextWindow) ?? 0) > (toContextWindow(best[1].contextWindow) ?? 0)) {
+      best = entry;
+    }
   }
-  return { model: best[0], contextWindow: best[1].contextWindow };
+  return { model: best[0], contextWindow: toContextWindow(best[1].contextWindow) };
 }
 
 /** Spawn a non-interactive Claude Code CLI turn (`claude -p` with stream-json
@@ -184,6 +191,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     let lastAssistantText: string | undefined;
     let resultText: string | undefined;
     let lastAssistantModel: string | undefined;
+    let lastMessageUsage: ClaudeUsage | undefined;
     let lastUsage: TokenUsage | undefined;
 
     const emitUsage = (usage: TokenUsage): void => {
@@ -251,6 +259,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
         if (parsed.message.usage) {
           // Live window is a best-effort guess from the model id; the `result`
           // event corrects it with the authoritative modelUsage window.
+          lastMessageUsage = parsed.message.usage;
           emitUsage(
             toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model)),
           );
@@ -260,12 +269,18 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
       if (parsed.type === "result") {
         if (parsed.session_id) emitSessionId(parsed.session_id);
         if (typeof parsed.result === "string") resultText = parsed.result;
-        if (parsed.usage) {
+        // The result event's usage sums every request in the turn, so it does
+        // not describe context occupancy on a multi-request turn — the last
+        // per-message usage does. Take only the authoritative model/window
+        // from here, falling back to the summed counts when no message carried
+        // usage (then the turn had a single request and they coincide).
+        const occupancy = lastMessageUsage ?? parsed.usage;
+        if (occupancy) {
           const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
           const model = primary?.model ?? lastAssistantModel;
           const contextWindow =
             primary?.contextWindow ?? contextWindowForModel(model);
-          emitUsage(toClaudeUsage(parsed.usage, model, contextWindow));
+          emitUsage(toClaudeUsage(occupancy, model, contextWindow));
         }
       }
     };
