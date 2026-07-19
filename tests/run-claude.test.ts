@@ -393,6 +393,12 @@ describe("runClaude", () => {
         summary: "Task #12 · in progress",
       },
       { name: "TodoWrite", input: { todos: [] }, summary: undefined },
+      { name: "Skill", input: { skill: "code-review" }, summary: "code-review" },
+      {
+        name: "Skill",
+        input: { skill: "linear", args: "list" },
+        summary: "linear · list",
+      },
       {
         name: "mcp__linear__create_issue",
         input: { title: "Bug" },

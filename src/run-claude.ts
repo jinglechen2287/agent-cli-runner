@@ -82,6 +82,12 @@ function summarizeClaudeTool(
       if (taskId && status) return `Task #${taskId} · ${status}`;
       return taskId ? `Task #${taskId}` : status;
     }
+    case "Skill": {
+      const skill = str("skill");
+      const skillArgs = str("args");
+      if (skill && skillArgs) return `${skill} · ${skillArgs}`;
+      return skill;
+    }
     default:
       return undefined;
   }

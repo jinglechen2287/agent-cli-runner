@@ -223,6 +223,12 @@ function summarizeClaudeTool(name, input) {
       if (taskId && status) return `Task #${taskId} \xB7 ${status}`;
       return taskId ? `Task #${taskId}` : status;
     }
+    case "Skill": {
+      const skill = str("skill");
+      const skillArgs = str("args");
+      if (skill && skillArgs) return `${skill} \xB7 ${skillArgs}`;
+      return skill;
+    }
     default:
       return void 0;
   }
