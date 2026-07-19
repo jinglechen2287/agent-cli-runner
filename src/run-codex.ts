@@ -1,4 +1,4 @@
-import { spawn as nodeSpawn } from "node:child_process";
+import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { CodexTurnError, MissingCliError } from "./errors.js";
 import {
   createLineSplitter,
@@ -6,12 +6,13 @@ import {
   isMissingExecutable,
   normalizeSummary,
   signalProcessTree,
+  toContextWindow,
   toTokenCount,
   watchLifecycle,
   writePrompt,
 } from "./internal.js";
-import type { CommonRunOptions, RunResult } from "./types.js";
-import { contextWindowForModel, type TokenUsage } from "./usage.js";
+import type { CommonRunOptions, RunResult, SpawnFn, ToolPlanItem } from "./types.js";
+import type { TokenUsage } from "./usage.js";
 
 /** Stripped so a Codex turn spawned from within another Codex session does
  * not inherit the parent's thread. */
@@ -28,26 +29,12 @@ export interface RunCodexOptions extends CommonRunOptions {
   resumeSessionId?: string;
   /** Image paths passed via repeated `-i` flags. */
   imagePaths?: string[];
-  /** Model to run, passed via `--model`. Also used to resolve the context
-   * window for usage reporting — Codex `exec --json` never reports the model,
-   * so without this the usage snapshot carries no window. */
+  /** Model to run, passed via `--model`. Used as usage attribution only when
+   * the app-server snapshot does not report the resolved model. */
   model?: string;
-  /** Explicit context-window size (tokens) for usage reporting. Overrides the
-   * value resolved from {@link RunCodexOptions.model}; supply it when running a
-   * model the built-in table doesn't know. */
+  /** Explicit context-window fallback (tokens). Codex app-server's reported
+   * `modelContextWindow` is authoritative whenever it is available. */
   contextWindow?: number;
-}
-
-/** The `usage` block on a Codex `turn.completed` event. `input_tokens` already
- * includes `cached_input_tokens`, so the cached count is never added on top.
- * All counts are summed across every request in the turn (`exec --json`
- * exposes no per-request usage), so on a turn with tool calls `input_tokens`
- * overstates the final context occupancy. */
-interface CodexUsage {
-  input_tokens?: number;
-  cached_input_tokens?: number;
-  output_tokens?: number;
-  reasoning_output_tokens?: number;
 }
 
 interface CodexStreamEvent {
@@ -56,7 +43,169 @@ interface CodexStreamEvent {
   message?: string;
   error?: unknown;
   item?: Record<string, unknown>;
-  usage?: CodexUsage;
+  usage?: Record<string, unknown>;
+}
+
+interface AppServerMessage {
+  id?: unknown;
+  method?: unknown;
+  params?: unknown;
+  result?: unknown;
+  error?: unknown;
+}
+
+const APP_SERVER_INITIALIZE_ID = 1;
+const APP_SERVER_RESUME_ID = 2;
+const APP_SERVER_USAGE_TIMEOUT_MS = 5_000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Convert app-server's authoritative last-request snapshot into the shared
+ * context-occupancy shape. `last.totalTokens` is the current used context;
+ * `last.inputTokens` already includes cached input, and `last.outputTokens`
+ * already includes its reasoning-token subset. */
+function toCodexUsage(
+  params: unknown,
+  threadId: string,
+  model: string | undefined,
+  explicitContextWindow: number | undefined,
+): TokenUsage | undefined {
+  if (!isRecord(params) || params.threadId !== threadId || !isRecord(params.tokenUsage)) {
+    return undefined;
+  }
+  const tokenUsage = params.tokenUsage;
+  if (!isRecord(tokenUsage.last)) return undefined;
+  const last = tokenUsage.last;
+  const used = toTokenCount(last.totalTokens);
+  if (used <= 0) return undefined;
+  const input = toTokenCount(last.inputTokens);
+  const cached = toTokenCount(last.cachedInputTokens);
+  const contextWindow =
+    toContextWindow(tokenUsage.modelContextWindow) ?? explicitContextWindow;
+  return {
+    contextTokens: used,
+    inputTokens: Math.max(0, input - cached),
+    cachedInputTokens: cached,
+    outputTokens: toTokenCount(last.outputTokens),
+    ...(model ? { model } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
+}
+
+/** Query the completed exec thread through app-server. Unlike `exec --json`,
+ * app-server exposes both cumulative totals and the last request; resuming a
+ * persisted thread immediately replays its latest authoritative snapshot. */
+function queryCodexUsage(
+  opts: RunCodexOptions,
+  threadId: string,
+  spawnFn: SpawnFn,
+): Promise<TokenUsage | undefined> {
+  return new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawnFn(opts.executablePath ?? "codex", ["app-server", "--stdio"], {
+        cwd: opts.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS),
+        detached: process.platform !== "win32",
+      });
+    } catch {
+      resolve(undefined);
+      return;
+    }
+
+    let settled = false;
+    let resumed = false;
+    let resolvedModel = opts.model;
+    let pendingParams: unknown;
+    const timer = setTimeout(() => finish(), APP_SERVER_USAGE_TIMEOUT_MS);
+
+    const send = (message: Record<string, unknown>): void => {
+      child.stdin?.write(`${JSON.stringify(message)}\n`);
+    };
+
+    const finish = (usage?: TokenUsage): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signalProcessTree(child, "SIGTERM");
+      resolve(usage);
+    };
+
+    const maybeFinish = (): void => {
+      if (!resumed || pendingParams === undefined) return;
+      const usage = toCodexUsage(
+        pendingParams,
+        threadId,
+        resolvedModel,
+        opts.contextWindow,
+      );
+      if (usage) finish(usage);
+    };
+
+    const handleLine = (line: string): void => {
+      let message: AppServerMessage;
+      try {
+        message = JSON.parse(line) as AppServerMessage;
+      } catch {
+        return;
+      }
+      if (message.id === APP_SERVER_INITIALIZE_ID) {
+        if (message.error !== undefined) {
+          finish();
+          return;
+        }
+        send({ method: "initialized" });
+        send({
+          id: APP_SERVER_RESUME_ID,
+          method: "thread/resume",
+          params: { threadId },
+        });
+        return;
+      }
+      if (message.id === APP_SERVER_RESUME_ID) {
+        if (message.error !== undefined) {
+          finish();
+          return;
+        }
+        if (isRecord(message.result) && typeof message.result.model === "string") {
+          resolvedModel = message.result.model;
+        }
+        resumed = true;
+        maybeFinish();
+        return;
+      }
+      if (message.method === "thread/tokenUsage/updated") {
+        pendingParams = message.params;
+        maybeFinish();
+      }
+    };
+
+    const splitter = createLineSplitter(handleLine);
+    child.stdout?.on("data", (chunk: Buffer | string) => splitter.push(chunk));
+    child.stderr?.resume();
+    child.stdin?.on("error", () => finish());
+    child.on("error", () => finish());
+    child.on("close", () => {
+      splitter.flush();
+      finish();
+    });
+
+    send({
+      id: APP_SERVER_INITIALIZE_ID,
+      method: "initialize",
+      params: {
+        clientInfo: {
+          name: "agent-cli-runner",
+          title: "Agent CLI Runner",
+          version: "0.1.0",
+        },
+        capabilities: null,
+      },
+    });
+  });
 }
 
 function toolName(item: Record<string, unknown>): string | null {
@@ -77,10 +226,41 @@ function toolName(item: Record<string, unknown>): string | null {
   }
 }
 
-/** Pull a one-line target out of a Codex stream item: the command it ran, the
- * file(s) it changed, or the query it searched. Returns undefined when the item
- * carries nothing meaningful to summarize. */
-function summarizeCodexTool(item: Record<string, unknown>): string | undefined {
+/** Normalize both the current `todo_list.items` shape and the older
+ * `plan_update.plan` shape. A malformed entry invalidates the whole snapshot
+ * so consumers never present a misleading partial plan. */
+function codexPlanItems(item: Record<string, unknown>): ToolPlanItem[] | undefined {
+  const rawItems = Array.isArray(item.items)
+    ? item.items
+    : Array.isArray(item.plan) ? item.plan : undefined;
+  if (!rawItems) return undefined;
+
+  const items: ToolPlanItem[] = [];
+  for (const rawItem of rawItems) {
+    if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) {
+      return undefined;
+    }
+    const record = rawItem as Record<string, unknown>;
+    const text = normalizeSummary(record.text) ?? normalizeSummary(record.step);
+    if (!text) return undefined;
+    let status: string | undefined;
+    if (typeof record.completed === "boolean") {
+      status = record.completed ? "completed" : "pending";
+    } else {
+      status = normalizeSummary(record.status)?.toLowerCase().replace(/\s+/g, "_");
+    }
+    if (!status) return undefined;
+    items.push({ text, status });
+  }
+  return items.length > 0 ? items : undefined;
+}
+
+/** Pull a one-line target or plan completion count out of a Codex stream item.
+ * Returns undefined when the item carries nothing meaningful to summarize. */
+function summarizeCodexTool(
+  item: Record<string, unknown>,
+  planItems?: ToolPlanItem[],
+): string | undefined {
   switch (item.type) {
     case "command_execution":
       return normalizeSummary(item.command);
@@ -98,6 +278,12 @@ function summarizeCodexTool(item: Record<string, unknown>): string | undefined {
       if (paths.length === 1) return paths[0];
       if (paths.length > 1) return `${paths.length} files`;
       return undefined;
+    }
+    case "todo_list":
+    case "plan_update": {
+      if (!planItems || planItems.length === 0) return undefined;
+      const completed = planItems.filter((planItem) => planItem.status === "completed").length;
+      return `${completed}/${planItems.length} steps completed`;
     }
     default:
       return undefined;
@@ -161,10 +347,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
     let fatalError: CodexTurnError | undefined;
     let lastUsage: TokenUsage | undefined;
     const emittedTools = new Set<string>();
-    // Codex exec never reports the model in its stream, so resolve the window
-    // once from the host-supplied model (or an explicit override).
-    const contextWindow =
-      opts.contextWindow ?? contextWindowForModel(opts.model);
+    let hasCumulativeUsage = false;
 
     const lifecycle = watchLifecycle({
       cli: "codex",
@@ -193,22 +376,10 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
         return;
       }
       if (event.type === "turn.completed" && event.usage) {
-        const input = toTokenCount(event.usage.input_tokens);
-        const cached = toTokenCount(event.usage.cached_input_tokens);
-        const usage: TokenUsage = {
-          // Turn-cumulative, the best signal Codex exec exposes: an upper
-          // bound on occupancy that is exact only for single-request turns.
-          contextTokens: input,
-          inputTokens: Math.max(0, input - cached),
-          cachedInputTokens: cached,
-          outputTokens:
-            toTokenCount(event.usage.output_tokens) +
-            toTokenCount(event.usage.reasoning_output_tokens),
-          ...(opts.model ? { model: opts.model } : {}),
-          ...(contextWindow !== undefined ? { contextWindow } : {}),
-        };
-        lastUsage = usage;
-        opts.onUsage?.(usage);
+        // This block is cumulative across every model request in the turn. It
+        // only tells us an authoritative snapshot is available to query; it is
+        // never emitted as context occupancy.
+        hasCumulativeUsage = true;
         return;
       }
       if (event.type !== "item.started" && event.type !== "item.completed") {
@@ -230,10 +401,13 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
       const id = typeof item.id === "string" ? item.id : `${item.type}:${name}`;
       if (emittedTools.has(id)) return;
       emittedTools.add(id);
-      const summary = summarizeCodexTool(item);
+      const planItems = codexPlanItems(item);
+      const summary = summarizeCodexTool(item, planItems);
       opts.onToolUse?.({
+        ...(typeof item.id === "string" ? { callId: item.id } : {}),
         name,
         ...(summary !== undefined ? { summary } : {}),
+        ...(planItems !== undefined ? { planItems } : {}),
         input: item,
       });
     };
@@ -266,12 +440,26 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
         reject(fatalError);
         return;
       }
-      resolve({
-        text: (finalText ?? "").trim(),
-        exitCode: code ?? -1,
-        ...(sessionId !== undefined ? { sessionId } : {}),
-        ...(lastUsage !== undefined ? { usage: lastUsage } : {}),
-      });
+      const exitCode = code ?? -1;
+      const complete = async (): Promise<void> => {
+        if (exitCode === 0 && sessionId && hasCumulativeUsage) {
+          lastUsage = await queryCodexUsage(opts, sessionId, spawnFn);
+          if (lastUsage) {
+            try {
+              opts.onUsage?.(lastUsage);
+            } catch {
+              // A host callback must not leave the run promise unsettled.
+            }
+          }
+        }
+        resolve({
+          text: (finalText ?? "").trim(),
+          exitCode,
+          ...(sessionId !== undefined ? { sessionId } : {}),
+          ...(lastUsage !== undefined ? { usage: lastUsage } : {}),
+        });
+      };
+      void complete();
     });
   });
 }

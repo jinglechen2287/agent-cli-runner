@@ -22,6 +22,8 @@ export interface ToolUseInfo {
   /** Best-effort raw tool input as reported by the CLI (the Claude tool_use
    * `input`, or the Codex stream item), when available. */
   input?: Record<string, unknown>;
+  /** Provider-normalized Codex plan/todo snapshot, when this tool updates one. */
+  planItems?: ToolPlanItem[];
 }
 
 /** A completed tool result as reported by the provider. Hosts should treat
@@ -31,6 +33,12 @@ export interface ToolResultInfo {
   callId: string;
   content: unknown;
   isError?: boolean;
+}
+
+/** One provider-normalized item from a Codex plan/todo snapshot. */
+export interface ToolPlanItem {
+  text: string;
+  status: string;
 }
 
 export interface AgentCallbacks {
@@ -47,8 +55,8 @@ export interface AgentCallbacks {
   /** Fired with a normalized context-usage snapshot whenever the CLI reports
    * token counts. Claude fires it per assistant message (live) and once more
    * at the end with the authoritative window merged into the last snapshot;
-   * Codex fires it once when the turn completes, with turn-cumulative counts
-   * (see {@link TokenUsage}). Each call supersedes the last. */
+   * Codex fires it once after completion using app-server's authoritative last
+   * request and model context window. Each call supersedes the last. */
   onUsage?: (usage: TokenUsage) => void;
 }
 

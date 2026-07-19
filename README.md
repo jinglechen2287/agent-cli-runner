@@ -56,6 +56,7 @@ interface RunResult {
   text: string;      // final assistant text ("" if none)
   exitCode: number;
   sessionId?: string; // Claude session id / Codex thread id
+  usage?: TokenUsage; // latest context occupancy, when reported
 }
 ```
 
@@ -69,7 +70,7 @@ interface RunResult {
 | `timeoutMs` | Optional wall-clock limit; same kill path, rejects `TimeoutError`. No timeout by default. |
 | `env` | Base child environment (default `process.env`). Nesting-guard variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ACCESS_TOKEN` for Claude; `CODEX_THREAD_ID` for Codex) are always stripped. |
 | `spawnFn` | Injectable spawn primitive for tests. |
-| `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onStderr` | Streaming callbacks. Claude tool uses and results share a provider call ID so hosts can correlate them. Codex tool items are mapped to Claude-style tool names (`command_execution` → `Bash`, `file_change` → `Edit`, …). |
+| `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onUsage`, `onStderr` | Streaming callbacks. Claude tool uses and results share a provider call ID so hosts can correlate them. Codex tool items are mapped to Claude-style tool names (`command_execution` → `Bash`, `file_change` → `Edit`, `todo_list`/`plan_update` → `TodoWrite`). Codex plan snapshots are normalized as `ToolUseInfo.planItems`. Usage snapshots always describe the latest request's context occupancy, never cumulative turn totals. |
 
 ### Claude-specific
 
@@ -77,7 +78,7 @@ interface RunResult {
 
 ### Codex-specific
 
-`developerInstructions`, `resumeSessionId`, `imagePaths`, `dangerouslyBypassApprovalsAndSandbox`. Codex always gets `--skip-git-repo-check` and is spawned as a detached process-group leader so aborts kill its whole tool subtree. `--dangerously-bypass-approvals-and-sandbox` (full host access, no approval prompts) is **off by default** — set `dangerouslyBypassApprovalsAndSandbox: true` only for trusted prompts in environments you accept the agent can modify.
+`developerInstructions`, `resumeSessionId`, `imagePaths`, `dangerouslyBypassApprovalsAndSandbox`. Codex always gets `--skip-git-repo-check` and is spawned as a detached process-group leader so aborts kill its whole tool subtree. After a successful turn, the runner briefly attaches through `codex app-server` to read the authoritative last-request usage and effective context window; if that capability is unavailable, usage is omitted instead of substituting cumulative totals. `--dangerously-bypass-approvals-and-sandbox` (full host access, no approval prompts) is **off by default** — set `dangerouslyBypassApprovalsAndSandbox: true` only for trusted prompts in environments you accept the agent can modify.
 
 ### Errors
 

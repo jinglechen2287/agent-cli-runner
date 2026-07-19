@@ -4,17 +4,14 @@
  */
 
 /**
- * Normalized token counts for the turn. Precision differs by provider: Claude
- * reports per-request usage, so `contextTokens` tracks how full the window is
- * *right now*; Codex `exec --json` only reports totals summed across the
- * turn's requests, so there `contextTokens` is an upper bound on occupancy —
- * exact for a single-request turn, overstated once the turn ran tools.
+ * Normalized token counts for the turn. `contextTokens` comes from the latest
+ * provider request rather than cumulative turn totals, so it can drive a
+ * current context-window meter for both Claude and Codex.
  */
 export interface TokenUsage {
   /**
-   * Tokens occupying the model's context window: fresh input + cache reads +
-   * cache writes. The headline "how full is the context" number — exact for
-   * Claude, an upper bound for Codex (see the interface note).
+   * Tokens occupying the model's context window: fresh input plus cached
+   * input. The headline "how full is the context" number.
    */
   contextTokens: number;
   /** Fresh (non-cached) input tokens. */
@@ -22,8 +19,8 @@ export interface TokenUsage {
   /** Input tokens served from cache (Claude cache reads; Codex cached input). */
   cachedInputTokens: number;
   /**
-   * Output tokens, including reasoning tokens when the provider reports them
-   * separately (Codex does).
+   * Provider-reported output tokens. Codex includes its separately reported
+   * reasoning-token subset in this count.
    */
   outputTokens: number;
   /**
@@ -34,7 +31,7 @@ export interface TokenUsage {
   model?: string;
   /**
    * The model's total context window in tokens, when known — reported by the
-   * CLI (Claude) or resolved from the model id via {@link contextWindowForModel}.
+   * provider or resolved from the model id via {@link contextWindowForModel}.
    * Absent when neither source could supply it; render the raw token count
    * without a percentage in that case.
    */
@@ -43,12 +40,10 @@ export interface TokenUsage {
 
 /**
  * Context-window sizes for models whose id doesn't follow a simple family rule.
- * Codex `exec --json` never reports a window, so a host that knows which Codex
- * model it launched can resolve one from here. Values track the Codex model
- * catalog; Anthropic models are handled by the family rules in
- * {@link contextWindowForModel} instead. A static table drifts as catalogs
- * change — hosts should prefer passing an explicit `contextWindow` for models
- * this package predates.
+ * Values are best-effort fallbacks for callers without a provider-reported
+ * window; `runCodex` prefers app-server's authoritative effective window.
+ * Anthropic models are handled by the family rules in
+ * {@link contextWindowForModel} instead.
  */
 export const KNOWN_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   "gpt-5.2": 272_000,

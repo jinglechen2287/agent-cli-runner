@@ -213,21 +213,39 @@ describe("runCodex", () => {
     expect(onToolUse.mock.calls).toEqual([
       [
         {
+          callId: "tool-1",
           name: "Bash",
           summary: "pnpm test",
           input: { id: "tool-1", type: "command_execution", command: "pnpm test" },
         },
       ],
-      [{ name: "Edit", input: { id: "tool-2", type: "file_change", changes: [] } }],
-      [{ name: "TodoWrite", input: { id: "tool-3", type: "todo_list", items: [] } }],
+      [{
+        callId: "tool-2",
+        name: "Edit",
+        input: { id: "tool-2", type: "file_change", changes: [] },
+      }],
+      [{
+        callId: "tool-3",
+        name: "TodoWrite",
+        input: { id: "tool-3", type: "todo_list", items: [] },
+      }],
     ]);
     expect(result).toEqual({ text: "Done", exitCode: 0, sessionId: "thread-1" });
   });
 
-  it("passes --model and reports normalized usage with the resolved window", async () => {
+  it("reports the app-server's last-request usage and authoritative window", async () => {
     const child = makeFakeChild();
-    const onUsage = vi.fn();
-    const spawnFn = vi.fn().mockReturnValue(child);
+    const appServer = makeFakeChild();
+    let appServerInput = "";
+    appServer.stdin.on("data", (chunk: Buffer | string) => {
+      appServerInput += chunk.toString();
+    });
+    const onUsage = vi.fn(() => {
+      throw new Error("host callback failed");
+    });
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(child)
+      .mockReturnValueOnce(appServer);
     const promise = runCodex({
       prompt: "x",
       cwd: "/tmp",
@@ -246,37 +264,82 @@ describe("runCodex", () => {
       JSON.stringify({
         type: "turn.completed",
         usage: {
-          input_tokens: 13988,
-          cached_input_tokens: 9984,
-          output_tokens: 5,
-          reasoning_output_tokens: 3,
+          input_tokens: 503237,
+          cached_input_tokens: 451328,
+          output_tokens: 3737,
+          reasoning_output_tokens: 1576,
         },
       }) + "\n",
     );
     finish(child);
+
+    expect(spawnFn.mock.calls[1]?.[1]).toEqual(["app-server", "--stdio"]);
+    expect(appServer.stderr.readableFlowing).toBe(true);
+    appServer.stdout.write(JSON.stringify({ id: 1, result: {} }) + "\n");
+    appServer.stdout.write(
+      JSON.stringify({ id: 2, result: { model: "gpt-5.6-sol" } }) + "\n",
+    );
+    appServer.stdout.write(
+      JSON.stringify({
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "t1",
+          turnId: "turn-1",
+          tokenUsage: {
+            total: {
+              totalTokens: 506974,
+              inputTokens: 503237,
+              cachedInputTokens: 451328,
+              outputTokens: 3737,
+              reasoningOutputTokens: 1576,
+            },
+            last: {
+              totalTokens: 52721,
+              inputTokens: 51718,
+              cachedInputTokens: 49920,
+              outputTokens: 1003,
+              reasoningOutputTokens: 516,
+            },
+            modelContextWindow: 258400,
+          },
+        },
+      }) + "\n",
+    );
     const result = await promise;
 
     const usage = {
-      contextTokens: 13988,
-      inputTokens: 13988 - 9984,
-      cachedInputTokens: 9984,
-      outputTokens: 8,
+      contextTokens: 52721,
+      inputTokens: 51718 - 49920,
+      cachedInputTokens: 49920,
+      outputTokens: 1003,
       model: "gpt-5.6-sol",
-      contextWindow: 372_000,
+      contextWindow: 258400,
     };
     expect(onUsage).toHaveBeenCalledWith(usage);
     expect(result.usage).toEqual(usage);
+    expect(appServer.kill).toHaveBeenCalledWith("SIGTERM");
+    const requests = appServerInput.trim().split("\n").map((line) => JSON.parse(line));
+    expect(requests[2]).toEqual({
+      id: 2,
+      method: "thread/resume",
+      params: { threadId: "t1" },
+    });
   });
 
-  it("reports usage without a window when the model is unknown", async () => {
+  it("omits usage instead of treating cumulative turn totals as occupancy", async () => {
     const child = makeFakeChild();
+    const appServer = makeFakeChild();
     const onUsage = vi.fn();
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(child)
+      .mockReturnValueOnce(appServer);
     const promise = runCodex({
       prompt: "x",
       cwd: "/tmp",
-      spawnFn: (() => child) as never,
+      spawnFn: spawnFn as never,
       onUsage,
     });
+    child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "t1" }) + "\n");
     child.stdout.write(
       JSON.stringify({
         type: "turn.completed",
@@ -284,26 +347,27 @@ describe("runCodex", () => {
       }) + "\n",
     );
     finish(child);
+    appServer.emit("error", Object.assign(new Error("unsupported"), { code: "ENOENT" }));
     const result = await promise;
-    expect(onUsage).toHaveBeenCalledWith({
-      contextTokens: 100,
-      inputTokens: 60,
-      cachedInputTokens: 40,
-      outputTokens: 10,
-    });
-    expect(result.usage?.contextWindow).toBeUndefined();
+    expect(onUsage).not.toHaveBeenCalled();
+    expect(result.usage).toBeUndefined();
   });
 
-  it("honors an explicit contextWindow override", async () => {
+  it("uses an explicit window only when app-server reports none", async () => {
     const child = makeFakeChild();
+    const appServer = makeFakeChild();
     const onUsage = vi.fn();
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(child)
+      .mockReturnValueOnce(appServer);
     const promise = runCodex({
       prompt: "x",
       cwd: "/tmp",
       contextWindow: 500_000,
-      spawnFn: (() => child) as never,
+      spawnFn: spawnFn as never,
       onUsage,
     });
+    child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "t1" }) + "\n");
     child.stdout.write(
       JSON.stringify({
         type: "turn.completed",
@@ -311,9 +375,41 @@ describe("runCodex", () => {
       }) + "\n",
     );
     finish(child);
+    appServer.stdout.write(JSON.stringify({ id: 1, result: {} }) + "\n");
+    appServer.stdout.write(JSON.stringify({ id: 2, result: { model: "mystery" } }) + "\n");
+    appServer.stdout.write(
+      JSON.stringify({
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "t1",
+          turnId: "turn-1",
+          tokenUsage: {
+            total: {
+              totalTokens: 110,
+              inputTokens: 100,
+              cachedInputTokens: 0,
+              outputTokens: 10,
+              reasoningOutputTokens: 0,
+            },
+            last: {
+              totalTokens: 60,
+              inputTokens: 50,
+              cachedInputTokens: 40,
+              outputTokens: 10,
+              reasoningOutputTokens: 0,
+            },
+            modelContextWindow: null,
+          },
+        },
+      }) + "\n",
+    );
     await promise;
     expect(onUsage).toHaveBeenCalledWith(
-      expect.objectContaining({ contextWindow: 500_000, cachedInputTokens: 0 }),
+      expect.objectContaining({
+        contextTokens: 60,
+        contextWindow: 500_000,
+        cachedInputTokens: 40,
+      }),
     );
   });
 
@@ -347,6 +443,7 @@ describe("runCodex", () => {
 
     expect(onToolUse.mock.calls.map(([info]) => info)).toEqual([
       {
+        callId: "f1",
         name: "Edit",
         summary: "src/app.ts",
         input: {
@@ -356,9 +453,92 @@ describe("runCodex", () => {
         },
       },
       {
+        callId: "s1",
         name: "WebSearch",
         summary: "codex json schema",
         input: { id: "s1", type: "web_search", query: "codex json schema" },
+      },
+    ]);
+  });
+
+  it("normalizes current todo_list and legacy plan_update items", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+
+    const events = [
+      {
+        type: "item.started",
+        item: {
+          id: "todo-1",
+          type: "todo_list",
+          items: [
+            { text: "Inspect repository", completed: true },
+            { text: "Implement support", completed: false },
+            { text: "Verify tests", completed: false },
+          ],
+        },
+      },
+      {
+        type: "item.completed",
+        item: {
+          id: "plan-bad",
+          type: "plan_update",
+          plan: [
+            { step: "Valid step", status: "completed" },
+            { step: "Missing status" },
+          ],
+        },
+      },
+      {
+        type: "item.completed",
+        item: {
+          id: "plan-1",
+          type: "plan_update",
+          plan: [
+            { step: "Inspect repository", status: "completed" },
+            { step: "Implement support", status: "in_progress" },
+            { step: "Verify tests", status: "pending" },
+          ],
+        },
+      },
+    ];
+    for (const event of events) child.stdout.write(JSON.stringify(event) + "\n");
+    finish(child);
+    await promise;
+
+    expect(onToolUse.mock.calls.map(([info]) => info)).toEqual([
+      {
+        callId: "todo-1",
+        name: "TodoWrite",
+        summary: "1/3 steps completed",
+        planItems: [
+          { text: "Inspect repository", status: "completed" },
+          { text: "Implement support", status: "pending" },
+          { text: "Verify tests", status: "pending" },
+        ],
+        input: events[0]?.item,
+      },
+      {
+        callId: "plan-bad",
+        name: "TodoWrite",
+        input: events[1]?.item,
+      },
+      {
+        callId: "plan-1",
+        name: "TodoWrite",
+        summary: "1/3 steps completed",
+        planItems: [
+          { text: "Inspect repository", status: "completed" },
+          { text: "Implement support", status: "in_progress" },
+          { text: "Verify tests", status: "pending" },
+        ],
+        input: events[2]?.item,
       },
     ]);
   });

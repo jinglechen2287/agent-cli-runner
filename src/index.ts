@@ -14,6 +14,7 @@ export type {
   RunResult,
   SpawnFn,
   ToolResultInfo,
+  ToolPlanItem,
   ToolUseInfo,
 } from "./types.js";
 export {

@@ -414,6 +414,133 @@ async function runClaude(opts) {
 // src/run-codex.ts
 import { spawn as nodeSpawn3 } from "child_process";
 var CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"];
+var APP_SERVER_INITIALIZE_ID = 1;
+var APP_SERVER_RESUME_ID = 2;
+var APP_SERVER_USAGE_TIMEOUT_MS = 5e3;
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function toCodexUsage(params, threadId, model, explicitContextWindow) {
+  if (!isRecord(params) || params.threadId !== threadId || !isRecord(params.tokenUsage)) {
+    return void 0;
+  }
+  const tokenUsage = params.tokenUsage;
+  if (!isRecord(tokenUsage.last)) return void 0;
+  const last = tokenUsage.last;
+  const used = toTokenCount(last.totalTokens);
+  if (used <= 0) return void 0;
+  const input = toTokenCount(last.inputTokens);
+  const cached = toTokenCount(last.cachedInputTokens);
+  const contextWindow = toContextWindow(tokenUsage.modelContextWindow) ?? explicitContextWindow;
+  return {
+    contextTokens: used,
+    inputTokens: Math.max(0, input - cached),
+    cachedInputTokens: cached,
+    outputTokens: toTokenCount(last.outputTokens),
+    ...model ? { model } : {},
+    ...contextWindow !== void 0 ? { contextWindow } : {}
+  };
+}
+function queryCodexUsage(opts, threadId, spawnFn) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawnFn(opts.executablePath ?? "codex", ["app-server", "--stdio"], {
+        cwd: opts.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS),
+        detached: process.platform !== "win32"
+      });
+    } catch {
+      resolve(void 0);
+      return;
+    }
+    let settled = false;
+    let resumed = false;
+    let resolvedModel = opts.model;
+    let pendingParams;
+    const timer = setTimeout(() => finish(), APP_SERVER_USAGE_TIMEOUT_MS);
+    const send = (message) => {
+      child.stdin?.write(`${JSON.stringify(message)}
+`);
+    };
+    const finish = (usage) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signalProcessTree(child, "SIGTERM");
+      resolve(usage);
+    };
+    const maybeFinish = () => {
+      if (!resumed || pendingParams === void 0) return;
+      const usage = toCodexUsage(
+        pendingParams,
+        threadId,
+        resolvedModel,
+        opts.contextWindow
+      );
+      if (usage) finish(usage);
+    };
+    const handleLine = (line) => {
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (message.id === APP_SERVER_INITIALIZE_ID) {
+        if (message.error !== void 0) {
+          finish();
+          return;
+        }
+        send({ method: "initialized" });
+        send({
+          id: APP_SERVER_RESUME_ID,
+          method: "thread/resume",
+          params: { threadId }
+        });
+        return;
+      }
+      if (message.id === APP_SERVER_RESUME_ID) {
+        if (message.error !== void 0) {
+          finish();
+          return;
+        }
+        if (isRecord(message.result) && typeof message.result.model === "string") {
+          resolvedModel = message.result.model;
+        }
+        resumed = true;
+        maybeFinish();
+        return;
+      }
+      if (message.method === "thread/tokenUsage/updated") {
+        pendingParams = message.params;
+        maybeFinish();
+      }
+    };
+    const splitter = createLineSplitter(handleLine);
+    child.stdout?.on("data", (chunk) => splitter.push(chunk));
+    child.stderr?.resume();
+    child.stdin?.on("error", () => finish());
+    child.on("error", () => finish());
+    child.on("close", () => {
+      splitter.flush();
+      finish();
+    });
+    send({
+      id: APP_SERVER_INITIALIZE_ID,
+      method: "initialize",
+      params: {
+        clientInfo: {
+          name: "agent-cli-runner",
+          title: "Agent CLI Runner",
+          version: "0.1.0"
+        },
+        capabilities: null
+      }
+    });
+  });
+}
 function toolName(item) {
   switch (item.type) {
     case "command_execution":
@@ -431,7 +558,29 @@ function toolName(item) {
       return null;
   }
 }
-function summarizeCodexTool(item) {
+function codexPlanItems(item) {
+  const rawItems = Array.isArray(item.items) ? item.items : Array.isArray(item.plan) ? item.plan : void 0;
+  if (!rawItems) return void 0;
+  const items = [];
+  for (const rawItem of rawItems) {
+    if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) {
+      return void 0;
+    }
+    const record = rawItem;
+    const text = normalizeSummary(record.text) ?? normalizeSummary(record.step);
+    if (!text) return void 0;
+    let status;
+    if (typeof record.completed === "boolean") {
+      status = record.completed ? "completed" : "pending";
+    } else {
+      status = normalizeSummary(record.status)?.toLowerCase().replace(/\s+/g, "_");
+    }
+    if (!status) return void 0;
+    items.push({ text, status });
+  }
+  return items.length > 0 ? items : void 0;
+}
+function summarizeCodexTool(item, planItems) {
   switch (item.type) {
     case "command_execution":
       return normalizeSummary(item.command);
@@ -445,6 +594,12 @@ function summarizeCodexTool(item) {
       if (paths.length === 1) return paths[0];
       if (paths.length > 1) return `${paths.length} files`;
       return void 0;
+    }
+    case "todo_list":
+    case "plan_update": {
+      if (!planItems || planItems.length === 0) return void 0;
+      const completed = planItems.filter((planItem) => planItem.status === "completed").length;
+      return `${completed}/${planItems.length} steps completed`;
     }
     default:
       return void 0;
@@ -499,7 +654,7 @@ async function runCodex(opts) {
     let fatalError;
     let lastUsage;
     const emittedTools = /* @__PURE__ */ new Set();
-    const contextWindow = opts.contextWindow ?? contextWindowForModel(opts.model);
+    let hasCumulativeUsage = false;
     const lifecycle = watchLifecycle({
       cli: "codex",
       signal: opts.signal,
@@ -526,20 +681,7 @@ async function runCodex(opts) {
         return;
       }
       if (event.type === "turn.completed" && event.usage) {
-        const input = toTokenCount(event.usage.input_tokens);
-        const cached = toTokenCount(event.usage.cached_input_tokens);
-        const usage = {
-          // Turn-cumulative, the best signal Codex exec exposes: an upper
-          // bound on occupancy that is exact only for single-request turns.
-          contextTokens: input,
-          inputTokens: Math.max(0, input - cached),
-          cachedInputTokens: cached,
-          outputTokens: toTokenCount(event.usage.output_tokens) + toTokenCount(event.usage.reasoning_output_tokens),
-          ...opts.model ? { model: opts.model } : {},
-          ...contextWindow !== void 0 ? { contextWindow } : {}
-        };
-        lastUsage = usage;
-        opts.onUsage?.(usage);
+        hasCumulativeUsage = true;
         return;
       }
       if (event.type !== "item.started" && event.type !== "item.completed") {
@@ -557,10 +699,13 @@ async function runCodex(opts) {
       const id = typeof item.id === "string" ? item.id : `${item.type}:${name}`;
       if (emittedTools.has(id)) return;
       emittedTools.add(id);
-      const summary = summarizeCodexTool(item);
+      const planItems = codexPlanItems(item);
+      const summary = summarizeCodexTool(item, planItems);
       opts.onToolUse?.({
+        ...typeof item.id === "string" ? { callId: item.id } : {},
         name,
         ...summary !== void 0 ? { summary } : {},
+        ...planItems !== void 0 ? { planItems } : {},
         input: item
       });
     };
@@ -590,12 +735,25 @@ async function runCodex(opts) {
         reject(fatalError);
         return;
       }
-      resolve({
-        text: (finalText ?? "").trim(),
-        exitCode: code ?? -1,
-        ...sessionId !== void 0 ? { sessionId } : {},
-        ...lastUsage !== void 0 ? { usage: lastUsage } : {}
-      });
+      const exitCode = code ?? -1;
+      const complete = async () => {
+        if (exitCode === 0 && sessionId && hasCumulativeUsage) {
+          lastUsage = await queryCodexUsage(opts, sessionId, spawnFn);
+          if (lastUsage) {
+            try {
+              opts.onUsage?.(lastUsage);
+            } catch {
+            }
+          }
+        }
+        resolve({
+          text: (finalText ?? "").trim(),
+          exitCode,
+          ...sessionId !== void 0 ? { sessionId } : {},
+          ...lastUsage !== void 0 ? { usage: lastUsage } : {}
+        });
+      };
+      void complete();
     });
   });
 }
