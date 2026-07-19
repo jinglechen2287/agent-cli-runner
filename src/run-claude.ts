@@ -5,10 +5,12 @@ import {
   filterEnv,
   isMissingExecutable,
   normalizeSummary,
+  toTokenCount,
   watchLifecycle,
   writePrompt,
 } from "./internal.js";
 import type { CommonRunOptions, RunResult } from "./types.js";
+import { contextWindowForModel, type TokenUsage } from "./usage.js";
 
 /** Nesting-guard variables the Claude CLI uses to refuse running inside
  * another Claude Code session. Stripped so hosts launched by Claude Code
@@ -72,12 +74,80 @@ function summarizeClaudeTool(
   }
 }
 
+/** The `usage` block on a Claude `assistant` message and the `result` event.
+ * `cache_read_input_tokens` are prior context replayed from cache;
+ * `cache_creation_input_tokens` are tokens written to cache this request. Both
+ * occupy the context window alongside the fresh `input_tokens`. */
+interface ClaudeUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
+/** Per-model rollup on the `result` event. Claude bills each model it used in
+ * the turn (a turn may spend a small sub-agent model too) and, crucially,
+ * reports each model's `contextWindow` here — the authoritative window size. */
+interface ClaudeModelUsage {
+  contextWindow?: number;
+}
+
 interface StreamLine {
   type?: string;
   subtype?: string;
   session_id?: string;
   result?: string;
-  message?: { content?: AssistantContentBlock[] };
+  message?: { content?: AssistantContentBlock[]; usage?: ClaudeUsage; model?: string };
+  usage?: ClaudeUsage;
+  modelUsage?: Record<string, ClaudeModelUsage>;
+}
+
+/** Normalize a Claude usage block into the shared shape. Context occupancy is
+ * fresh input plus both cache lanes; only cache *reads* count as "cached". */
+function toClaudeUsage(
+  usage: ClaudeUsage,
+  model: string | undefined,
+  contextWindow: number | undefined,
+): TokenUsage {
+  const input = toTokenCount(usage.input_tokens);
+  const cacheRead = toTokenCount(usage.cache_read_input_tokens);
+  const cacheCreation = toTokenCount(usage.cache_creation_input_tokens);
+  return {
+    contextTokens: input + cacheRead + cacheCreation,
+    inputTokens: input,
+    cachedInputTokens: cacheRead,
+    outputTokens: toTokenCount(usage.output_tokens),
+    ...(model ? { model } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
+}
+
+/** Drop a Claude model id's `[...]` variant marker so `claude-opus-4-8` (from
+ * an assistant message) matches `claude-opus-4-8[1m]` (a modelUsage key). */
+function baseModelId(model: string): string {
+  return model.replace(/\[[^\]]*\]$/, "");
+}
+
+/** Pick the turn's main model from the `result` event's per-model rollup: the
+ * one that produced the final assistant message when identifiable, else the one
+ * with the largest context window (a sub-agent model has a smaller window). */
+function pickPrimaryModel(
+  modelUsage: Record<string, ClaudeModelUsage> | undefined,
+  preferred: string | undefined,
+): { model: string; contextWindow: number | undefined } | undefined {
+  if (!modelUsage) return undefined;
+  const entries = Object.entries(modelUsage);
+  if (entries.length === 0) return undefined;
+  if (preferred) {
+    const base = baseModelId(preferred);
+    const match = entries.find(([key]) => baseModelId(key) === base);
+    if (match) return { model: match[0], contextWindow: match[1].contextWindow };
+  }
+  let best = entries[0]!;
+  for (const entry of entries) {
+    if ((entry[1].contextWindow ?? 0) > (best[1].contextWindow ?? 0)) best = entry;
+  }
+  return { model: best[0], contextWindow: best[1].contextWindow };
 }
 
 /** Spawn a non-interactive Claude Code CLI turn (`claude -p` with stream-json
@@ -113,6 +183,13 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     let sessionIdEmitted = false;
     let lastAssistantText: string | undefined;
     let resultText: string | undefined;
+    let lastAssistantModel: string | undefined;
+    let lastUsage: TokenUsage | undefined;
+
+    const emitUsage = (usage: TokenUsage): void => {
+      lastUsage = usage;
+      opts.onUsage?.(usage);
+    };
 
     const lifecycle = watchLifecycle({
       cli: "claude",
@@ -166,11 +243,30 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
           lastAssistantText = text;
           opts.onAssistantText?.(text);
         }
+        const model = parsed.message.model;
+        // Track the responding model even on messages without usage, so the
+        // result event can attribute usage to it rather than the largest-window
+        // model in a multi-model turn.
+        if (model) lastAssistantModel = model;
+        if (parsed.message.usage) {
+          // Live window is a best-effort guess from the model id; the `result`
+          // event corrects it with the authoritative modelUsage window.
+          emitUsage(
+            toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model)),
+          );
+        }
         return;
       }
       if (parsed.type === "result") {
         if (parsed.session_id) emitSessionId(parsed.session_id);
         if (typeof parsed.result === "string") resultText = parsed.result;
+        if (parsed.usage) {
+          const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
+          const model = primary?.model ?? lastAssistantModel;
+          const contextWindow =
+            primary?.contextWindow ?? contextWindowForModel(model);
+          emitUsage(toClaudeUsage(parsed.usage, model, contextWindow));
+        }
       }
     };
 
@@ -201,6 +297,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
         text: (resultText ?? lastAssistantText ?? "").trim(),
         exitCode: code ?? -1,
         ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(lastUsage !== undefined ? { usage: lastUsage } : {}),
       });
     });
   });

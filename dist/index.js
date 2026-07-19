@@ -37,6 +37,9 @@ function normalizeSummary(value) {
   const summary = value.replace(/\s+/g, " ").trim();
   return summary || void 0;
 }
+function toTokenCount(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
 function filterEnv(base, stripped) {
   const env = {};
   const normalize = (key) => process.platform === "win32" ? key.toUpperCase() : key;
@@ -152,6 +155,34 @@ function signalProcessTree(child, signal) {
   }
 }
 
+// src/usage.ts
+var KNOWN_CONTEXT_WINDOWS = {
+  "gpt-5.2": 272e3,
+  "gpt-5.4": 272e3,
+  "gpt-5.4-mini": 272e3,
+  "gpt-5.5": 272e3,
+  "gpt-5.6-luna": 372e3,
+  "gpt-5.6-sol": 372e3,
+  "gpt-5.6-terra": 372e3,
+  "codex-auto-review": 272e3
+};
+var CLAUDE_DEFAULT_CONTEXT_WINDOW = 2e5;
+var CLAUDE_1M_CONTEXT_WINDOW = 1e6;
+function contextWindowForModel(model) {
+  if (!model) return void 0;
+  const id = model.trim().toLowerCase();
+  if (!id) return void 0;
+  if (Object.prototype.hasOwnProperty.call(KNOWN_CONTEXT_WINDOWS, id)) {
+    return KNOWN_CONTEXT_WINDOWS[id];
+  }
+  if (id.includes("claude")) {
+    return /\[1m\]|[-_]1m\b/.test(id) ? CLAUDE_1M_CONTEXT_WINDOW : CLAUDE_DEFAULT_CONTEXT_WINDOW;
+  }
+  if (id.startsWith("gpt-5.6")) return 372e3;
+  if (id.startsWith("gpt-5")) return 272e3;
+  return void 0;
+}
+
 // src/run-claude.ts
 var CLAUDE_STRIPPED_ENV_VARS = [
   "CLAUDECODE",
@@ -185,6 +216,37 @@ function summarizeClaudeTool(name, input) {
       return void 0;
   }
 }
+function toClaudeUsage(usage, model, contextWindow) {
+  const input = toTokenCount(usage.input_tokens);
+  const cacheRead = toTokenCount(usage.cache_read_input_tokens);
+  const cacheCreation = toTokenCount(usage.cache_creation_input_tokens);
+  return {
+    contextTokens: input + cacheRead + cacheCreation,
+    inputTokens: input,
+    cachedInputTokens: cacheRead,
+    outputTokens: toTokenCount(usage.output_tokens),
+    ...model ? { model } : {},
+    ...contextWindow !== void 0 ? { contextWindow } : {}
+  };
+}
+function baseModelId(model) {
+  return model.replace(/\[[^\]]*\]$/, "");
+}
+function pickPrimaryModel(modelUsage, preferred) {
+  if (!modelUsage) return void 0;
+  const entries = Object.entries(modelUsage);
+  if (entries.length === 0) return void 0;
+  if (preferred) {
+    const base = baseModelId(preferred);
+    const match = entries.find(([key]) => baseModelId(key) === base);
+    if (match) return { model: match[0], contextWindow: match[1].contextWindow };
+  }
+  let best = entries[0];
+  for (const entry of entries) {
+    if ((entry[1].contextWindow ?? 0) > (best[1].contextWindow ?? 0)) best = entry;
+  }
+  return { model: best[0], contextWindow: best[1].contextWindow };
+}
 async function runClaude(opts) {
   if (opts.newSessionId && opts.resumeSessionId) {
     throw new Error(
@@ -213,6 +275,12 @@ async function runClaude(opts) {
     let sessionIdEmitted = false;
     let lastAssistantText;
     let resultText;
+    let lastAssistantModel;
+    let lastUsage;
+    const emitUsage = (usage) => {
+      lastUsage = usage;
+      opts.onUsage?.(usage);
+    };
     const lifecycle = watchLifecycle({
       cli: "claude",
       signal: opts.signal,
@@ -262,11 +330,24 @@ async function runClaude(opts) {
           lastAssistantText = text;
           opts.onAssistantText?.(text);
         }
+        const model = parsed.message.model;
+        if (model) lastAssistantModel = model;
+        if (parsed.message.usage) {
+          emitUsage(
+            toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model))
+          );
+        }
         return;
       }
       if (parsed.type === "result") {
         if (parsed.session_id) emitSessionId(parsed.session_id);
         if (typeof parsed.result === "string") resultText = parsed.result;
+        if (parsed.usage) {
+          const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
+          const model = primary?.model ?? lastAssistantModel;
+          const contextWindow = primary?.contextWindow ?? contextWindowForModel(model);
+          emitUsage(toClaudeUsage(parsed.usage, model, contextWindow));
+        }
       }
     };
     const splitter = createLineSplitter(handleLine);
@@ -293,7 +374,8 @@ async function runClaude(opts) {
       resolve({
         text: (resultText ?? lastAssistantText ?? "").trim(),
         exitCode: code ?? -1,
-        ...sessionId !== void 0 ? { sessionId } : {}
+        ...sessionId !== void 0 ? { sessionId } : {},
+        ...lastUsage !== void 0 ? { usage: lastUsage } : {}
       });
     });
   });
@@ -358,6 +440,9 @@ function buildArgs(opts) {
     args.push("--dangerously-bypass-approvals-and-sandbox");
   }
   args.push("--skip-git-repo-check");
+  if (opts.model !== void 0) {
+    args.push("--model", opts.model);
+  }
   if (opts.developerInstructions !== void 0) {
     args.push("-c", `developer_instructions=${JSON.stringify(opts.developerInstructions)}`);
   }
@@ -382,7 +467,9 @@ async function runCodex(opts) {
     let sessionId;
     let finalText;
     let fatalError;
+    let lastUsage;
     const emittedTools = /* @__PURE__ */ new Set();
+    const contextWindow = opts.contextWindow ?? contextWindowForModel(opts.model);
     const lifecycle = watchLifecycle({
       cli: "codex",
       signal: opts.signal,
@@ -406,6 +493,21 @@ async function runCodex(opts) {
       if (event.type === "thread.started" && typeof event.thread_id === "string") {
         sessionId = event.thread_id;
         opts.onSessionId?.(event.thread_id);
+        return;
+      }
+      if (event.type === "turn.completed" && event.usage) {
+        const input = toTokenCount(event.usage.input_tokens);
+        const cached = toTokenCount(event.usage.cached_input_tokens);
+        const usage = {
+          contextTokens: input,
+          inputTokens: Math.max(0, input - cached),
+          cachedInputTokens: cached,
+          outputTokens: toTokenCount(event.usage.output_tokens) + toTokenCount(event.usage.reasoning_output_tokens),
+          ...opts.model ? { model: opts.model } : {},
+          ...contextWindow !== void 0 ? { contextWindow } : {}
+        };
+        lastUsage = usage;
+        opts.onUsage?.(usage);
         return;
       }
       if (event.type !== "item.started" && event.type !== "item.completed") {
@@ -459,7 +561,8 @@ async function runCodex(opts) {
       resolve({
         text: (finalText ?? "").trim(),
         exitCode: code ?? -1,
-        ...sessionId !== void 0 ? { sessionId } : {}
+        ...sessionId !== void 0 ? { sessionId } : {},
+        ...lastUsage !== void 0 ? { usage: lastUsage } : {}
       });
     });
   });
@@ -469,8 +572,10 @@ export {
   CLAUDE_STRIPPED_ENV_VARS,
   CODEX_STRIPPED_ENV_VARS,
   CodexTurnError,
+  KNOWN_CONTEXT_WINDOWS,
   MissingCliError,
   TimeoutError,
+  contextWindowForModel,
   runClaude,
   runCodex
 };

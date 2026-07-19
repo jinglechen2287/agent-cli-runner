@@ -15,3 +15,8 @@ export type {
   SpawnFn,
   ToolUseInfo,
 } from "./types.js";
+export {
+  contextWindowForModel,
+  KNOWN_CONTEXT_WINDOWS,
+  type TokenUsage,
+} from "./usage.js";

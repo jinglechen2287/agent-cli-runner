@@ -642,4 +642,149 @@ describe("runClaude", () => {
     const result = await promise;
     expect(result.exitCode).toBe(-1);
   });
+
+  it("emits normalized usage per assistant message, summing input and cache lanes", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-opus-4-8",
+          content: [{ type: "text", text: "hi" }],
+          usage: {
+            input_tokens: 2,
+            cache_read_input_tokens: 15099,
+            cache_creation_input_tokens: 6490,
+            output_tokens: 6,
+          },
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onUsage).toHaveBeenCalledWith({
+      contextTokens: 2 + 15099 + 6490,
+      inputTokens: 2,
+      cachedInputTokens: 15099,
+      outputTokens: 6,
+      model: "claude-opus-4-8",
+      contextWindow: 200_000,
+    });
+  });
+
+  it("corrects the window from the result event's authoritative modelUsage and returns it", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+    // A turn that also billed a small sub-agent model (Haiku): the primary
+    // model is the one that produced the final assistant message.
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-opus-4-8",
+          content: [{ type: "text", text: "done" }],
+          usage: { input_tokens: 2, cache_read_input_tokens: 15099, output_tokens: 6 },
+        },
+      }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "result",
+        result: "done",
+        session_id: "s1",
+        usage: {
+          input_tokens: 2,
+          cache_read_input_tokens: 15099,
+          cache_creation_input_tokens: 6490,
+          output_tokens: 6,
+        },
+        modelUsage: {
+          "claude-haiku-4-5-20251001": { contextWindow: 200_000 },
+          "claude-opus-4-8[1m]": { contextWindow: 1_000_000 },
+        },
+      }) + "\n",
+    );
+    finish(child);
+    const result = await promise;
+    const finalUsage = {
+      contextTokens: 2 + 15099 + 6490,
+      inputTokens: 2,
+      cachedInputTokens: 15099,
+      outputTokens: 6,
+      model: "claude-opus-4-8[1m]",
+      contextWindow: 1_000_000,
+    };
+    expect(onUsage).toHaveBeenLastCalledWith(finalUsage);
+    expect(result.usage).toEqual(finalUsage);
+  });
+
+  it("attributes result usage to the responding model even when its message carried no usage", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+    // A tool-only assistant message: it names the responding model but omits
+    // usage. Its model must still win over the larger-window model at result.
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-haiku-4-5-20251001",
+          content: [{ type: "tool_use", id: "t", name: "Read", input: { file_path: "a.ts" } }],
+        },
+      }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "result",
+        result: "done",
+        usage: { input_tokens: 5, output_tokens: 3 },
+        modelUsage: {
+          "claude-haiku-4-5-20251001": { contextWindow: 200_000 },
+          "claude-opus-4-8[1m]": { contextWindow: 1_000_000 },
+        },
+      }) + "\n",
+    );
+    finish(child);
+    const result = await promise;
+    expect(result.usage).toMatchObject({
+      model: "claude-haiku-4-5-20251001",
+      contextWindow: 200_000,
+    });
+  });
+
+  it("omits usage from the result when the CLI reports no token counts", async () => {
+    const child = makeFakeChild();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "hi" }] },
+      }) + "\n",
+    );
+    finish(child);
+    const result = await promise;
+    expect(result.usage).toBeUndefined();
+  });
 });

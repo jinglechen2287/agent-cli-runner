@@ -224,6 +224,99 @@ describe("runCodex", () => {
     expect(result).toEqual({ text: "Done", exitCode: 0, sessionId: "thread-1" });
   });
 
+  it("passes --model and reports normalized usage with the resolved window", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      model: "gpt-5.6-sol",
+      spawnFn: spawnFn as never,
+      onUsage,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    expect(args).toContain("--model");
+    expect(args[args.indexOf("--model") + 1]).toBe("gpt-5.6-sol");
+
+    child.stdout.write(
+      JSON.stringify({ type: "thread.started", thread_id: "t1" }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "turn.completed",
+        usage: {
+          input_tokens: 13988,
+          cached_input_tokens: 9984,
+          output_tokens: 5,
+          reasoning_output_tokens: 3,
+        },
+      }) + "\n",
+    );
+    finish(child);
+    const result = await promise;
+
+    const usage = {
+      contextTokens: 13988,
+      inputTokens: 13988 - 9984,
+      cachedInputTokens: 9984,
+      outputTokens: 8,
+      model: "gpt-5.6-sol",
+      contextWindow: 372_000,
+    };
+    expect(onUsage).toHaveBeenCalledWith(usage);
+    expect(result.usage).toEqual(usage);
+  });
+
+  it("reports usage without a window when the model is unknown", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 100, cached_input_tokens: 40, output_tokens: 10 },
+      }) + "\n",
+    );
+    finish(child);
+    const result = await promise;
+    expect(onUsage).toHaveBeenCalledWith({
+      contextTokens: 100,
+      inputTokens: 60,
+      cachedInputTokens: 40,
+      outputTokens: 10,
+    });
+    expect(result.usage?.contextWindow).toBeUndefined();
+  });
+
+  it("honors an explicit contextWindow override", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      contextWindow: 500_000,
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 100, output_tokens: 10 },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ contextWindow: 500_000, cachedInputTokens: 0 }),
+    );
+  });
+
   it("summarizes a single file change by its path and a search by its query", async () => {
     const child = makeFakeChild();
     const onToolUse = vi.fn();

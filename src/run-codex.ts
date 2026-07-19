@@ -6,10 +6,12 @@ import {
   isMissingExecutable,
   normalizeSummary,
   signalProcessTree,
+  toTokenCount,
   watchLifecycle,
   writePrompt,
 } from "./internal.js";
 import type { CommonRunOptions, RunResult } from "./types.js";
+import { contextWindowForModel, type TokenUsage } from "./usage.js";
 
 /** Stripped so a Codex turn spawned from within another Codex session does
  * not inherit the parent's thread. */
@@ -26,6 +28,24 @@ export interface RunCodexOptions extends CommonRunOptions {
   resumeSessionId?: string;
   /** Image paths passed via repeated `-i` flags. */
   imagePaths?: string[];
+  /** Model to run, passed via `--model`. Also used to resolve the context
+   * window for usage reporting — Codex `exec --json` never reports the model,
+   * so without this the usage snapshot carries no window. */
+  model?: string;
+  /** Explicit context-window size (tokens) for usage reporting. Overrides the
+   * value resolved from {@link RunCodexOptions.model}; supply it when running a
+   * model the built-in table doesn't know. */
+  contextWindow?: number;
+}
+
+/** The `usage` block on a Codex `turn.completed` event. `input_tokens` is the
+ * full input for the turn (which includes `cached_input_tokens`), so it already
+ * equals the context occupancy — no need to add the cached count on top. */
+interface CodexUsage {
+  input_tokens?: number;
+  cached_input_tokens?: number;
+  output_tokens?: number;
+  reasoning_output_tokens?: number;
 }
 
 interface CodexStreamEvent {
@@ -34,6 +54,7 @@ interface CodexStreamEvent {
   message?: string;
   error?: unknown;
   item?: Record<string, unknown>;
+  usage?: CodexUsage;
 }
 
 function toolName(item: Record<string, unknown>): string | null {
@@ -104,6 +125,9 @@ function buildArgs(opts: RunCodexOptions): string[] {
     args.push("--dangerously-bypass-approvals-and-sandbox");
   }
   args.push("--skip-git-repo-check");
+  if (opts.model !== undefined) {
+    args.push("--model", opts.model);
+  }
   if (opts.developerInstructions !== undefined) {
     args.push("-c", `developer_instructions=${JSON.stringify(opts.developerInstructions)}`);
   }
@@ -133,7 +157,12 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
     let sessionId: string | undefined;
     let finalText: string | undefined;
     let fatalError: CodexTurnError | undefined;
+    let lastUsage: TokenUsage | undefined;
     const emittedTools = new Set<string>();
+    // Codex exec never reports the model in its stream, so resolve the window
+    // once from the host-supplied model (or an explicit override).
+    const contextWindow =
+      opts.contextWindow ?? contextWindowForModel(opts.model);
 
     const lifecycle = watchLifecycle({
       cli: "codex",
@@ -159,6 +188,23 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
       if (event.type === "thread.started" && typeof event.thread_id === "string") {
         sessionId = event.thread_id;
         opts.onSessionId?.(event.thread_id);
+        return;
+      }
+      if (event.type === "turn.completed" && event.usage) {
+        const input = toTokenCount(event.usage.input_tokens);
+        const cached = toTokenCount(event.usage.cached_input_tokens);
+        const usage: TokenUsage = {
+          contextTokens: input,
+          inputTokens: Math.max(0, input - cached),
+          cachedInputTokens: cached,
+          outputTokens:
+            toTokenCount(event.usage.output_tokens) +
+            toTokenCount(event.usage.reasoning_output_tokens),
+          ...(opts.model ? { model: opts.model } : {}),
+          ...(contextWindow !== undefined ? { contextWindow } : {}),
+        };
+        lastUsage = usage;
+        opts.onUsage?.(usage);
         return;
       }
       if (event.type !== "item.started" && event.type !== "item.completed") {
@@ -220,6 +266,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
         text: (finalText ?? "").trim(),
         exitCode: code ?? -1,
         ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(lastUsage !== undefined ? { usage: lastUsage } : {}),
       });
     });
   });

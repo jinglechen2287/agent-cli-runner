@@ -1,5 +1,60 @@
 import { SpawnOptions, ChildProcess } from 'node:child_process';
 
+/**
+ * Provider-normalized token accounting, so a host can render one context-usage
+ * meter for both Claude and Codex without knowing either CLI's raw shape.
+ */
+/**
+ * Token counts for the most recent model request the CLI reported — not
+ * cumulative across the whole session, so `contextTokens` tracks how full the
+ * window is *right now*.
+ */
+interface TokenUsage {
+    /**
+     * Tokens occupying the model's context window as of the latest request:
+     * fresh input + cache reads + cache writes. The headline "how full is the
+     * context" number.
+     */
+    contextTokens: number;
+    /** Fresh (non-cached) input tokens of the latest request. */
+    inputTokens: number;
+    /** Input tokens served from cache (Claude cache reads; Codex cached input). */
+    cachedInputTokens: number;
+    /**
+     * Output tokens of the latest request, including reasoning tokens when the
+     * provider reports them separately (Codex does).
+     */
+    outputTokens: number;
+    /**
+     * Model that produced this usage, when the CLI reports it. Claude reports it
+     * on every turn; Codex `exec` does not, so this is only present when the host
+     * told the runner which model it launched.
+     */
+    model?: string;
+    /**
+     * The model's total context window in tokens, when known — reported by the
+     * CLI (Claude) or resolved from the model id via {@link contextWindowForModel}.
+     * Absent when neither source could supply it; render the raw token count
+     * without a percentage in that case.
+     */
+    contextWindow?: number;
+}
+/**
+ * Context-window sizes for models whose id doesn't follow a simple family rule.
+ * Codex `exec --json` never reports a window, so a host that knows which Codex
+ * model it launched can resolve one from here. Values track the Codex model
+ * catalog; Anthropic models are handled by the family rules in
+ * {@link contextWindowForModel} instead.
+ */
+declare const KNOWN_CONTEXT_WINDOWS: Readonly<Record<string, number>>;
+/**
+ * Best-effort context window (in tokens) for a model id, or `undefined` when it
+ * can't be determined. Consults {@link KNOWN_CONTEXT_WINDOWS} first, then
+ * falls back to family rules: Anthropic models get 200k (1M for the `[1m]`
+ * beta variants), and Codex `gpt-5.6*` / other `gpt-5*` models get 372k / 272k.
+ */
+declare function contextWindowForModel(model: string | undefined): number | undefined;
+
 /** Injectable spawn primitive so hosts and tests can substitute their own. */
 type SpawnFn = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
 /** What the agent did when it invoked a tool. `name` is always present; the
@@ -24,6 +79,11 @@ interface AgentCallbacks {
     onToolUse?: (info: ToolUseInfo) => void;
     /** Raw stderr chunks from the CLI process. */
     onStderr?: (chunk: string) => void;
+    /** Fired with a normalized context-usage snapshot whenever the CLI reports
+     * token counts. Claude fires it per assistant message (live) and once more
+     * with authoritative window data at the end; Codex fires it once when the
+     * turn completes. Each call supersedes the last. */
+    onUsage?: (usage: TokenUsage) => void;
 }
 interface CommonRunOptions extends AgentCallbacks {
     prompt: string;
@@ -47,6 +107,9 @@ interface RunResult {
     exitCode: number;
     /** Claude session id / Codex thread id, when the CLI reported one. */
     sessionId?: string;
+    /** The latest context-usage snapshot of the turn, when the CLI reported any
+     * token counts. Matches the final {@link AgentCallbacks.onUsage} value. */
+    usage?: TokenUsage;
 }
 
 /** Nesting-guard variables the Claude CLI uses to refuse running inside
@@ -81,6 +144,14 @@ interface RunCodexOptions extends CommonRunOptions {
     resumeSessionId?: string;
     /** Image paths passed via repeated `-i` flags. */
     imagePaths?: string[];
+    /** Model to run, passed via `--model`. Also used to resolve the context
+     * window for usage reporting — Codex `exec --json` never reports the model,
+     * so without this the usage snapshot carries no window. */
+    model?: string;
+    /** Explicit context-window size (tokens) for usage reporting. Overrides the
+     * value resolved from {@link RunCodexOptions.model}; supply it when running a
+     * model the built-in table doesn't know. */
+    contextWindow?: number;
 }
 /** Spawn a non-interactive Codex CLI turn (`codex exec --json`) and translate
  * its JSONL stream into the same callbacks used by the Claude runner. */
@@ -106,4 +177,4 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, CodexTurnError, type CommonRunOptions, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type ToolUseInfo, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, CodexTurnError, type CommonRunOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolUseInfo, contextWindowForModel, runClaude, runCodex };

@@ -1,4 +1,5 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import type { TokenUsage } from "./usage.js";
 
 /** Injectable spawn primitive so hosts and tests can substitute their own. */
 export type SpawnFn = (
@@ -30,6 +31,11 @@ export interface AgentCallbacks {
   onToolUse?: (info: ToolUseInfo) => void;
   /** Raw stderr chunks from the CLI process. */
   onStderr?: (chunk: string) => void;
+  /** Fired with a normalized context-usage snapshot whenever the CLI reports
+   * token counts. Claude fires it per assistant message (live) and once more
+   * with authoritative window data at the end; Codex fires it once when the
+   * turn completes. Each call supersedes the last. */
+  onUsage?: (usage: TokenUsage) => void;
 }
 
 export interface CommonRunOptions extends AgentCallbacks {
@@ -55,4 +61,7 @@ export interface RunResult {
   exitCode: number;
   /** Claude session id / Codex thread id, when the CLI reported one. */
   sessionId?: string;
+  /** The latest context-usage snapshot of the turn, when the CLI reported any
+   * token counts. Matches the final {@link AgentCallbacks.onUsage} value. */
+  usage?: TokenUsage;
 }

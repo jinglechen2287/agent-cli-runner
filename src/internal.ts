@@ -14,6 +14,14 @@ export function normalizeSummary(value: unknown): string | undefined {
   return summary || undefined;
 }
 
+/** Coerce a CLI-reported token count into a non-negative integer, defaulting
+ * to 0 for missing, negative, or non-finite values. */
+export function toTokenCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.round(value)
+    : 0;
+}
+
 export function filterEnv(
   base: NodeJS.ProcessEnv,
   stripped: readonly string[],
