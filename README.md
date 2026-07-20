@@ -74,11 +74,15 @@ interface RunResult {
 
 ### Claude-specific
 
-`appendSystemPrompt` (passed on every turn — the CLI rebuilds the system prompt from flags each run), `newSessionId` / `resumeSessionId` (mutually exclusive).
+`appendSystemPrompt` (passed on every turn — the CLI rebuilds the system prompt from flags each run), `newSessionId` / `resumeSessionId` (mutually exclusive), and `isolated`.
+
+`isolated: true` is for non-persistent one-shot metadata requests. It requires Claude Code 2.1.169 or newer because it enables `--safe-mode`; it also disables built-in tools and MCP servers and prevents session persistence. It cannot resume a session.
 
 ### Codex-specific
 
-`developerInstructions`, `resumeSessionId`, `imagePaths`, `dangerouslyBypassApprovalsAndSandbox`. Codex always gets `--skip-git-repo-check` and is spawned as a detached process-group leader so aborts kill its whole tool subtree. After a successful turn, the runner briefly attaches through `codex app-server` to read the authoritative last-request usage and effective context window; if that capability is unavailable, usage is omitted instead of substituting cumulative totals. `--dangerously-bypass-approvals-and-sandbox` (full host access, no approval prompts) is **off by default** — set `dangerouslyBypassApprovalsAndSandbox: true` only for trusted prompts in environments you accept the agent can modify.
+`developerInstructions`, `resumeSessionId`, `imagePaths`, `dangerouslyBypassApprovalsAndSandbox`, and `isolated`. Codex always gets `--skip-git-repo-check` and is spawned as a detached process-group leader so aborts kill its whole tool subtree. After a successful turn, the runner briefly attaches through `codex app-server` to read the authoritative last-request usage and effective context window; if that capability is unavailable, usage is omitted instead of substituting cumulative totals. `--dangerously-bypass-approvals-and-sandbox` (full host access, no approval prompts) is **off by default** — set `dangerouslyBypassApprovalsAndSandbox: true` only for trusted prompts in environments you accept the agent can modify.
+
+`isolated: true` runs Codex with an ephemeral session, ignores user config and exec-policy rules, and enforces a read-only sandbox. It cannot resume a thread or be combined with `dangerouslyBypassApprovalsAndSandbox`; ephemeral runs skip the app-server usage lookup because no persisted thread exists.
 
 ### Errors
 

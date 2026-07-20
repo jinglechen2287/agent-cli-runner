@@ -289,8 +289,20 @@ async function runClaude(opts) {
       "newSessionId and resumeSessionId are mutually exclusive \u2014 pass one or the other"
     );
   }
+  if (opts.isolated && opts.resumeSessionId) {
+    throw new Error("isolated Claude runs cannot resume a session");
+  }
   const spawnFn = opts.spawnFn ?? nodeSpawn2;
   const args = ["-p", "--output-format", "stream-json", "--verbose"];
+  if (opts.isolated) {
+    args.push(
+      "--safe-mode",
+      "--tools",
+      "",
+      "--strict-mcp-config",
+      "--no-session-persistence"
+    );
+  }
   if (opts.appendSystemPrompt) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
   }
@@ -670,6 +682,15 @@ function buildArgs(opts) {
     args.push("--dangerously-bypass-approvals-and-sandbox");
   }
   args.push("--skip-git-repo-check");
+  if (opts.isolated) {
+    args.push(
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--sandbox",
+      "read-only"
+    );
+  }
   if (opts.model !== void 0) {
     args.push("--model", opts.model);
   }
@@ -684,6 +705,12 @@ function buildArgs(opts) {
   return args;
 }
 async function runCodex(opts) {
+  if (opts.isolated && opts.resumeSessionId) {
+    throw new Error("isolated Codex runs cannot resume a session");
+  }
+  if (opts.isolated && opts.dangerouslyBypassApprovalsAndSandbox) {
+    throw new Error("isolated Codex runs cannot bypass approvals and sandboxing");
+  }
   const spawnFn = opts.spawnFn ?? nodeSpawn3;
   const child = spawnFn(opts.executablePath ?? "codex", buildArgs(opts), {
     cwd: opts.cwd,
@@ -782,7 +809,7 @@ async function runCodex(opts) {
       }
       const exitCode = code ?? -1;
       const complete = async () => {
-        if (exitCode === 0 && sessionId && hasCumulativeUsage) {
+        if (exitCode === 0 && sessionId && hasCumulativeUsage && !opts.isolated) {
           lastUsage = await queryCodexUsage(opts, sessionId, spawnFn);
           if (lastUsage) {
             try {

@@ -163,6 +163,27 @@ describe("runClaude", () => {
     await promise;
   });
 
+  it("runs isolated one-shot requests without tools, customizations, MCP, or persistence", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "title this",
+      cwd: "/tmp",
+      isolated: true,
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    expect(args).toEqual(expect.arrayContaining([
+      "--safe-mode",
+      "--tools",
+      "",
+      "--strict-mcp-config",
+      "--no-session-persistence",
+    ]));
+    finish(child);
+    await promise;
+  });
+
   it("passes --resume when resumeSessionId is provided", async () => {
     const child = makeFakeChild();
     const spawnFn = vi.fn().mockReturnValue(child);

@@ -89,6 +89,28 @@ describe("runCodex", () => {
     await promise;
   });
 
+  it("runs isolated one-shot requests read-only without config, rules, or persistence", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runCodex({
+      prompt: "title this",
+      cwd: "/tmp",
+      isolated: true,
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    expect(args).toEqual(expect.arrayContaining([
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--sandbox",
+      "read-only",
+    ]));
+    expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    finish(child);
+    await promise;
+  });
+
   it("rejects instead of throwing when spawnFn throws synchronously", async () => {
     await expect(
       runCodex({

@@ -31,6 +31,9 @@ export interface RunClaudeOptions extends CommonRunOptions {
   newSessionId?: string;
   /** Resume an existing session by id (turn 2+). Mutually exclusive with newSessionId. */
   resumeSessionId?: string;
+  /** Run a non-persistent one-shot request with customizations, tools, and MCP
+   * disabled. Intended for small metadata tasks such as chat titles. */
+  isolated?: boolean;
 }
 
 interface ClaudeContentBlock {
@@ -210,9 +213,21 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
       "newSessionId and resumeSessionId are mutually exclusive — pass one or the other",
     );
   }
+  if (opts.isolated && opts.resumeSessionId) {
+    throw new Error("isolated Claude runs cannot resume a session");
+  }
 
   const spawnFn = opts.spawnFn ?? nodeSpawn;
   const args: string[] = ["-p", "--output-format", "stream-json", "--verbose"];
+  if (opts.isolated) {
+    args.push(
+      "--safe-mode",
+      "--tools",
+      "",
+      "--strict-mcp-config",
+      "--no-session-persistence",
+    );
+  }
   if (opts.appendSystemPrompt) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
   }

@@ -35,6 +35,9 @@ export interface RunCodexOptions extends CommonRunOptions {
   /** Explicit context-window fallback (tokens). Codex app-server's reported
    * `modelContextWindow` is authoritative whenever it is available. */
   contextWindow?: number;
+  /** Run a non-persistent one-shot request in a read-only sandbox without
+   * user config or exec-policy rules. Intended for small metadata tasks. */
+  isolated?: boolean;
 }
 
 interface CodexStreamEvent {
@@ -341,6 +344,15 @@ function buildArgs(opts: RunCodexOptions): string[] {
     args.push("--dangerously-bypass-approvals-and-sandbox");
   }
   args.push("--skip-git-repo-check");
+  if (opts.isolated) {
+    args.push(
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--sandbox",
+      "read-only",
+    );
+  }
   if (opts.model !== undefined) {
     args.push("--model", opts.model);
   }
@@ -359,6 +371,12 @@ function buildArgs(opts: RunCodexOptions): string[] {
 /** Spawn a non-interactive Codex CLI turn (`codex exec --json`) and translate
  * its JSONL stream into the same callbacks used by the Claude runner. */
 export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
+  if (opts.isolated && opts.resumeSessionId) {
+    throw new Error("isolated Codex runs cannot resume a session");
+  }
+  if (opts.isolated && opts.dangerouslyBypassApprovalsAndSandbox) {
+    throw new Error("isolated Codex runs cannot bypass approvals and sandboxing");
+  }
   const spawnFn = opts.spawnFn ?? nodeSpawn;
   const child = spawnFn(opts.executablePath ?? "codex", buildArgs(opts), {
     cwd: opts.cwd,
@@ -470,7 +488,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
       }
       const exitCode = code ?? -1;
       const complete = async (): Promise<void> => {
-        if (exitCode === 0 && sessionId && hasCumulativeUsage) {
+        if (exitCode === 0 && sessionId && hasCumulativeUsage && !opts.isolated) {
           lastUsage = await queryCodexUsage(opts, sessionId, spawnFn);
           if (lastUsage) {
             try {

@@ -144,6 +144,9 @@ interface RunClaudeOptions extends CommonRunOptions {
     newSessionId?: string;
     /** Resume an existing session by id (turn 2+). Mutually exclusive with newSessionId. */
     resumeSessionId?: string;
+    /** Run a non-persistent one-shot request with customizations, tools, and MCP
+     * disabled. Intended for small metadata tasks such as chat titles. */
+    isolated?: boolean;
 }
 /** Spawn a non-interactive Claude Code CLI turn (`claude -p` with stream-json
  * output) and translate its JSONL stream into callbacks plus a final result. */
@@ -169,6 +172,9 @@ interface RunCodexOptions extends CommonRunOptions {
     /** Explicit context-window fallback (tokens). Codex app-server's reported
      * `modelContextWindow` is authoritative whenever it is available. */
     contextWindow?: number;
+    /** Run a non-persistent one-shot request in a read-only sandbox without
+     * user config or exec-policy rules. Intended for small metadata tasks. */
+    isolated?: boolean;
 }
 /** Spawn a non-interactive Codex CLI turn (`codex exec --json`) and translate
  * its JSONL stream into the same callbacks used by the Claude runner. */
