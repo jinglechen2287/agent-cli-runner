@@ -5,6 +5,9 @@ import {
   type SpawnOptions,
 } from "node:child_process";
 import { PassThrough } from "node:stream";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCodex } from "../src/index.js";
 
@@ -372,6 +375,214 @@ describe("runCodex", () => {
         endedAt: 3_000,
       }],
     ]);
+  });
+
+  it("observes collaboration lifecycle events omitted from Codex exec JSON", async () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "agent-cli-runner-codex-"));
+    const threadId = "019f8179-613c-7b32-adc0-efaf6f753e37";
+    const rolloutDirectory = join(codexHome, "sessions", "2026", "07", "20");
+    const rolloutPath = join(
+      rolloutDirectory,
+      `rollout-2026-07-20T14-40-45-${threadId}.jsonl`,
+    );
+    mkdirSync(rolloutDirectory, { recursive: true });
+    writeFileSync(rolloutPath, "");
+
+    const child = makeFakeChild();
+    const onBackgroundAgentUpdate = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      env: { ...process.env, CODEX_HOME: codexHome },
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate,
+    });
+
+    child.stdout.write(`${JSON.stringify({
+      type: "thread.started",
+      thread_id: threadId,
+    })}\n`);
+    appendFileSync(rolloutPath, [
+      {
+        timestamp: "1970-01-01T00:00:00.500Z",
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "spawn_agent",
+          namespace: "collaboration",
+          arguments: JSON.stringify({ task_name: "probe" }),
+          call_id: "call-spawn",
+        },
+      },
+      {
+        timestamp: "1970-01-01T00:00:01.000Z",
+        type: "event_msg",
+        payload: {
+          type: "sub_agent_activity",
+          event_id: "call-spawn",
+          occurred_at_ms: 1_000,
+          agent_thread_id: "agent-thread",
+          agent_path: "/root/probe",
+          kind: "started",
+        },
+      },
+      {
+        timestamp: "1970-01-01T00:00:02.000Z",
+        type: "response_item",
+        payload: {
+          type: "agent_message",
+          author: "/root/probe",
+          recipient: "/root",
+          content: [{
+            type: "input_text",
+            text: "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/probe\nPayload:\nprobe complete",
+          }],
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+
+    try {
+      await vi.waitFor(() => {
+        expect(onBackgroundAgentUpdate).toHaveBeenCalledTimes(2);
+      }, { timeout: 1_000 });
+    } finally {
+      finish(child);
+      await promise;
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+
+    expect(onBackgroundAgentUpdate.mock.calls).toEqual([
+      [{
+        id: "agent-thread",
+        provider: "codex",
+        parentToolCallId: "call-spawn",
+        description: "probe",
+        status: "running",
+        startedAt: 1_000,
+        updatedAt: 1_000,
+      }],
+      [{
+        id: "agent-thread",
+        provider: "codex",
+        parentToolCallId: "call-spawn",
+        description: "probe",
+        status: "completed",
+        summary: "probe complete",
+        startedAt: 1_000,
+        updatedAt: 2_000,
+        endedAt: 2_000,
+      }],
+    ]);
+  });
+
+  it("establishes the resumed rollout offset before sending the next prompt", async () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "agent-cli-runner-codex-resume-"));
+    const threadId = "019f8181-09b1-7113-8d78-9dc045aa0e7c";
+    const rolloutDirectory = join(codexHome, "sessions", "2026", "07", "20");
+    const rolloutPath = join(
+      rolloutDirectory,
+      `rollout-2026-07-20T14-48-28-${threadId}.jsonl`,
+    );
+    mkdirSync(rolloutDirectory, { recursive: true });
+    writeFileSync(rolloutPath, `${JSON.stringify({ type: "old-event" })}\n`);
+
+    const child = makeFakeChild();
+    const stdinData = readAll(child.stdin);
+    const onBackgroundAgentUpdate = vi.fn();
+    const promise = runCodex({
+      prompt: "resume",
+      cwd: "/tmp",
+      resumeSessionId: threadId,
+      env: { ...process.env, CODEX_HOME: codexHome },
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate,
+    });
+
+    await expect(stdinData).resolves.toBe("resume");
+    appendFileSync(rolloutPath, `${JSON.stringify({
+      timestamp: "1970-01-01T00:00:01.000Z",
+      type: "event_msg",
+      payload: {
+        type: "sub_agent_activity",
+        event_id: "call-resumed-spawn",
+        occurred_at_ms: 1_000,
+        agent_thread_id: "resumed-agent",
+        agent_path: "/root/resumed_probe",
+        kind: "started",
+      },
+    })}\n`);
+
+    try {
+      await vi.waitFor(() => {
+        expect(onBackgroundAgentUpdate).toHaveBeenCalledTimes(1);
+      }, { timeout: 1_000 });
+    } finally {
+      finish(child);
+      await promise;
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+
+    expect(onBackgroundAgentUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      id: "resumed-agent",
+      description: "resumed_probe",
+      status: "running",
+    }));
+  });
+
+  it("preserves rollout JSON when a UTF-8 character is split across polls", async () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "agent-cli-runner-codex-utf8-"));
+    const threadId = "019f8181-09b1-7113-8d78-9dc045aa0e7d";
+    const rolloutDirectory = join(codexHome, "sessions", "2026", "07", "20");
+    const rolloutPath = join(
+      rolloutDirectory,
+      `rollout-2026-07-20T14-48-28-${threadId}.jsonl`,
+    );
+    mkdirSync(rolloutDirectory, { recursive: true });
+    writeFileSync(rolloutPath, "");
+
+    const child = makeFakeChild();
+    const onBackgroundAgentUpdate = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      env: { ...process.env, CODEX_HOME: codexHome },
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate,
+    });
+    child.stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: threadId })}\n`);
+
+    const line = Buffer.from(JSON.stringify({
+      timestamp: "1970-01-01T00:00:01.000Z",
+      type: "event_msg",
+      payload: {
+        type: "sub_agent_activity",
+        event_id: "call-utf8",
+        occurred_at_ms: 1_000,
+        agent_thread_id: "utf8-agent",
+        agent_path: "/root/探査",
+        kind: "started",
+      },
+    }));
+    const characterOffset = line.indexOf(Buffer.from("探"));
+    appendFileSync(rolloutPath, line.subarray(0, characterOffset + 1));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    appendFileSync(rolloutPath, Buffer.concat([
+      line.subarray(characterOffset + 1),
+      Buffer.from("\n"),
+    ]));
+
+    try {
+      await vi.waitFor(() => {
+        expect(onBackgroundAgentUpdate).toHaveBeenCalledWith(expect.objectContaining({
+          id: "utf8-agent",
+          description: "探査",
+        }));
+      }, { timeout: 1_000 });
+    } finally {
+      finish(child);
+      await promise;
+      rmSync(codexHome, { recursive: true, force: true });
+    }
   });
 
   it("normalizes Codex agent failures and their messages", async () => {

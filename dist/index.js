@@ -531,10 +531,15 @@ async function runClaude(opts) {
 
 // src/run-codex.ts
 import { spawn as nodeSpawn3 } from "child_process";
+import { open, readdir, stat } from "fs/promises";
+import { homedir } from "os";
+import { join } from "path";
+import { StringDecoder as StringDecoder2 } from "string_decoder";
 var CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"];
 var APP_SERVER_INITIALIZE_ID = 1;
 var APP_SERVER_RESUME_ID = 2;
 var APP_SERVER_USAGE_TIMEOUT_MS = 5e3;
+var ROLLOUT_POLL_INTERVAL_MS = 50;
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -558,6 +563,126 @@ function codexBackgroundAgentStatus(status) {
 }
 function isTerminalBackgroundAgentStatus(status) {
   return status === "completed" || status === "failed" || status === "interrupted";
+}
+async function findCodexRollout(root, threadId) {
+  const suffix = `${threadId}.jsonl`;
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    if (!directory) break;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(path);
+      else if (entry.isFile() && entry.name.endsWith(suffix)) return path;
+    }
+  }
+  return void 0;
+}
+function tailCodexRollout(threadId, env, fromStart, onLine) {
+  const sessionsRoot = join(env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions");
+  let rolloutPath;
+  let offset;
+  let partial = "";
+  const decoder = new StringDecoder2("utf8");
+  let closed = false;
+  let timer;
+  let inFlight = Promise.resolve();
+  const readAvailable = async () => {
+    rolloutPath ??= await findCodexRollout(sessionsRoot, threadId);
+    if (!rolloutPath) return;
+    let size;
+    try {
+      size = (await stat(rolloutPath)).size;
+    } catch {
+      return;
+    }
+    if (offset === void 0) offset = fromStart ? 0 : size;
+    if (size <= offset) return;
+    const length = size - offset;
+    const buffer = Buffer.alloc(length);
+    const file = await open(rolloutPath, "r");
+    try {
+      const { bytesRead } = await file.read(buffer, 0, length, offset);
+      offset += bytesRead;
+      partial += decoder.write(buffer.subarray(0, bytesRead));
+    } finally {
+      await file.close();
+    }
+    const lines = partial.split("\n");
+    partial = lines.pop() ?? "";
+    for (const line of lines) {
+      if (line.trim()) onLine(line);
+    }
+  };
+  const poll = () => {
+    inFlight = readAvailable().catch(() => {
+    }).finally(() => {
+      if (closed) return;
+      timer = setTimeout(poll, ROLLOUT_POLL_INTERVAL_MS);
+      timer.unref?.();
+    });
+  };
+  poll();
+  return {
+    async ready() {
+      await inFlight;
+    },
+    async stop() {
+      closed = true;
+      if (timer) clearTimeout(timer);
+      await inFlight;
+      await readAvailable().catch(() => {
+      });
+      partial += decoder.end();
+      if (partial.trim()) onLine(partial);
+      partial = "";
+    }
+  };
+}
+function rolloutTimestamp(event, payload) {
+  if (typeof payload?.occurred_at_ms === "number") return payload.occurred_at_ms;
+  if (typeof event.timestamp === "string") {
+    const parsed = Date.parse(event.timestamp);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Date.now();
+}
+function rolloutContentText(content) {
+  if (!Array.isArray(content)) return void 0;
+  const text = content.flatMap((part) => {
+    if (!isRecord(part) || typeof part.text !== "string") return [];
+    return [part.text];
+  }).join("\n").trim();
+  return text || void 0;
+}
+function finalAgentMessage(text) {
+  if (!/^Message Type: FINAL_ANSWER$/m.test(text)) return void 0;
+  const marker = "Payload:\n";
+  const markerIndex = text.indexOf(marker);
+  return (markerIndex === -1 ? text : text.slice(markerIndex + marker.length)).trim();
+}
+function rolloutActivityStatus(kind) {
+  switch (kind) {
+    case "started":
+      return "running";
+    case "completed":
+      return "completed";
+    case "failed":
+    case "errored":
+      return "failed";
+    case "interrupted":
+    case "stopped":
+    case "shutdown":
+      return "interrupted";
+    default:
+      return void 0;
+  }
 }
 function toCodexUsage(params, threadId, model, explicitContextWindow) {
   if (!isRecord(params) || params.threadId !== threadId || !isRecord(params.tokenUsage)) {
@@ -820,7 +945,6 @@ async function runCodex(opts) {
     env: filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS),
     detached: process.platform !== "win32"
   });
-  writePrompt(child, opts.prompt);
   return new Promise((resolve, reject) => {
     let settled = false;
     let sessionId;
@@ -829,6 +953,9 @@ async function runCodex(opts) {
     let lastUsage;
     const emittedTools = /* @__PURE__ */ new Set();
     const backgroundAgents = /* @__PURE__ */ new Map();
+    const backgroundAgentIdsByPath = /* @__PURE__ */ new Map();
+    const backgroundAgentDescriptions = /* @__PURE__ */ new Map();
+    let rolloutTail;
     let hasCumulativeUsage = false;
     const lifecycle = watchLifecycle({
       cli: "codex",
@@ -836,6 +963,86 @@ async function runCodex(opts) {
       timeoutMs: opts.timeoutMs,
       kill: (signal) => signalProcessTree(child, signal)
     });
+    const emitBackgroundAgent = (agent) => {
+      backgroundAgents.set(agent.id, agent);
+      try {
+        opts.onBackgroundAgentUpdate?.(agent);
+      } catch {
+      }
+    };
+    const handleRolloutLine = (line) => {
+      let event;
+      try {
+        const parsed = JSON.parse(line);
+        if (!isRecord(parsed)) return;
+        event = parsed;
+      } catch {
+        return;
+      }
+      if (!isRecord(event.payload)) return;
+      const payload = event.payload;
+      if (event.type === "response_item" && payload.type === "function_call" && payload.namespace === "collaboration" && (payload.name === "spawn_agent" || payload.name === "spawnAgent") && typeof payload.call_id === "string") {
+        if (typeof payload.arguments !== "string") return;
+        try {
+          const args = JSON.parse(payload.arguments);
+          if (isRecord(args) && typeof args.task_name === "string") {
+            backgroundAgentDescriptions.set(payload.call_id, args.task_name);
+          }
+        } catch {
+        }
+        return;
+      }
+      if (event.type === "event_msg" && payload.type === "sub_agent_activity" && typeof payload.agent_thread_id === "string") {
+        const id = payload.agent_thread_id;
+        const current = backgroundAgents.get(id);
+        const status = rolloutActivityStatus(payload.kind) ?? current?.status ?? "running";
+        const updatedAt = rolloutTimestamp(event, payload);
+        const parentToolCallId = typeof payload.event_id === "string" ? payload.event_id : current?.parentToolCallId;
+        const agentPath = typeof payload.agent_path === "string" ? payload.agent_path : void 0;
+        if (agentPath) backgroundAgentIdsByPath.set(agentPath, id);
+        const description = current?.description ?? (parentToolCallId ? backgroundAgentDescriptions.get(parentToolCallId) : void 0) ?? agentPath?.split("/").filter(Boolean).at(-1);
+        emitBackgroundAgent({
+          ...current ?? {
+            id,
+            provider: "codex",
+            startedAt: updatedAt
+          },
+          ...parentToolCallId ? { parentToolCallId } : {},
+          ...description ? { description } : {},
+          status,
+          updatedAt,
+          ...isTerminalBackgroundAgentStatus(status) ? { endedAt: current?.endedAt ?? updatedAt } : {}
+        });
+        return;
+      }
+      if (event.type === "response_item" && payload.type === "agent_message" && typeof payload.author === "string") {
+        const id = backgroundAgentIdsByPath.get(payload.author);
+        if (!id) return;
+        const current = backgroundAgents.get(id);
+        if (!current) return;
+        const text = rolloutContentText(payload.content);
+        if (!text) return;
+        const finalSummary = finalAgentMessage(text);
+        const updatedAt = rolloutTimestamp(event);
+        emitBackgroundAgent({
+          ...current,
+          status: finalSummary === void 0 ? current.status : "completed",
+          summary: finalSummary ?? text,
+          updatedAt,
+          ...finalSummary === void 0 ? {} : { endedAt: updatedAt }
+        });
+      }
+    };
+    const startRolloutTail = (threadId, fromStart) => {
+      if (rolloutTail || opts.isolated || !opts.onBackgroundAgentUpdate) return;
+      rolloutTail = tailCodexRollout(
+        threadId,
+        opts.env ?? process.env,
+        fromStart,
+        handleRolloutLine
+      );
+    };
+    if (opts.resumeSessionId) startRolloutTail(opts.resumeSessionId, false);
     const handleLine = (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -852,6 +1059,7 @@ async function runCodex(opts) {
       }
       if (event.type === "thread.started" && typeof event.thread_id === "string") {
         sessionId = event.thread_id;
+        startRolloutTail(event.thread_id, !opts.resumeSessionId);
         opts.onSessionId?.(event.thread_id);
         return;
       }
@@ -895,11 +1103,7 @@ async function runCodex(opts) {
           } else {
             delete agent.error;
           }
-          backgroundAgents.set(id2, agent);
-          try {
-            opts.onBackgroundAgentUpdate?.(agent);
-          } catch {
-          }
+          emitBackgroundAgent(agent);
         }
         return;
       }
@@ -932,6 +1136,7 @@ async function runCodex(opts) {
       if (settled) return;
       settled = true;
       lifecycle.cleanup();
+      void rolloutTail?.stop();
       reject(isMissingExecutable(error) ? new MissingCliError("codex") : error);
     });
     child.on("close", (code) => {
@@ -939,18 +1144,19 @@ async function runCodex(opts) {
       settled = true;
       splitter.flush();
       lifecycle.cleanup();
-      const interruption = lifecycle.interruptionError();
-      if (interruption) {
-        reject(interruption);
-        return;
-      }
-      if (fatalError) {
-        fatalError.exitCode = code ?? -1;
-        reject(fatalError);
-        return;
-      }
-      const exitCode = code ?? -1;
       const complete = async () => {
+        if (rolloutTail) await rolloutTail.stop();
+        const interruption = lifecycle.interruptionError();
+        if (interruption) {
+          reject(interruption);
+          return;
+        }
+        if (fatalError) {
+          fatalError.exitCode = code ?? -1;
+          reject(fatalError);
+          return;
+        }
+        const exitCode = code ?? -1;
         if (exitCode === 0 && sessionId && hasCumulativeUsage && !opts.isolated) {
           lastUsage = await queryCodexUsage(opts, sessionId, spawnFn);
           if (lastUsage) {
@@ -968,6 +1174,17 @@ async function runCodex(opts) {
         });
       };
       void complete();
+    });
+    const sendPrompt = async () => {
+      if (rolloutTail) await rolloutTail.ready();
+      writePrompt(child, opts.prompt);
+    };
+    void sendPrompt().catch((error) => {
+      if (settled) return;
+      settled = true;
+      lifecycle.cleanup();
+      void rolloutTail?.stop();
+      reject(error);
     });
   });
 }

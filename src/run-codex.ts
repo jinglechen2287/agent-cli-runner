@@ -1,4 +1,8 @@
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { open, readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { CodexTurnError, MissingCliError } from "./errors.js";
 import {
   createLineSplitter,
@@ -67,6 +71,7 @@ interface AppServerMessage {
 const APP_SERVER_INITIALIZE_ID = 1;
 const APP_SERVER_RESUME_ID = 2;
 const APP_SERVER_USAGE_TIMEOUT_MS = 5_000;
+const ROLLOUT_POLL_INTERVAL_MS = 50;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -93,6 +98,149 @@ function codexBackgroundAgentStatus(status: unknown): BackgroundAgentStatus | un
 
 function isTerminalBackgroundAgentStatus(status: BackgroundAgentStatus): boolean {
   return status === "completed" || status === "failed" || status === "interrupted";
+}
+
+interface CodexRolloutTail {
+  ready(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+async function findCodexRollout(root: string, threadId: string): Promise<string | undefined> {
+  const suffix = `${threadId}.jsonl`;
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    if (!directory) break;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(path);
+      else if (entry.isFile() && entry.name.endsWith(suffix)) return path;
+    }
+  }
+  return undefined;
+}
+
+/** `codex exec --json` intentionally omits collaboration activity from
+ * stdout in current Codex releases. The local rollout is the only live event
+ * source for spawned-agent activity, so tail just that parent thread's file.
+ * Rollouts stay local; only normalized lifecycle snapshots leave this layer. */
+function tailCodexRollout(
+  threadId: string,
+  env: NodeJS.ProcessEnv,
+  fromStart: boolean,
+  onLine: (line: string) => void,
+): CodexRolloutTail {
+  const sessionsRoot = join(env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions");
+  let rolloutPath: string | undefined;
+  let offset: number | undefined;
+  let partial = "";
+  const decoder = new StringDecoder("utf8");
+  let closed = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let inFlight: Promise<void> = Promise.resolve();
+
+  const readAvailable = async (): Promise<void> => {
+    rolloutPath ??= await findCodexRollout(sessionsRoot, threadId);
+    if (!rolloutPath) return;
+    let size: number;
+    try {
+      size = (await stat(rolloutPath)).size;
+    } catch {
+      return;
+    }
+    if (offset === undefined) offset = fromStart ? 0 : size;
+    if (size <= offset) return;
+    const length = size - offset;
+    const buffer = Buffer.alloc(length);
+    const file = await open(rolloutPath, "r");
+    try {
+      const { bytesRead } = await file.read(buffer, 0, length, offset);
+      offset += bytesRead;
+      partial += decoder.write(buffer.subarray(0, bytesRead));
+    } finally {
+      await file.close();
+    }
+    const lines = partial.split("\n");
+    partial = lines.pop() ?? "";
+    for (const line of lines) {
+      if (line.trim()) onLine(line);
+    }
+  };
+
+  const poll = (): void => {
+    inFlight = readAvailable()
+      .catch(() => {})
+      .finally(() => {
+        if (closed) return;
+        timer = setTimeout(poll, ROLLOUT_POLL_INTERVAL_MS);
+        timer.unref?.();
+      });
+  };
+  poll();
+
+  return {
+    async ready() {
+      await inFlight;
+    },
+    async stop() {
+      closed = true;
+      if (timer) clearTimeout(timer);
+      await inFlight;
+      await readAvailable().catch(() => {});
+      partial += decoder.end();
+      if (partial.trim()) onLine(partial);
+      partial = "";
+    },
+  };
+}
+
+function rolloutTimestamp(event: Record<string, unknown>, payload?: Record<string, unknown>): number {
+  if (typeof payload?.occurred_at_ms === "number") return payload.occurred_at_ms;
+  if (typeof event.timestamp === "string") {
+    const parsed = Date.parse(event.timestamp);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Date.now();
+}
+
+function rolloutContentText(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const text = content.flatMap((part) => {
+    if (!isRecord(part) || typeof part.text !== "string") return [];
+    return [part.text];
+  }).join("\n").trim();
+  return text || undefined;
+}
+
+function finalAgentMessage(text: string): string | undefined {
+  if (!/^Message Type: FINAL_ANSWER$/m.test(text)) return undefined;
+  const marker = "Payload:\n";
+  const markerIndex = text.indexOf(marker);
+  return (markerIndex === -1 ? text : text.slice(markerIndex + marker.length)).trim();
+}
+
+function rolloutActivityStatus(kind: unknown): BackgroundAgentStatus | undefined {
+  switch (kind) {
+    case "started":
+      return "running";
+    case "completed":
+      return "completed";
+    case "failed":
+    case "errored":
+      return "failed";
+    case "interrupted":
+    case "stopped":
+    case "shutdown":
+      return "interrupted";
+    default:
+      return undefined;
+  }
 }
 
 /** Convert app-server's authoritative last-request snapshot into the shared
@@ -414,7 +562,6 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
     env: filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS),
     detached: process.platform !== "win32",
   });
-  writePrompt(child, opts.prompt);
 
   return new Promise<RunResult>((resolve, reject) => {
     let settled = false;
@@ -424,6 +571,9 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
     let lastUsage: TokenUsage | undefined;
     const emittedTools = new Set<string>();
     const backgroundAgents = new Map<string, BackgroundAgentInfo>();
+    const backgroundAgentIdsByPath = new Map<string, string>();
+    const backgroundAgentDescriptions = new Map<string, string>();
+    let rolloutTail: CodexRolloutTail | undefined;
     let hasCumulativeUsage = false;
 
     const lifecycle = watchLifecycle({
@@ -432,6 +582,118 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
       timeoutMs: opts.timeoutMs,
       kill: (signal) => signalProcessTree(child, signal),
     });
+
+    const emitBackgroundAgent = (agent: BackgroundAgentInfo): void => {
+      backgroundAgents.set(agent.id, agent);
+      try {
+        opts.onBackgroundAgentUpdate?.(agent);
+      } catch {
+        // A host callback must not interrupt the provider stream.
+      }
+    };
+
+    const handleRolloutLine = (line: string): void => {
+      let event: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        if (!isRecord(parsed)) return;
+        event = parsed;
+      } catch {
+        return;
+      }
+      if (!isRecord(event.payload)) return;
+      const payload = event.payload;
+
+      if (
+        event.type === "response_item"
+        && payload.type === "function_call"
+        && payload.namespace === "collaboration"
+        && (payload.name === "spawn_agent" || payload.name === "spawnAgent")
+        && typeof payload.call_id === "string"
+      ) {
+        if (typeof payload.arguments !== "string") return;
+        try {
+          const args = JSON.parse(payload.arguments) as unknown;
+          if (isRecord(args) && typeof args.task_name === "string") {
+            backgroundAgentDescriptions.set(payload.call_id, args.task_name);
+          }
+        } catch {
+          // The task prompt may be encrypted, but malformed metadata should
+          // not prevent the following activity event from creating the row.
+        }
+        return;
+      }
+
+      if (
+        event.type === "event_msg"
+        && payload.type === "sub_agent_activity"
+        && typeof payload.agent_thread_id === "string"
+      ) {
+        const id = payload.agent_thread_id;
+        const current = backgroundAgents.get(id);
+        const status = rolloutActivityStatus(payload.kind) ?? current?.status ?? "running";
+        const updatedAt = rolloutTimestamp(event, payload);
+        const parentToolCallId = typeof payload.event_id === "string"
+          ? payload.event_id
+          : current?.parentToolCallId;
+        const agentPath = typeof payload.agent_path === "string"
+          ? payload.agent_path
+          : undefined;
+        if (agentPath) backgroundAgentIdsByPath.set(agentPath, id);
+        const description = current?.description
+          ?? (parentToolCallId ? backgroundAgentDescriptions.get(parentToolCallId) : undefined)
+          ?? agentPath?.split("/").filter(Boolean).at(-1);
+        emitBackgroundAgent({
+          ...(current ?? {
+            id,
+            provider: "codex" as const,
+            startedAt: updatedAt,
+          }),
+          ...(parentToolCallId ? { parentToolCallId } : {}),
+          ...(description ? { description } : {}),
+          status,
+          updatedAt,
+          ...(isTerminalBackgroundAgentStatus(status)
+            ? { endedAt: current?.endedAt ?? updatedAt }
+            : {}),
+        });
+        return;
+      }
+
+      if (
+        event.type === "response_item"
+        && payload.type === "agent_message"
+        && typeof payload.author === "string"
+      ) {
+        const id = backgroundAgentIdsByPath.get(payload.author);
+        if (!id) return;
+        const current = backgroundAgents.get(id);
+        if (!current) return;
+        const text = rolloutContentText(payload.content);
+        if (!text) return;
+        const finalSummary = finalAgentMessage(text);
+        const updatedAt = rolloutTimestamp(event);
+        emitBackgroundAgent({
+          ...current,
+          status: finalSummary === undefined ? current.status : "completed",
+          summary: finalSummary ?? text,
+          updatedAt,
+          ...(finalSummary === undefined ? {} : { endedAt: updatedAt }),
+        });
+      }
+    };
+
+    const startRolloutTail = (threadId: string, fromStart: boolean): void => {
+      if (rolloutTail || opts.isolated || !opts.onBackgroundAgentUpdate) return;
+      rolloutTail = tailCodexRollout(
+        threadId,
+        opts.env ?? process.env,
+        fromStart,
+        handleRolloutLine,
+      );
+    };
+
+    if (opts.resumeSessionId) startRolloutTail(opts.resumeSessionId, false);
 
     const handleLine = (line: string): void => {
       const trimmed = line.trim();
@@ -449,6 +711,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
       }
       if (event.type === "thread.started" && typeof event.thread_id === "string") {
         sessionId = event.thread_id;
+        startRolloutTail(event.thread_id, !opts.resumeSessionId);
         opts.onSessionId?.(event.thread_id);
         return;
       }
@@ -503,12 +766,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
           } else {
             delete agent.error;
           }
-          backgroundAgents.set(id, agent);
-          try {
-            opts.onBackgroundAgentUpdate?.(agent);
-          } catch {
-            // A host callback must not interrupt the provider stream.
-          }
+          emitBackgroundAgent(agent);
         }
         return;
       }
@@ -547,6 +805,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
       if (settled) return;
       settled = true;
       lifecycle.cleanup();
+      void rolloutTail?.stop();
       reject(isMissingExecutable(error) ? new MissingCliError("codex") : error);
     });
 
@@ -555,18 +814,19 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
       settled = true;
       splitter.flush();
       lifecycle.cleanup();
-      const interruption = lifecycle.interruptionError();
-      if (interruption) {
-        reject(interruption);
-        return;
-      }
-      if (fatalError) {
-        fatalError.exitCode = code ?? -1;
-        reject(fatalError);
-        return;
-      }
-      const exitCode = code ?? -1;
       const complete = async (): Promise<void> => {
+        if (rolloutTail) await rolloutTail.stop();
+        const interruption = lifecycle.interruptionError();
+        if (interruption) {
+          reject(interruption);
+          return;
+        }
+        if (fatalError) {
+          fatalError.exitCode = code ?? -1;
+          reject(fatalError);
+          return;
+        }
+        const exitCode = code ?? -1;
         if (exitCode === 0 && sessionId && hasCumulativeUsage && !opts.isolated) {
           lastUsage = await queryCodexUsage(opts, sessionId, spawnFn);
           if (lastUsage) {
@@ -585,6 +845,18 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
         });
       };
       void complete();
+    });
+
+    const sendPrompt = async (): Promise<void> => {
+      if (rolloutTail) await rolloutTail.ready();
+      writePrompt(child, opts.prompt);
+    };
+    void sendPrompt().catch((error: unknown) => {
+      if (settled) return;
+      settled = true;
+      lifecycle.cleanup();
+      void rolloutTail?.stop();
+      reject(error);
     });
   });
 }
