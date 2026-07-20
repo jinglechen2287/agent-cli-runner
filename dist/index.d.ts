@@ -86,6 +86,31 @@ interface ToolPlanItem {
     text: string;
     status: string;
 }
+/** Provider-normalized state of a background subagent. Each callback carries
+ * a complete snapshot and supersedes the prior snapshot with the same `id`. */
+type BackgroundAgentStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
+interface BackgroundAgentProgress {
+    totalTokens?: number;
+    toolUses?: number;
+    durationMs?: number;
+    lastToolName?: string;
+}
+interface BackgroundAgentInfo {
+    /** Claude task id or Codex child thread id. Stable within the parent turn. */
+    id: string;
+    provider: "claude" | "codex";
+    /** Tool invocation that originally spawned the agent, when reported. */
+    parentToolCallId?: string;
+    description?: string;
+    agentType?: string;
+    status: BackgroundAgentStatus;
+    summary?: string;
+    error?: string;
+    progress?: BackgroundAgentProgress;
+    startedAt: number;
+    updatedAt: number;
+    endedAt?: number;
+}
 interface AgentCallbacks {
     /** Fired once with the CLI's session/thread id as soon as it is known. */
     onSessionId?: (id: string) => void;
@@ -95,6 +120,9 @@ interface AgentCallbacks {
     onToolUse?: (info: ToolUseInfo) => void;
     /** Fired when the provider reports the result for a tool invocation. */
     onToolResult?: (info: ToolResultInfo) => void;
+    /** Fired whenever a background subagent starts, progresses, or finishes.
+     * Repeated calls with the same id are replace-in-place snapshots. */
+    onBackgroundAgentUpdate?: (info: BackgroundAgentInfo) => void;
     /** Raw stderr chunks from the CLI process. */
     onStderr?: (chunk: string) => void;
     /** Fired with a normalized context-usage snapshot whenever the CLI reports
@@ -200,4 +228,4 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, CodexTurnError, type CommonRunOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, CodexTurnError, type CommonRunOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, runClaude, runCodex };

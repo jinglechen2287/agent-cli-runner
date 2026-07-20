@@ -42,6 +42,7 @@ function finish(child: FakeChild, code: number | null = 0): void {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.useRealTimers();
 });
 
 describe("runCodex", () => {
@@ -253,6 +254,199 @@ describe("runCodex", () => {
       }],
     ]);
     expect(result).toEqual({ text: "Done", exitCode: 0, sessionId: "thread-1" });
+  });
+
+  it("emits mutable lifecycle snapshots for spawned agents", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const child = makeFakeChild();
+    const onBackgroundAgentUpdate = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate,
+    });
+
+    child.stdout.write(JSON.stringify({
+      type: "item.started",
+      item: {
+        id: "collab-1",
+        type: "collab_tool_call",
+        tool: "spawn_agent",
+        sender_thread_id: "root-thread",
+        receiver_thread_ids: ["agent-thread"],
+        prompt: "Inspect authentication",
+        agents_states: { "agent-thread": { status: "running" } },
+        status: "in_progress",
+      },
+    }) + "\n");
+    vi.setSystemTime(2_000);
+    child.stdout.write(JSON.stringify({
+      type: "item.updated",
+      item: {
+        id: "collab-2",
+        type: "collab_tool_call",
+        tool: "wait",
+        sender_thread_id: "root-thread",
+        receiver_thread_ids: ["agent-thread"],
+        agents_states: {
+          "agent-thread": { status: "running", message: "Checking middleware" },
+        },
+        status: "in_progress",
+      },
+    }) + "\n");
+    vi.setSystemTime(3_000);
+    child.stdout.write(JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "collab-2",
+        type: "collab_tool_call",
+        tool: "wait",
+        sender_thread_id: "root-thread",
+        receiver_thread_ids: ["agent-thread"],
+        agents_states: {
+          "agent-thread": { status: "completed", message: "Found the session middleware" },
+        },
+        status: "completed",
+      },
+    }) + "\n");
+    vi.setSystemTime(4_000);
+    child.stdout.write(JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "collab-3",
+        type: "collab_tool_call",
+        tool: "close_agent",
+        sender_thread_id: "root-thread",
+        receiver_thread_ids: ["agent-thread"],
+        agents_states: {
+          "agent-thread": { status: "completed", message: "Agent closed" },
+        },
+        status: "completed",
+      },
+    }) + "\n");
+    finish(child);
+    await promise;
+
+    expect(onBackgroundAgentUpdate.mock.calls).toEqual([
+      [{
+        id: "agent-thread",
+        provider: "codex",
+        parentToolCallId: "collab-1",
+        description: "Inspect authentication",
+        status: "running",
+        startedAt: 1_000,
+        updatedAt: 1_000,
+      }],
+      [{
+        id: "agent-thread",
+        provider: "codex",
+        parentToolCallId: "collab-1",
+        description: "Inspect authentication",
+        status: "running",
+        summary: "Checking middleware",
+        startedAt: 1_000,
+        updatedAt: 2_000,
+      }],
+      [{
+        id: "agent-thread",
+        provider: "codex",
+        parentToolCallId: "collab-1",
+        description: "Inspect authentication",
+        status: "completed",
+        summary: "Found the session middleware",
+        startedAt: 1_000,
+        updatedAt: 3_000,
+        endedAt: 3_000,
+      }],
+      [{
+        id: "agent-thread",
+        provider: "codex",
+        parentToolCallId: "collab-1",
+        description: "Inspect authentication",
+        status: "completed",
+        summary: "Agent closed",
+        startedAt: 1_000,
+        updatedAt: 4_000,
+        endedAt: 3_000,
+      }],
+    ]);
+  });
+
+  it("normalizes Codex agent failures and their messages", async () => {
+    const child = makeFakeChild();
+    const onBackgroundAgentUpdate = vi.fn();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate,
+    });
+    child.stdout.write(JSON.stringify({
+      type: "item.started",
+      item: {
+        id: "collab-failed",
+        type: "collab_tool_call",
+        tool: "spawn_agent",
+        receiver_thread_ids: ["agent-failed"],
+        prompt: "Inspect authentication",
+        agents_states: {
+          "agent-failed": { status: "running", message: "Checking authentication" },
+        },
+        status: "in_progress",
+      },
+    }) + "\n");
+    child.stdout.write(JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "collab-failed",
+        type: "collab_tool_call",
+        tool: "spawn_agent",
+        receiver_thread_ids: ["agent-failed"],
+        prompt: "Inspect authentication",
+        agents_states: {
+          "agent-failed": { status: "errored", message: "Subagent crashed" },
+        },
+        status: "failed",
+      },
+    }) + "\n");
+    finish(child);
+    await promise;
+
+    const failed = onBackgroundAgentUpdate.mock.calls.at(-1)?.[0];
+    expect(failed).toEqual(expect.objectContaining({
+      id: "agent-failed",
+      status: "failed",
+      error: "Subagent crashed",
+      endedAt: expect.any(Number),
+    }));
+    expect(failed).not.toHaveProperty("summary");
+  });
+
+  it("contains background-agent callback errors", async () => {
+    const child = makeFakeChild();
+    const promise = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate: () => {
+        throw new Error("host callback failed");
+      },
+    });
+    expect(() => child.stdout.write(JSON.stringify({
+      type: "item.started",
+      item: {
+        id: "collab-1",
+        type: "collab_tool_call",
+        tool: "spawn_agent",
+        receiver_thread_ids: ["agent-thread"],
+        agents_states: { "agent-thread": { status: "running" } },
+        status: "in_progress",
+      },
+    }) + "\n")).not.toThrow();
+    finish(child);
+    await expect(promise).resolves.toMatchObject({ exitCode: 0 });
   });
 
   it("reports the app-server's last-request usage and authoritative window", async () => {

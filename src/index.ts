@@ -10,6 +10,9 @@ export {
 } from "./errors.js";
 export type {
   AgentCallbacks,
+  BackgroundAgentInfo,
+  BackgroundAgentProgress,
+  BackgroundAgentStatus,
   CommonRunOptions,
   RunResult,
   SpawnFn,

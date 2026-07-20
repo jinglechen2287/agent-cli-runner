@@ -29,6 +29,7 @@ const first = await runClaude({
   onAssistantText: (text) => console.log(text),
   onToolUse: ({ name }) => console.log(`tool: ${name}`),
   onToolResult: ({ callId }) => console.log(`tool result: ${callId}`),
+  onBackgroundAgentUpdate: (agent) => console.log(`${agent.id}: ${agent.status}`),
 });
 
 // Follow-up turn: resume it.
@@ -70,7 +71,7 @@ interface RunResult {
 | `timeoutMs` | Optional wall-clock limit; same kill path, rejects `TimeoutError`. No timeout by default. |
 | `env` | Base child environment (default `process.env`). Nesting-guard variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ACCESS_TOKEN` for Claude; `CODEX_THREAD_ID` for Codex) are always stripped. |
 | `spawnFn` | Injectable spawn primitive for tests. |
-| `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onUsage`, `onStderr` | Streaming callbacks. Claude tool uses and results share a provider call ID so hosts can correlate them. Codex tool items are mapped to Claude-style tool names (`command_execution` → `Bash`, `file_change` → `Edit`, `todo_list`/`plan_update` → `TodoWrite`). Codex plan snapshots are normalized as `ToolUseInfo.planItems`. Usage snapshots always describe the latest request's context occupancy, never cumulative turn totals. |
+| `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onBackgroundAgentUpdate`, `onUsage`, `onStderr` | Streaming callbacks. Claude tool uses and results share a provider call ID so hosts can correlate them. Codex tool items are mapped to Claude-style tool names (`command_execution` → `Bash`, `file_change` → `Edit`, `todo_list`/`plan_update` → `TodoWrite`). Codex plan snapshots are normalized as `ToolUseInfo.planItems`. Background subagents emit complete, replace-in-place snapshots keyed by their Claude task id or Codex child thread id. Usage snapshots always describe the latest request's context occupancy, never cumulative turn totals. |
 
 ### Claude-specific
 

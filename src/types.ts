@@ -41,6 +41,39 @@ export interface ToolPlanItem {
   status: string;
 }
 
+/** Provider-normalized state of a background subagent. Each callback carries
+ * a complete snapshot and supersedes the prior snapshot with the same `id`. */
+export type BackgroundAgentStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted";
+
+export interface BackgroundAgentProgress {
+  totalTokens?: number;
+  toolUses?: number;
+  durationMs?: number;
+  lastToolName?: string;
+}
+
+export interface BackgroundAgentInfo {
+  /** Claude task id or Codex child thread id. Stable within the parent turn. */
+  id: string;
+  provider: "claude" | "codex";
+  /** Tool invocation that originally spawned the agent, when reported. */
+  parentToolCallId?: string;
+  description?: string;
+  agentType?: string;
+  status: BackgroundAgentStatus;
+  summary?: string;
+  error?: string;
+  progress?: BackgroundAgentProgress;
+  startedAt: number;
+  updatedAt: number;
+  endedAt?: number;
+}
+
 export interface AgentCallbacks {
   /** Fired once with the CLI's session/thread id as soon as it is known. */
   onSessionId?: (id: string) => void;
@@ -50,6 +83,9 @@ export interface AgentCallbacks {
   onToolUse?: (info: ToolUseInfo) => void;
   /** Fired when the provider reports the result for a tool invocation. */
   onToolResult?: (info: ToolResultInfo) => void;
+  /** Fired whenever a background subagent starts, progresses, or finishes.
+   * Repeated calls with the same id are replace-in-place snapshots. */
+  onBackgroundAgentUpdate?: (info: BackgroundAgentInfo) => void;
   /** Raw stderr chunks from the CLI process. */
   onStderr?: (chunk: string) => void;
   /** Fired with a normalized context-usage snapshot whenever the CLI reports

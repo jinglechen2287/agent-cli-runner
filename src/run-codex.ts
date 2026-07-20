@@ -11,7 +11,14 @@ import {
   watchLifecycle,
   writePrompt,
 } from "./internal.js";
-import type { CommonRunOptions, RunResult, SpawnFn, ToolPlanItem } from "./types.js";
+import type {
+  BackgroundAgentInfo,
+  BackgroundAgentStatus,
+  CommonRunOptions,
+  RunResult,
+  SpawnFn,
+  ToolPlanItem,
+} from "./types.js";
 import type { TokenUsage } from "./usage.js";
 
 /** Stripped so a Codex turn spawned from within another Codex session does
@@ -63,6 +70,29 @@ const APP_SERVER_USAGE_TIMEOUT_MS = 5_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function codexBackgroundAgentStatus(status: unknown): BackgroundAgentStatus | undefined {
+  switch (status) {
+    case "pending_init":
+      return "pending";
+    case "running":
+      return "running";
+    case "completed":
+      return "completed";
+    case "errored":
+    case "not_found":
+      return "failed";
+    case "interrupted":
+    case "shutdown":
+      return "interrupted";
+    default:
+      return undefined;
+  }
+}
+
+function isTerminalBackgroundAgentStatus(status: BackgroundAgentStatus): boolean {
+  return status === "completed" || status === "failed" || status === "interrupted";
 }
 
 /** Convert app-server's authoritative last-request snapshot into the shared
@@ -393,6 +423,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
     let fatalError: CodexTurnError | undefined;
     let lastUsage: TokenUsage | undefined;
     const emittedTools = new Set<string>();
+    const backgroundAgents = new Map<string, BackgroundAgentInfo>();
     let hasCumulativeUsage = false;
 
     const lifecycle = watchLifecycle({
@@ -429,10 +460,58 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
         return;
       }
       if (event.type !== "item.started" && event.type !== "item.completed") {
-        return;
+        if (event.type !== "item.updated") return;
       }
       const item = event.item;
       if (!item) return;
+      if (item.type === "collab_tool_call") {
+        const tool = item.tool;
+        const isSpawn = tool === "spawn_agent" || tool === "spawnAgent";
+        const states = isRecord(item.agents_states) ? item.agents_states : {};
+        const receiverIds = Array.isArray(item.receiver_thread_ids)
+          ? item.receiver_thread_ids.filter((id): id is string => typeof id === "string")
+          : [];
+        for (const id of new Set([...receiverIds, ...Object.keys(states)])) {
+          const current = backgroundAgents.get(id);
+          if (!current && !isSpawn) continue;
+          const state = isRecord(states[id]) ? states[id] : undefined;
+          const status = codexBackgroundAgentStatus(state?.status)
+            ?? current?.status
+            ?? "pending";
+          const message = typeof state?.message === "string" ? state.message : undefined;
+          const now = Date.now();
+          const agent: BackgroundAgentInfo = {
+            ...(current ?? {
+              id,
+              provider: "codex" as const,
+              startedAt: now,
+            }),
+            ...(current?.parentToolCallId
+              ? {}
+              : typeof item.id === "string" ? { parentToolCallId: item.id } : {}),
+            ...(typeof item.prompt === "string" ? { description: item.prompt } : {}),
+            status,
+            ...(message && status === "failed" ? { error: message } : {}),
+            ...(message && status !== "failed" ? { summary: message } : {}),
+            updatedAt: now,
+            ...(isTerminalBackgroundAgentStatus(status)
+              ? { endedAt: current?.endedAt ?? now }
+              : {}),
+          };
+          if (status === "failed") {
+            delete agent.summary;
+          } else {
+            delete agent.error;
+          }
+          backgroundAgents.set(id, agent);
+          try {
+            opts.onBackgroundAgentUpdate?.(agent);
+          } catch {
+            // A host callback must not interrupt the provider stream.
+          }
+        }
+        return;
+      }
       if (
         event.type === "item.completed" &&
         item.type === "agent_message" &&

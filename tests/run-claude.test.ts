@@ -37,6 +37,7 @@ function finish(child: FakeChild, code: number | null = 0): void {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.useRealTimers();
 });
 
 describe("runClaude", () => {
@@ -286,6 +287,234 @@ describe("runClaude", () => {
     finish(child);
     await promise;
     expect(onAssistantText).toHaveBeenCalledWith("Hello there");
+  });
+
+  it("emits full lifecycle snapshots for background subagents", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const child = makeFakeChild();
+    const onBackgroundAgentUpdate = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate,
+    });
+
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_started",
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Inspect authentication",
+      task_type: "local_agent",
+    }) + "\n");
+    vi.setSystemTime(2_000);
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_progress",
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Inspect authentication",
+      subagent_type: "Explore",
+      usage: { total_tokens: 1200, tool_uses: 4, duration_ms: 900 },
+      last_tool_name: "Grep",
+      summary: "Found the session middleware",
+    }) + "\n");
+    vi.setSystemTime(2_500);
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_progress",
+      task_id: "task-1",
+      usage: { duration_ms: 1_400 },
+    }) + "\n");
+    vi.setSystemTime(3_000);
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "task-1",
+      patch: { status: "completed", end_time: 2_900 },
+    }) + "\n");
+    vi.setSystemTime(4_000);
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "task-1",
+      patch: { status: "completed", end_time: 3_900 },
+    }) + "\n");
+    finish(child);
+    await promise;
+
+    expect(onBackgroundAgentUpdate.mock.calls).toEqual([
+      [{
+        id: "task-1",
+        provider: "claude",
+        parentToolCallId: "tool-1",
+        description: "Inspect authentication",
+        agentType: "local_agent",
+        status: "running",
+        startedAt: 1_000,
+        updatedAt: 1_000,
+      }],
+      [{
+        id: "task-1",
+        provider: "claude",
+        parentToolCallId: "tool-1",
+        description: "Inspect authentication",
+        agentType: "Explore",
+        status: "running",
+        summary: "Found the session middleware",
+        progress: {
+          totalTokens: 1200,
+          toolUses: 4,
+          durationMs: 900,
+          lastToolName: "Grep",
+        },
+        startedAt: 1_000,
+        updatedAt: 2_000,
+      }],
+      [{
+        id: "task-1",
+        provider: "claude",
+        parentToolCallId: "tool-1",
+        description: "Inspect authentication",
+        agentType: "Explore",
+        status: "running",
+        summary: "Found the session middleware",
+        progress: {
+          totalTokens: 1200,
+          toolUses: 4,
+          durationMs: 1_400,
+          lastToolName: "Grep",
+        },
+        startedAt: 1_000,
+        updatedAt: 2_500,
+      }],
+      [{
+        id: "task-1",
+        provider: "claude",
+        parentToolCallId: "tool-1",
+        description: "Inspect authentication",
+        agentType: "Explore",
+        status: "completed",
+        summary: "Found the session middleware",
+        progress: {
+          totalTokens: 1200,
+          toolUses: 4,
+          durationMs: 1_400,
+          lastToolName: "Grep",
+        },
+        startedAt: 1_000,
+        updatedAt: 3_000,
+        endedAt: 2_900,
+      }],
+      [{
+        id: "task-1",
+        provider: "claude",
+        parentToolCallId: "tool-1",
+        description: "Inspect authentication",
+        agentType: "Explore",
+        status: "completed",
+        summary: "Found the session middleware",
+        progress: {
+          totalTokens: 1200,
+          toolUses: 4,
+          durationMs: 1_400,
+          lastToolName: "Grep",
+        },
+        startedAt: 1_000,
+        updatedAt: 4_000,
+        endedAt: 2_900,
+      }],
+    ]);
+  });
+
+  it("contains background-agent callback errors", async () => {
+    const child = makeFakeChild();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate: () => {
+        throw new Error("host callback failed");
+      },
+    });
+    expect(() => child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_started",
+      task_id: "task-1",
+      description: "Inspect authentication",
+      task_type: "local_agent",
+    }) + "\n")).not.toThrow();
+    finish(child);
+    await expect(promise).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("does not report background shell tasks as background agents", async () => {
+    const child = makeFakeChild();
+    const onBackgroundAgentUpdate = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate,
+    });
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_started",
+      task_id: "bash-1",
+      description: "Run tests",
+      task_type: "local_bash",
+    }) + "\n");
+    finish(child);
+    await promise;
+    expect(onBackgroundAgentUpdate).not.toHaveBeenCalled();
+  });
+
+  it("recognizes an older untyped task by its Agent tool correlation", async () => {
+    const child = makeFakeChild();
+    const onBackgroundAgentUpdate = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate,
+    });
+    child.stdout.write(JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [{
+          type: "tool_use",
+          id: "tool-legacy",
+          name: "Agent",
+          input: { description: "Inspect authentication" },
+        }],
+      },
+    }) + "\n");
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_started",
+      task_id: "task-legacy",
+      tool_use_id: "tool-legacy",
+      description: "Inspect authentication",
+    }) + "\n");
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "task-legacy",
+      patch: { status: "killed", error: "Stopped by parent" },
+    }) + "\n");
+    finish(child);
+    await promise;
+
+    expect(onBackgroundAgentUpdate).toHaveBeenCalledTimes(2);
+    expect(onBackgroundAgentUpdate.mock.calls[1]?.[0]).toMatchObject({
+      id: "task-legacy",
+      parentToolCallId: "tool-legacy",
+      status: "interrupted",
+      error: "Stopped by parent",
+      endedAt: expect.any(Number),
+    });
   });
 
   it("concatenates multiple text blocks in one assistant message", async () => {

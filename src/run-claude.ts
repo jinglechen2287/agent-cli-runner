@@ -10,7 +10,13 @@ import {
   watchLifecycle,
   writePrompt,
 } from "./internal.js";
-import type { CommonRunOptions, RunResult, ToolPlanItem } from "./types.js";
+import type {
+  BackgroundAgentInfo,
+  BackgroundAgentStatus,
+  CommonRunOptions,
+  RunResult,
+  ToolPlanItem,
+} from "./types.js";
 import { contextWindowForModel, type TokenUsage } from "./usage.js";
 
 /** Nesting-guard variables the Claude CLI uses to refuse running inside
@@ -135,6 +141,9 @@ interface ClaudeUsage {
   output_tokens?: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
+  total_tokens?: number;
+  tool_uses?: number;
+  duration_ms?: number;
 }
 
 /** Per-model rollup on the `result` event. Claude bills each model it used in
@@ -153,6 +162,33 @@ interface StreamLine {
   message?: { content?: ClaudeContentBlock[]; usage?: ClaudeUsage; model?: string };
   usage?: ClaudeUsage;
   modelUsage?: Record<string, ClaudeModelUsage>;
+  task_id?: string;
+  tool_use_id?: string;
+  description?: string;
+  task_type?: string;
+  subagent_type?: string;
+  last_tool_name?: string;
+  summary?: string;
+  patch?: {
+    status?: string;
+    description?: string;
+    end_time?: number;
+    error?: string;
+  };
+}
+
+function claudeBackgroundAgentStatus(status: string | undefined): BackgroundAgentStatus | undefined {
+  switch (status) {
+    case "pending":
+    case "running":
+    case "completed":
+    case "failed":
+      return status;
+    case "killed":
+      return "interrupted";
+    default:
+      return undefined;
+  }
 }
 
 /** Normalize a Claude usage block into the shared shape. Context occupancy is
@@ -253,6 +289,17 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     let lastAssistantModel: string | undefined;
     let lastMessageUsage: ClaudeUsage | undefined;
     let lastUsage: TokenUsage | undefined;
+    const agentToolCallIds = new Set<string>();
+    const backgroundAgents = new Map<string, BackgroundAgentInfo>();
+
+    const emitBackgroundAgent = (agent: BackgroundAgentInfo): void => {
+      backgroundAgents.set(agent.id, agent);
+      try {
+        opts.onBackgroundAgentUpdate?.(agent);
+      } catch {
+        // A host callback must not interrupt the provider stream.
+      }
+    };
 
     const emitUsage = (usage: TokenUsage): void => {
       lastUsage = usage;
@@ -292,12 +339,105 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
         emitSessionId(parsed.session_id);
         return;
       }
+      if (
+        parsed.type === "system"
+        && parsed.subtype === "task_started"
+        && typeof parsed.task_id === "string"
+      ) {
+        const isAgent = parsed.task_type === "local_agent"
+          || parsed.task_type === "remote_agent"
+          || (typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id));
+        if (!isAgent) return;
+        const now = Date.now();
+        emitBackgroundAgent({
+          id: parsed.task_id,
+          provider: "claude",
+          ...(typeof parsed.tool_use_id === "string"
+            ? { parentToolCallId: parsed.tool_use_id }
+            : {}),
+          ...(typeof parsed.description === "string"
+            ? { description: parsed.description }
+            : {}),
+          ...(typeof parsed.task_type === "string" ? { agentType: parsed.task_type } : {}),
+          status: "running",
+          startedAt: now,
+          updatedAt: now,
+        });
+        return;
+      }
+      if (
+        parsed.type === "system"
+        && parsed.subtype === "task_progress"
+        && typeof parsed.task_id === "string"
+      ) {
+        const current = backgroundAgents.get(parsed.task_id);
+        if (!current) return;
+        const usage = parsed.usage;
+        const progress = {
+          ...(current.progress ?? {}),
+          ...(typeof usage?.total_tokens === "number" ? { totalTokens: usage.total_tokens } : {}),
+          ...(typeof usage?.tool_uses === "number" ? { toolUses: usage.tool_uses } : {}),
+          ...(typeof usage?.duration_ms === "number" ? { durationMs: usage.duration_ms } : {}),
+          ...(typeof parsed.last_tool_name === "string"
+            ? { lastToolName: parsed.last_tool_name }
+            : {}),
+        };
+        emitBackgroundAgent({
+          ...current,
+          ...(typeof parsed.tool_use_id === "string"
+            ? { parentToolCallId: parsed.tool_use_id }
+            : {}),
+          ...(typeof parsed.description === "string"
+            ? { description: parsed.description }
+            : {}),
+          ...(typeof parsed.subagent_type === "string"
+            ? { agentType: parsed.subagent_type }
+            : {}),
+          ...(typeof parsed.summary === "string" ? { summary: parsed.summary } : {}),
+          ...(Object.keys(progress).length > 0 ? { progress } : {}),
+          status: "running",
+          updatedAt: Date.now(),
+        });
+        return;
+      }
+      if (
+        parsed.type === "system"
+        && parsed.subtype === "task_updated"
+        && typeof parsed.task_id === "string"
+      ) {
+        const current = backgroundAgents.get(parsed.task_id);
+        if (!current || !parsed.patch) return;
+        const status = claudeBackgroundAgentStatus(parsed.patch.status) ?? current.status;
+        const now = Date.now();
+        emitBackgroundAgent({
+          ...current,
+          ...(typeof parsed.patch.description === "string"
+            ? { description: parsed.patch.description }
+            : {}),
+          ...(typeof parsed.patch.error === "string" ? { error: parsed.patch.error } : {}),
+          status,
+          updatedAt: now,
+          ...((status === "completed" || status === "failed" || status === "interrupted")
+            ? {
+                endedAt: current.endedAt
+                  ?? (typeof parsed.patch.end_time === "number" ? parsed.patch.end_time : now),
+              }
+            : {}),
+        });
+        return;
+      }
       if (parsed.type === "assistant" && parsed.message?.content) {
         const texts: string[] = [];
         for (const block of parsed.message.content) {
           if (block.type === "text" && typeof block.text === "string") {
             texts.push(block.text);
           } else if (block.type === "tool_use" && typeof block.name === "string") {
+            if (
+              (block.name === "Agent" || block.name === "Task")
+              && typeof block.id === "string"
+            ) {
+              agentToolCallIds.add(block.id);
+            }
             const planItems = claudeTodoPlanItems(block.name, block.input);
             const summary = planItems
               ? planCompletionSummary(planItems)

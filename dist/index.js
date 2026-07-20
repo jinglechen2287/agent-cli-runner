@@ -250,6 +250,19 @@ function planCompletionSummary(planItems) {
   const completed = planItems.filter((item) => item.status === "completed").length;
   return `${completed}/${planItems.length} steps completed`;
 }
+function claudeBackgroundAgentStatus(status) {
+  switch (status) {
+    case "pending":
+    case "running":
+    case "completed":
+    case "failed":
+      return status;
+    case "killed":
+      return "interrupted";
+    default:
+      return void 0;
+  }
+}
 function toClaudeUsage(usage, model, contextWindow) {
   const input = toTokenCount(usage.input_tokens);
   const cacheRead = toTokenCount(usage.cache_read_input_tokens);
@@ -326,6 +339,15 @@ async function runClaude(opts) {
     let lastAssistantModel;
     let lastMessageUsage;
     let lastUsage;
+    const agentToolCallIds = /* @__PURE__ */ new Set();
+    const backgroundAgents = /* @__PURE__ */ new Map();
+    const emitBackgroundAgent = (agent) => {
+      backgroundAgents.set(agent.id, agent);
+      try {
+        opts.onBackgroundAgentUpdate?.(agent);
+      } catch {
+      }
+    };
     const emitUsage = (usage) => {
       lastUsage = usage;
       opts.onUsage?.(usage);
@@ -360,12 +382,71 @@ async function runClaude(opts) {
         emitSessionId(parsed.session_id);
         return;
       }
+      if (parsed.type === "system" && parsed.subtype === "task_started" && typeof parsed.task_id === "string") {
+        const isAgent = parsed.task_type === "local_agent" || parsed.task_type === "remote_agent" || typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id);
+        if (!isAgent) return;
+        const now = Date.now();
+        emitBackgroundAgent({
+          id: parsed.task_id,
+          provider: "claude",
+          ...typeof parsed.tool_use_id === "string" ? { parentToolCallId: parsed.tool_use_id } : {},
+          ...typeof parsed.description === "string" ? { description: parsed.description } : {},
+          ...typeof parsed.task_type === "string" ? { agentType: parsed.task_type } : {},
+          status: "running",
+          startedAt: now,
+          updatedAt: now
+        });
+        return;
+      }
+      if (parsed.type === "system" && parsed.subtype === "task_progress" && typeof parsed.task_id === "string") {
+        const current = backgroundAgents.get(parsed.task_id);
+        if (!current) return;
+        const usage = parsed.usage;
+        const progress = {
+          ...current.progress ?? {},
+          ...typeof usage?.total_tokens === "number" ? { totalTokens: usage.total_tokens } : {},
+          ...typeof usage?.tool_uses === "number" ? { toolUses: usage.tool_uses } : {},
+          ...typeof usage?.duration_ms === "number" ? { durationMs: usage.duration_ms } : {},
+          ...typeof parsed.last_tool_name === "string" ? { lastToolName: parsed.last_tool_name } : {}
+        };
+        emitBackgroundAgent({
+          ...current,
+          ...typeof parsed.tool_use_id === "string" ? { parentToolCallId: parsed.tool_use_id } : {},
+          ...typeof parsed.description === "string" ? { description: parsed.description } : {},
+          ...typeof parsed.subagent_type === "string" ? { agentType: parsed.subagent_type } : {},
+          ...typeof parsed.summary === "string" ? { summary: parsed.summary } : {},
+          ...Object.keys(progress).length > 0 ? { progress } : {},
+          status: "running",
+          updatedAt: Date.now()
+        });
+        return;
+      }
+      if (parsed.type === "system" && parsed.subtype === "task_updated" && typeof parsed.task_id === "string") {
+        const current = backgroundAgents.get(parsed.task_id);
+        if (!current || !parsed.patch) return;
+        const status = claudeBackgroundAgentStatus(parsed.patch.status) ?? current.status;
+        const now = Date.now();
+        emitBackgroundAgent({
+          ...current,
+          ...typeof parsed.patch.description === "string" ? { description: parsed.patch.description } : {},
+          ...typeof parsed.patch.error === "string" ? { error: parsed.patch.error } : {},
+          status,
+          updatedAt: now,
+          ...status === "completed" || status === "failed" || status === "interrupted" ? {
+            endedAt: current.endedAt ?? (typeof parsed.patch.end_time === "number" ? parsed.patch.end_time : now)
+          } : {}
+        });
+        return;
+      }
       if (parsed.type === "assistant" && parsed.message?.content) {
         const texts = [];
         for (const block of parsed.message.content) {
           if (block.type === "text" && typeof block.text === "string") {
             texts.push(block.text);
           } else if (block.type === "tool_use" && typeof block.name === "string") {
+            if ((block.name === "Agent" || block.name === "Task") && typeof block.id === "string") {
+              agentToolCallIds.add(block.id);
+            }
             const planItems = claudeTodoPlanItems(block.name, block.input);
             const summary = planItems ? planCompletionSummary(planItems) : summarizeClaudeTool(block.name, block.input);
             opts.onToolUse?.({
@@ -456,6 +537,27 @@ var APP_SERVER_RESUME_ID = 2;
 var APP_SERVER_USAGE_TIMEOUT_MS = 5e3;
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function codexBackgroundAgentStatus(status) {
+  switch (status) {
+    case "pending_init":
+      return "pending";
+    case "running":
+      return "running";
+    case "completed":
+      return "completed";
+    case "errored":
+    case "not_found":
+      return "failed";
+    case "interrupted":
+    case "shutdown":
+      return "interrupted";
+    default:
+      return void 0;
+  }
+}
+function isTerminalBackgroundAgentStatus(status) {
+  return status === "completed" || status === "failed" || status === "interrupted";
 }
 function toCodexUsage(params, threadId, model, explicitContextWindow) {
   if (!isRecord(params) || params.threadId !== threadId || !isRecord(params.tokenUsage)) {
@@ -726,6 +828,7 @@ async function runCodex(opts) {
     let fatalError;
     let lastUsage;
     const emittedTools = /* @__PURE__ */ new Set();
+    const backgroundAgents = /* @__PURE__ */ new Map();
     let hasCumulativeUsage = false;
     const lifecycle = watchLifecycle({
       cli: "codex",
@@ -757,10 +860,49 @@ async function runCodex(opts) {
         return;
       }
       if (event.type !== "item.started" && event.type !== "item.completed") {
-        return;
+        if (event.type !== "item.updated") return;
       }
       const item = event.item;
       if (!item) return;
+      if (item.type === "collab_tool_call") {
+        const tool = item.tool;
+        const isSpawn = tool === "spawn_agent" || tool === "spawnAgent";
+        const states = isRecord(item.agents_states) ? item.agents_states : {};
+        const receiverIds = Array.isArray(item.receiver_thread_ids) ? item.receiver_thread_ids.filter((id2) => typeof id2 === "string") : [];
+        for (const id2 of /* @__PURE__ */ new Set([...receiverIds, ...Object.keys(states)])) {
+          const current = backgroundAgents.get(id2);
+          if (!current && !isSpawn) continue;
+          const state = isRecord(states[id2]) ? states[id2] : void 0;
+          const status = codexBackgroundAgentStatus(state?.status) ?? current?.status ?? "pending";
+          const message = typeof state?.message === "string" ? state.message : void 0;
+          const now = Date.now();
+          const agent = {
+            ...current ?? {
+              id: id2,
+              provider: "codex",
+              startedAt: now
+            },
+            ...current?.parentToolCallId ? {} : typeof item.id === "string" ? { parentToolCallId: item.id } : {},
+            ...typeof item.prompt === "string" ? { description: item.prompt } : {},
+            status,
+            ...message && status === "failed" ? { error: message } : {},
+            ...message && status !== "failed" ? { summary: message } : {},
+            updatedAt: now,
+            ...isTerminalBackgroundAgentStatus(status) ? { endedAt: current?.endedAt ?? now } : {}
+          };
+          if (status === "failed") {
+            delete agent.summary;
+          } else {
+            delete agent.error;
+          }
+          backgroundAgents.set(id2, agent);
+          try {
+            opts.onBackgroundAgentUpdate?.(agent);
+          } catch {
+          }
+        }
+        return;
+      }
       if (event.type === "item.completed" && item.type === "agent_message" && typeof item.text === "string") {
         finalText = item.text;
         opts.onAssistantText?.(item.text);
