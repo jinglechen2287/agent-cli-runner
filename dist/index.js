@@ -535,6 +535,7 @@ import { spawn } from "child_process";
 // src/codex-app-server.ts
 import { spawn as nodeSpawn3 } from "child_process";
 var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;
+var TURN_START_TIMEOUT_MS = 6e4;
 var CLIENT_INFO = {
   name: "agent_cli_runner",
   title: "Agent CLI Runner",
@@ -687,14 +688,14 @@ async function createCodexAppServerClient(options) {
     ));
   });
   const client = {
-    request(method, params = {}) {
+    request(method, params = {}, requestTimeoutMs) {
       if (closed) return Promise.reject(new Error("Codex app-server is closed"));
       const id = nextId++;
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
-          reject(new Error(`Codex app-server request timed out: ${method}`));
-        }, timeoutMs);
+          reject(new TimeoutError(`Codex app-server request timed out: ${method}`));
+        }, requestTimeoutMs ?? timeoutMs);
         pending.set(id, { resolve, reject, timer });
         send({ id, method, params });
       });
@@ -961,8 +962,9 @@ function openedCodexThread(value, fallbackModel) {
   const model = text(record(value)?.model) ?? fallbackModel;
   return { threadId, ...model ? { model } : {} };
 }
-async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false) {
+async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false, continuity) {
   if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  const staleTurnId = continuity?.previousTurnId;
   let threadId = openedThread?.threadId ?? opts.resumeSessionId;
   let turnId;
   let resolvedModel = opts.model ?? openedThread?.model;
@@ -970,7 +972,6 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
   let latestUsage;
   let settled = false;
   let interruption;
-  let turnStarting = false;
   let timeout;
   const emittedTools = /* @__PURE__ */ new Set();
   const backgroundAgents = /* @__PURE__ */ new Map();
@@ -1007,14 +1008,16 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (interruption || settled) return;
     interruption = error;
     if (threadId && turnId) requestInterrupt();
-    else if (!turnStarting) failLifecycle(error);
+    else failLifecycle(error);
   };
   const abortHandler = () => interrupt(new AbortError("codex run aborted"));
   if (opts.signal) {
     if (opts.signal.aborted) abortHandler();
     else opts.signal.addEventListener("abort", abortHandler, { once: true });
   }
+  let runDeadline;
   if (opts.timeoutMs !== void 0) {
+    runDeadline = Date.now() + opts.timeoutMs;
     timeout = setTimeout(
       () => interrupt(new TimeoutError(`codex run timed out after ${opts.timeoutMs}ms`)),
       opts.timeoutMs
@@ -1059,7 +1062,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
   const handleItem = (method, params) => {
     if (params.threadId !== threadId) return;
     const eventTurnId = text(params.turnId);
-    if (!eventTurnId) return;
+    if (!eventTurnId || eventTurnId === staleTurnId) return;
     turnId ??= eventTurnId;
     if (turnId !== eventTurnId) return;
     const item = record(params.item);
@@ -1101,7 +1104,8 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     const params = record(rawParams);
     if (!params) return;
     if (method === "turn/started" && params.threadId === threadId) {
-      turnId ??= text(record(params.turn)?.id);
+      const startedTurnId = text(record(params.turn)?.id);
+      if (startedTurnId && startedTurnId !== staleTurnId) turnId ??= startedTurnId;
       if (interruption) requestInterrupt();
       return;
     }
@@ -1111,7 +1115,9 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     }
     if (method === "turn/plan/updated" && params.threadId === threadId) {
       const eventTurnId = text(params.turnId);
-      if (!eventTurnId || turnId && eventTurnId !== turnId) return;
+      if (!eventTurnId || eventTurnId === staleTurnId || turnId && eventTurnId !== turnId) {
+        return;
+      }
       turnId ??= eventTurnId;
       const info = planToolInfo(params, eventTurnId);
       if (info) safeCallback(() => opts.onToolUse?.(info));
@@ -1132,7 +1138,9 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     }
     if (method !== "turn/completed" || params.threadId !== threadId) return;
     const completedTurnId = text(record(params.turn)?.id);
-    if (!completedTurnId || turnId && completedTurnId !== turnId) return;
+    if (!completedTurnId || completedTurnId === staleTurnId || turnId && completedTurnId !== turnId) {
+      return;
+    }
     turnId ??= completedTurnId;
     if (interruption) {
       failLifecycle(interruption);
@@ -1161,18 +1169,29 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
       resolvedModel = opened.model;
     }
     safeCallback(() => opts.onSessionId?.(threadId));
-    turnStarting = true;
     const input = [
       { type: "text", text: opts.prompt, text_elements: [] },
       ...(opts.imagePaths ?? []).map((path) => ({ type: "localImage", path }))
     ];
-    const turnResult = await raceLifecycle(client.request("turn/start", {
-      threadId,
-      input,
-      ...opts.model ? { model: opts.model } : {},
-      ...opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}
-    }));
-    turnStarting = false;
+    const turnStartTimeoutMs = runDeadline === void 0 ? TURN_START_TIMEOUT_MS : Math.max(1, Math.min(TURN_START_TIMEOUT_MS, runDeadline - Date.now()));
+    let turnResult;
+    try {
+      turnResult = await raceLifecycle(client.request("turn/start", {
+        threadId,
+        input,
+        ...opts.model ? { model: opts.model } : {},
+        ...opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}
+      }, turnStartTimeoutMs));
+    } catch (error) {
+      if ((error instanceof TimeoutError || error instanceof AbortError) && threadId) {
+        if (turnId && !interruption) {
+          void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
+          });
+        }
+        client.close();
+      }
+      throw error;
+    }
     turnId = turnIdFrom(turnResult) ?? turnId;
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
     if (interruption) requestInterrupt();
@@ -1190,6 +1209,8 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     removeNotification();
     removeClose();
     removeStderr();
+    const finishedTurnId = turnId;
+    if (finishedTurnId) safeCallback(() => continuity?.onTurnId?.(finishedTurnId));
     if (ownedClient) client.close();
   }
 }
@@ -1210,6 +1231,7 @@ async function createCodexAppServerSession(options) {
   }
   let closed = false;
   let running = false;
+  let lastTurnId;
   let closePromise;
   client.onClose(() => {
     closed = true;
@@ -1235,7 +1257,12 @@ async function createCodexAppServerSession(options) {
             dangerouslyBypassApprovalsAndSandbox: options.dangerouslyBypassApprovalsAndSandbox
           } : {},
           ...options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}
-        }, client, opened);
+        }, client, opened, false, {
+          ...lastTurnId ? { previousTurnId: lastTurnId } : {},
+          onTurnId: (turnId) => {
+            lastTurnId = turnId;
+          }
+        });
       } finally {
         running = false;
       }

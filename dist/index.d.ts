@@ -187,7 +187,7 @@ interface CodexServerRequest {
 }
 type CodexServerRequestHandler = (request: CodexServerRequest) => Promise<unknown> | unknown;
 interface CodexAppServerClient {
-    request(method: string, params?: Record<string, unknown>): Promise<unknown>;
+    request(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
     notify(method: string, params?: unknown): void;
     onNotification(handler: (method: string, params: unknown) => void): () => void;
     onServerRequest(handler: CodexServerRequestHandler): () => void;

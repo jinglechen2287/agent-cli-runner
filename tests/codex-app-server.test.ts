@@ -838,6 +838,338 @@ describe("Codex app-server runner", () => {
     });
   });
 
+  it("ignores stale notifications from the previous turn on a reused session", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    let turnNumber = 0;
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-stale" } } });
+      } else if (message.method === "turn/start") {
+        turnNumber += 1;
+        if (turnNumber === 1) {
+          send(child, { id: message.id, result: { turn: completedTurn("turn-1", "inProgress") } });
+          send(child, {
+            method: "item/completed",
+            params: {
+              threadId: "thread-stale",
+              turnId: "turn-1",
+              item: { type: "agentMessage", id: "message-1", text: "First done" },
+            },
+          });
+          send(child, {
+            method: "turn/completed",
+            params: { threadId: "thread-stale", turn: completedTurn("turn-1") },
+          });
+          return;
+        }
+        // A late turn-1 notification lands before turn 2's start response.
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-stale",
+            turnId: "turn-1",
+            completedAtMs: 2_000,
+            item: {
+              type: "commandExecution",
+              id: "stale-command",
+              command: "echo stale",
+              status: "completed",
+              exitCode: 0,
+            },
+          },
+        });
+        send(child, { id: message.id, result: { turn: completedTurn("turn-2", "inProgress") } });
+        setImmediate(() => {
+          send(child, {
+            method: "item/started",
+            params: {
+              threadId: "thread-stale",
+              turnId: "turn-2",
+              startedAtMs: 3_000,
+              item: {
+                type: "commandExecution",
+                id: "fresh-command",
+                command: "echo fresh",
+                status: "inProgress",
+              },
+            },
+          });
+          send(child, {
+            method: "item/completed",
+            params: {
+              threadId: "thread-stale",
+              turnId: "turn-2",
+              completedAtMs: 4_000,
+              item: { type: "agentMessage", id: "message-2", text: "Second done" },
+            },
+          });
+          send(child, {
+            method: "turn/completed",
+            params: { threadId: "thread-stale", turn: completedTurn("turn-2") },
+          });
+        });
+      }
+    });
+
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      spawnFn: (() => child) as never,
+    });
+    const first = await session.runTurn({ prompt: "one" });
+    const second = await session.runTurn({ prompt: "two", onToolUse });
+
+    expect(first).toMatchObject({ text: "First done" });
+    expect(second).toMatchObject({ text: "Second done" });
+    const toolCallIds = onToolUse.mock.calls.map(([info]) => info.callId);
+    expect(toolCallIds).not.toContain("stale-command");
+    expect(toolCallIds).toContain("fresh-command");
+    const closing = Promise.resolve(session.close());
+    child.emit("close", 0);
+    await closing;
+  });
+
+  it("rejects an unanswered request with TimeoutError", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      }
+    });
+    const client = await createCodexAppServerClient({
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      requestTimeoutMs: 20,
+    });
+
+    await expect(client.request("model/list")).rejects.toMatchObject({
+      name: "TimeoutError",
+      message: expect.stringContaining("model/list"),
+    });
+    client.close();
+  });
+
+  it("gives turn/start more headroom than the default request timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeFakeChild();
+      const requests = captureRequests(child, (message) => {
+        if (message.method === "initialize") {
+          send(child, { id: message.id, result: {} });
+        } else if (message.method === "thread/start") {
+          send(child, { id: message.id, result: { thread: { id: "thread-slow" } } });
+        } else if (message.method === "turn/start") {
+          // The ack never arrives; only the started notification does.
+          send(child, {
+            method: "turn/started",
+            params: { threadId: "thread-slow", turn: { id: "turn-slow", status: "inProgress" } },
+          });
+        } else if (message.method === "turn/interrupt") {
+          send(child, { id: message.id, result: {} });
+        }
+      });
+
+      let settled: { status: string; error?: Error } | undefined;
+      void runCodex({ prompt: "x", cwd: "/tmp", spawnFn: (() => child) as never }).then(
+        () => {
+          settled = { status: "resolved" };
+        },
+        (error: Error) => {
+          settled = { status: "rejected", error };
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(settled).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(50_000);
+      expect(settled).toMatchObject({
+        status: "rejected",
+        error: expect.objectContaining({ name: "TimeoutError" }),
+      });
+      expect(requests.find(({ method }) => method === "turn/interrupt")?.params).toEqual({
+        threadId: "thread-slow",
+        turnId: "turn-slow",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("caps the turn/start wait at the run timeout when the server stays silent", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeFakeChild();
+      captureRequests(child, (message) => {
+        if (message.method === "initialize") {
+          send(child, { id: message.id, result: {} });
+        } else if (message.method === "thread/start") {
+          send(child, { id: message.id, result: { thread: { id: "thread-budget" } } });
+        }
+        // turn/start gets no ack and no turn/started notification.
+      });
+
+      let settled: { status: string; error?: Error } | undefined;
+      void runCodex({
+        prompt: "x",
+        cwd: "/tmp",
+        timeoutMs: 5_000,
+        spawnFn: (() => child) as never,
+      }).then(
+        () => {
+          settled = { status: "resolved" };
+        },
+        (error: Error) => {
+          settled = { status: "rejected", error };
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(5_500);
+      expect(settled).toMatchObject({
+        status: "rejected",
+        error: expect.objectContaining({ name: "TimeoutError" }),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires the session when turn/start times out before the turn is identified", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeFakeChild();
+      captureRequests(child, (message) => {
+        if (message.method === "initialize") {
+          send(child, { id: message.id, result: {} });
+        } else if (message.method === "thread/start") {
+          send(child, { id: message.id, result: { thread: { id: "thread-wedged" } } });
+        }
+        // turn/start gets no ack and no turn/started notification, so the
+        // possibly-running turn can never be interrupted by id.
+      });
+      const session = await createCodexAppServerSession({
+        cwd: "/tmp/project",
+        spawnFn: (() => child) as never,
+      });
+
+      let settled: { status: string; error?: Error } | undefined;
+      void session.runTurn({ prompt: "x", timeoutMs: 1_000 }).then(
+        () => {
+          settled = { status: "resolved" };
+        },
+        (error: Error) => {
+          settled = { status: "rejected", error };
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(settled).toMatchObject({
+        status: "rejected",
+        error: expect.objectContaining({ name: "TimeoutError" }),
+      });
+      expect(session.closed).toBe(true);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires the session when turn/start times out even with an identified turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeFakeChild();
+      const requests = captureRequests(child, (message) => {
+        if (message.method === "initialize") {
+          send(child, { id: message.id, result: {} });
+        } else if (message.method === "thread/start") {
+          send(child, { id: message.id, result: { thread: { id: "thread-half-wedged" } } });
+        } else if (message.method === "turn/start") {
+          // The started notification arrives but the ack never does.
+          send(child, {
+            method: "turn/started",
+            params: {
+              threadId: "thread-half-wedged",
+              turn: { id: "turn-half-wedged", status: "inProgress" },
+            },
+          });
+        } else if (message.method === "turn/interrupt") {
+          send(child, { id: message.id, result: {} });
+        }
+      });
+      const session = await createCodexAppServerSession({
+        cwd: "/tmp/project",
+        spawnFn: (() => child) as never,
+      });
+
+      let settled: { status: string; error?: Error } | undefined;
+      void session.runTurn({ prompt: "x", timeoutMs: 1_000 }).then(
+        () => {
+          settled = { status: "resolved" };
+        },
+        (error: Error) => {
+          settled = { status: "rejected", error };
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(settled).toMatchObject({
+        status: "rejected",
+        error: expect.objectContaining({ name: "TimeoutError" }),
+      });
+      expect(requests.find(({ method }) => method === "turn/interrupt")?.params).toEqual({
+        threadId: "thread-half-wedged",
+        turnId: "turn-half-wedged",
+      });
+      expect(session.closed).toBe(true);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts immediately when the signal fires before the turn is identified", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeFakeChild();
+      const controller = new AbortController();
+      captureRequests(child, (message) => {
+        if (message.method === "initialize") {
+          send(child, { id: message.id, result: {} });
+        } else if (message.method === "thread/start") {
+          send(child, { id: message.id, result: { thread: { id: "thread-abort-early" } } });
+        } else if (message.method === "turn/start") {
+          // The server stays silent; the user aborts while the ack is pending.
+          queueMicrotask(() => controller.abort());
+        }
+      });
+      const session = await createCodexAppServerSession({
+        cwd: "/tmp/project",
+        spawnFn: (() => child) as never,
+      });
+
+      let settled: { status: string; error?: Error } | undefined;
+      void session.runTurn({ prompt: "x", signal: controller.signal }).then(
+        () => {
+          settled = { status: "resolved" };
+        },
+        (error: Error) => {
+          settled = { status: "rejected", error };
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(settled).toMatchObject({
+        status: "rejected",
+        error: expect.objectContaining({ name: "AbortError" }),
+      });
+      expect(session.closed).toBe(true);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects a non-retrying app-server error notification with CodexTurnError", async () => {
     const child = makeFakeChild();
     captureRequests(child, (message) => {

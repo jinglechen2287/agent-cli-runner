@@ -45,7 +45,11 @@ export type CodexServerRequestHandler = (
 ) => Promise<unknown> | unknown;
 
 export interface CodexAppServerClient {
-  request(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  request(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<unknown>;
   notify(method: string, params?: unknown): void;
   onNotification(handler: (method: string, params: unknown) => void): () => void;
   onServerRequest(handler: CodexServerRequestHandler): () => void;
@@ -98,6 +102,10 @@ export interface CreateCodexAppServerSessionOptions {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+/** `turn/start` is acked immediately in normal operation, but a busy
+ * app-server can be slow to answer; give it far more headroom than plain
+ * admin requests so a loaded host does not fail turns spuriously. */
+const TURN_START_TIMEOUT_MS = 60_000;
 const CLIENT_INFO = {
   name: "agent_cli_runner",
   title: "Agent CLI Runner",
@@ -267,14 +275,14 @@ export async function createCodexAppServerClient(
   });
 
   const client: CodexAppServerClient = {
-    request(method, params = {}) {
+    request(method, params = {}, requestTimeoutMs) {
       if (closed) return Promise.reject(new Error("Codex app-server is closed"));
       const id = nextId++;
       return new Promise<unknown>((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
-          reject(new Error(`Codex app-server request timed out: ${method}`));
-        }, timeoutMs);
+          reject(new TimeoutError(`Codex app-server request timed out: ${method}`));
+        }, requestTimeoutMs ?? timeoutMs);
         pending.set(id, { resolve, reject, timer });
         send({ id, method, params });
       });
@@ -596,14 +604,24 @@ function openedCodexThread(value: unknown, fallbackModel?: string): OpenedCodexT
   return { threadId, ...(model ? { model } : {}) };
 }
 
+/** Links turns that share one thread: a reused session can see late
+ * notifications from its previous turn before the next `turn/start` is acked,
+ * and latching onto one would misattribute events across turns. */
+interface TurnContinuity {
+  previousTurnId?: string;
+  onTurnId?: (turnId: string) => void;
+}
+
 async function runCodexAppServerTurn(
   opts: RunCodexOptions,
   client: CodexAppServerClient,
   openedThread?: OpenedCodexThread,
   ownedClient = false,
+  continuity?: TurnContinuity,
 ): Promise<RunResult> {
   if (opts.signal?.aborted) throw new AbortError("codex run aborted");
 
+  const staleTurnId = continuity?.previousTurnId;
   let threadId = openedThread?.threadId ?? opts.resumeSessionId;
   let turnId: string | undefined;
   let resolvedModel = opts.model ?? openedThread?.model;
@@ -611,7 +629,6 @@ async function runCodexAppServerTurn(
   let latestUsage: TokenUsage | undefined;
   let settled = false;
   let interruption: AbortError | TimeoutError | undefined;
-  let turnStarting = false;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const emittedTools = new Set<string>();
   const backgroundAgents = new Map<string, BackgroundAgentInfo>();
@@ -658,8 +675,11 @@ async function runCodexAppServerTurn(
   const interrupt = (error: AbortError | TimeoutError): void => {
     if (interruption || settled) return;
     interruption = error;
+    // Without a turn ID there is nothing to interrupt gracefully — fail the
+    // lifecycle right away; the turn/start error path retires the process,
+    // which terminates any turn the server may have started meanwhile.
     if (threadId && turnId) requestInterrupt();
-    else if (!turnStarting) failLifecycle(error);
+    else failLifecycle(error);
   };
 
   const abortHandler = (): void => interrupt(new AbortError("codex run aborted"));
@@ -667,7 +687,9 @@ async function runCodexAppServerTurn(
     if (opts.signal.aborted) abortHandler();
     else opts.signal.addEventListener("abort", abortHandler, { once: true });
   }
+  let runDeadline: number | undefined;
   if (opts.timeoutMs !== undefined) {
+    runDeadline = Date.now() + opts.timeoutMs;
     timeout = setTimeout(
       () => interrupt(new TimeoutError(`codex run timed out after ${opts.timeoutMs}ms`)),
       opts.timeoutMs,
@@ -718,7 +740,7 @@ async function runCodexAppServerTurn(
   const handleItem = (method: string, params: Record<string, unknown>): void => {
     if (params.threadId !== threadId) return;
     const eventTurnId = text(params.turnId);
-    if (!eventTurnId) return;
+    if (!eventTurnId || eventTurnId === staleTurnId) return;
     turnId ??= eventTurnId;
     if (turnId !== eventTurnId) return;
     const item = record(params.item);
@@ -767,7 +789,8 @@ async function runCodexAppServerTurn(
     const params = record(rawParams);
     if (!params) return;
     if (method === "turn/started" && params.threadId === threadId) {
-      turnId ??= text(record(params.turn)?.id);
+      const startedTurnId = text(record(params.turn)?.id);
+      if (startedTurnId && startedTurnId !== staleTurnId) turnId ??= startedTurnId;
       if (interruption) requestInterrupt();
       return;
     }
@@ -777,7 +800,9 @@ async function runCodexAppServerTurn(
     }
     if (method === "turn/plan/updated" && params.threadId === threadId) {
       const eventTurnId = text(params.turnId);
-      if (!eventTurnId || (turnId && eventTurnId !== turnId)) return;
+      if (!eventTurnId || eventTurnId === staleTurnId || (turnId && eventTurnId !== turnId)) {
+        return;
+      }
       turnId ??= eventTurnId;
       const info = planToolInfo(params, eventTurnId);
       if (info) safeCallback(() => opts.onToolUse?.(info));
@@ -798,7 +823,9 @@ async function runCodexAppServerTurn(
     }
     if (method !== "turn/completed" || params.threadId !== threadId) return;
     const completedTurnId = text(record(params.turn)?.id);
-    if (!completedTurnId || (turnId && completedTurnId !== turnId)) return;
+    if (!completedTurnId || completedTurnId === staleTurnId || (turnId && completedTurnId !== turnId)) {
+      return;
+    }
     turnId ??= completedTurnId;
     if (interruption) {
       failLifecycle(interruption);
@@ -829,18 +856,37 @@ async function runCodexAppServerTurn(
       resolvedModel = opened.model;
     }
     safeCallback(() => opts.onSessionId?.(threadId as string));
-    turnStarting = true;
     const input: Array<Record<string, unknown>> = [
       { type: "text", text: opts.prompt, text_elements: [] },
       ...(opts.imagePaths ?? []).map((path) => ({ type: "localImage", path })),
     ];
-    const turnResult = await raceLifecycle(client.request("turn/start", {
-      threadId,
-      input,
-      ...(opts.model ? { model: opts.model } : {}),
-      ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
-    }));
-    turnStarting = false;
+    // Cap the ack wait at the caller's remaining run budget so a silent
+    // server cannot outlive a shorter opts.timeoutMs.
+    const turnStartTimeoutMs = runDeadline === undefined
+      ? TURN_START_TIMEOUT_MS
+      : Math.max(1, Math.min(TURN_START_TIMEOUT_MS, runDeadline - Date.now()));
+    let turnResult: unknown;
+    try {
+      turnResult = await raceLifecycle(client.request("turn/start", {
+        threadId,
+        input,
+        ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
+      }, turnStartTimeoutMs));
+    } catch (error) {
+      // The turn may have started server-side despite the lost ack, and an
+      // unacked start cannot be trusted to unwind before the session is
+      // reused: best-effort interrupt when the turn is identifiable, then
+      // retire the whole app-server process either way. A pooled session
+      // recreates and resumes the thread on its next turn.
+      if ((error instanceof TimeoutError || error instanceof AbortError) && threadId) {
+        if (turnId && !interruption) {
+          void client.request("turn/interrupt", { threadId, turnId }).catch(() => {});
+        }
+        client.close();
+      }
+      throw error;
+    }
     turnId = turnIdFrom(turnResult) ?? turnId;
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
     if (interruption) requestInterrupt();
@@ -859,6 +905,8 @@ async function runCodexAppServerTurn(
     removeNotification();
     removeClose();
     removeStderr();
+    const finishedTurnId = turnId;
+    if (finishedTurnId) safeCallback(() => continuity?.onTurnId?.(finishedTurnId));
     if (ownedClient) client.close();
   }
 }
@@ -886,6 +934,7 @@ export async function createCodexAppServerSession(
 
   let closed = false;
   let running = false;
+  let lastTurnId: string | undefined;
   let closePromise: Promise<void> | undefined;
   client.onClose(() => {
     closed = true;
@@ -917,7 +966,12 @@ export async function createCodexAppServerSession(
           ...(options.developerInstructions
             ? { developerInstructions: options.developerInstructions }
             : {}),
-        }, client, opened);
+        }, client, opened, false, {
+          ...(lastTurnId ? { previousTurnId: lastTurnId } : {}),
+          onTurnId: (turnId) => {
+            lastTurnId = turnId;
+          },
+        });
       } finally {
         running = false;
       }
