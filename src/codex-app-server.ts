@@ -329,7 +329,7 @@ export async function createCodexAppServerClient(
   try {
     await client.request("initialize", {
       clientInfo: CLIENT_INFO,
-      capabilities: { experimentalApi: false },
+      capabilities: { experimentalApi: true },
     });
     client.notify("initialized", {});
     return client;
@@ -366,6 +366,15 @@ function webActionType(item: Record<string, unknown>): string | undefined {
   return type;
 }
 
+function isWebItem(item: Record<string, unknown>): boolean {
+  const type = itemType(item);
+  return type === "webSearch" || type === "web_search";
+}
+
+function webUrl(item: Record<string, unknown>): string | undefined {
+  return text(webAction(item)?.url) ?? text(item.url);
+}
+
 function toolName(item: Record<string, unknown>): string | null {
   switch (itemType(item)) {
     case "commandExecution":
@@ -381,7 +390,9 @@ function toolName(item: Record<string, unknown>): string | null {
       return text(item.tool) ?? "Tool";
     case "webSearch":
     case "web_search":
-      return webActionType(item) === "open_page" || webActionType(item) === "find_in_page"
+      return webActionType(item) === "open_page"
+        || webActionType(item) === "find_in_page"
+        || webActionType(item) === "other"
         ? "WebFetch"
         : "WebSearch";
     default:
@@ -408,8 +419,8 @@ function toolInput(item: Record<string, unknown>): Record<string, unknown> {
   if (type !== "webSearch" && type !== "web_search") return item;
   const action = webAction(item);
   const actionType = webActionType(item);
-  const url = text(action?.url) ?? text(item.url);
-  if (actionType === "open_page" && url) {
+  const url = webUrl(item);
+  if ((actionType === "open_page" || actionType === "other") && url) {
     const input: Record<string, unknown> = { ...item, url };
     delete input.query;
     return input;
@@ -437,13 +448,14 @@ function summarizeTool(item: Record<string, unknown>): string | undefined {
     case "web_search": {
       const action = webAction(item);
       const actionType = webActionType(item);
-      const url = text(action?.url) ?? text(item.url);
+      const url = webUrl(item);
       if (actionType === "open_page") return url ?? webSearchQuery(item);
       if (actionType === "find_in_page") {
         const pattern = text(action?.pattern) ?? text(item.pattern);
         if (pattern && url) return `${pattern} · ${url}`;
         return pattern ?? url ?? webSearchQuery(item);
       }
+      if (actionType === "other") return url ?? webSearchQuery(item);
       return webSearchQuery(item);
     }
     case "fileChange":
@@ -459,6 +471,71 @@ function summarizeTool(item: Record<string, unknown>): string | undefined {
     default:
       return undefined;
   }
+}
+
+function firstHttpUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const start = value.search(/https?:\/\//u);
+  if (start < 0) return undefined;
+  let end = start;
+  let parenthesisDepth = 0;
+  while (end < value.length) {
+    const character = value[end];
+    if (!character || /[\s<>"'\]]/u.test(character)) break;
+    if (character === "(") {
+      parenthesisDepth += 1;
+    } else if (character === ")") {
+      if (parenthesisDepth === 0) break;
+      parenthesisDepth -= 1;
+    }
+    end += 1;
+  }
+  return value.slice(start, end).replace(/[.,;:]$/u, "") || undefined;
+}
+
+function rawResponseOutputText(item: Record<string, unknown>): string | undefined {
+  if (typeof item.output === "string") return text(item.output);
+  if (!Array.isArray(item.output)) return undefined;
+  const parts = item.output.flatMap((part) => {
+    const value = text(record(part)?.text);
+    return value ? [value] : [];
+  });
+  return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+function rawWebOutputUrl(item: Record<string, unknown>): string | undefined {
+  const output = rawResponseOutputText(item);
+  if (!output) return undefined;
+  for (const line of output.split("\n")) {
+    const headerStart = line.search(/\(\s*https?:\/\//u);
+    if (headerStart < 0 || !line.trimEnd().endsWith(")")) continue;
+    const url = firstHttpUrl(line.slice(headerStart + 1));
+    if (url) return url;
+  }
+  return undefined;
+}
+
+function singleRawWebCall(item: Record<string, unknown>): {
+  callId: string;
+  inputUrl?: string;
+} | undefined {
+  if (itemType(item) !== "custom_tool_call" || text(item.name) !== "exec") return undefined;
+  const input = text(item.input);
+  const callId = text(item.call_id) ?? text(item.callId);
+  if (!input || !callId) return undefined;
+  if (!/^\s*(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*)?await\s+tools\.web__run\s*\(/u
+    .test(input)) {
+    return undefined;
+  }
+  const matches = input.match(/tools\.web__run\s*\(/gu);
+  if (matches?.length !== 1) return undefined;
+  const inputUrl = firstHttpUrl(input);
+  return { callId, ...(inputUrl ? { inputUrl } : {}) };
+}
+
+function withWebUrl(item: Record<string, unknown>, url: string | undefined): Record<string, unknown> {
+  if (!url || webUrl(item)) return item;
+  return { ...item, url };
 }
 
 function normalizePlanStatus(value: unknown): string | undefined {
@@ -587,6 +664,7 @@ function requestCodexThread(
       })
     : client.request("thread/start", {
         cwd: opts.cwd,
+        experimentalRawEvents: true,
         ...(opts.model ? { model: opts.model } : {}),
         ...(opts.developerInstructions
           ? { developerInstructions: opts.developerInstructions }
@@ -612,6 +690,20 @@ interface TurnContinuity {
   onTurnId?: (turnId: string) => void;
 }
 
+interface PendingCodexWebTool {
+  item: Record<string, unknown>;
+  completed: boolean;
+  rawCallId?: string;
+}
+
+interface RawCodexWebCall {
+  callId: string;
+  inputUrl?: string;
+  outputUrl?: string;
+  outputCompleted: boolean;
+  webItemId?: string;
+}
+
 async function runCodexAppServerTurn(
   opts: RunCodexOptions,
   client: CodexAppServerClient,
@@ -633,6 +725,9 @@ async function runCodexAppServerTurn(
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const emittedTools = new Set<string>();
   const backgroundAgents = new Map<string, BackgroundAgentInfo>();
+  const pendingWebTools = new Map<string, PendingCodexWebTool>();
+  const rawWebCalls = new Map<string, RawCodexWebCall>();
+  const unassignedRawWebCalls: string[] = [];
 
   let resolveCompletion!: () => void;
   let rejectCompletion!: (error: Error) => void;
@@ -697,6 +792,88 @@ async function runCodexAppServerTurn(
     );
   }
 
+  const emitToolUse = (id: string, item: Record<string, unknown>): void => {
+    if (emittedTools.has(id)) return;
+    const name = toolName(item);
+    if (!name) return;
+    emittedTools.add(id);
+    const summary = summarizeTool(item);
+    safeCallback(() => opts.onToolUse?.({
+      callId: id,
+      name,
+      ...(summary ? { summary } : {}),
+      input: toolInput(item),
+    }));
+  };
+
+  const emitToolResult = (id: string, item: Record<string, unknown>): void => {
+    const exitCode = item.exitCode;
+    const status = text(item.status);
+    safeCallback(() => opts.onToolResult?.({
+      callId: id,
+      content: item,
+      ...((typeof exitCode === "number" && exitCode !== 0) || status === "failed"
+        ? { isError: true }
+        : {}),
+    }));
+  };
+
+  const assignRawWebCall = (id: string, pending: PendingCodexWebTool): void => {
+    if (pending.rawCallId) return;
+    for (let index = unassignedRawWebCalls.length - 1; index >= 0; index -= 1) {
+      const call = rawWebCalls.get(unassignedRawWebCalls[index] as string);
+      if (!call || call.webItemId) unassignedRawWebCalls.splice(index, 1);
+    }
+    if (unassignedRawWebCalls.length !== 1) return;
+    const callId = unassignedRawWebCalls.shift();
+    if (!callId) return;
+    const call = rawWebCalls.get(callId);
+    if (!call) return;
+    call.webItemId = id;
+    pending.rawCallId = callId;
+  };
+
+  const emitPendingWebTool = (id: string, force: boolean): void => {
+    const pending = pendingWebTools.get(id);
+    if (!pending) return;
+    const rawCall = pending.rawCallId ? rawWebCalls.get(pending.rawCallId) : undefined;
+    const item = withWebUrl(pending.item, rawCall?.inputUrl ?? rawCall?.outputUrl);
+    const needsUrl = toolName(item) === "WebFetch" && !webUrl(item);
+    if (!force && needsUrl && rawCall && !rawCall.outputCompleted) return;
+    emitToolUse(id, item);
+    if (pending.completed) emitToolResult(id, item);
+    if (pending.completed || force) pendingWebTools.delete(id);
+  };
+
+  const flushPendingWebTools = (): void => {
+    for (const id of [...pendingWebTools.keys()]) emitPendingWebTool(id, true);
+  };
+
+  const handleRawResponseItem = (params: Record<string, unknown>): void => {
+    const item = record(params.item);
+    if (!item) return;
+    const rawCall = singleRawWebCall(item);
+    if (rawCall) {
+      rawWebCalls.set(rawCall.callId, {
+        ...rawCall,
+        outputCompleted: false,
+      });
+      unassignedRawWebCalls.push(rawCall.callId);
+      return;
+    }
+    if (itemType(item) !== "custom_tool_call_output") return;
+    const callId = text(item.call_id) ?? text(item.callId);
+    if (!callId) return;
+    const call = rawWebCalls.get(callId);
+    if (!call) return;
+    call.outputCompleted = true;
+    const outputUrl = rawWebOutputUrl(item);
+    if (outputUrl) call.outputUrl = outputUrl;
+    if (call.webItemId) {
+      emitPendingWebTool(call.webItemId, false);
+    }
+  };
+
   const updateBackgroundAgents = (item: Record<string, unknown>, occurredAt: number): void => {
     const type = itemType(item);
     if (type !== "collabAgentToolCall" && type !== "collab_tool_call") return;
@@ -760,30 +937,25 @@ async function runCodexAppServerTurn(
       return;
     }
 
+    if (isWebItem(item)) {
+      const id = text(item.id) ?? `${itemType(item)}:web`;
+      const pending = pendingWebTools.get(id) ?? {
+        item,
+        completed: false,
+      };
+      pending.item = item;
+      pending.completed = method === "item/completed";
+      assignRawWebCall(id, pending);
+      pendingWebTools.set(id, pending);
+      if (pending.completed) emitPendingWebTool(id, false);
+      return;
+    }
+
     const name = toolName(item);
     if (!name) return;
     const id = text(item.id) ?? `${itemType(item)}:${name}`;
-    if (!emittedTools.has(id)) {
-      emittedTools.add(id);
-      const summary = summarizeTool(item);
-      safeCallback(() => opts.onToolUse?.({
-        callId: id,
-        name,
-        ...(summary ? { summary } : {}),
-        input: toolInput(item),
-      }));
-    }
-    if (method === "item/completed") {
-      const exitCode = item.exitCode;
-      const status = text(item.status);
-      safeCallback(() => opts.onToolResult?.({
-        callId: id,
-        content: item,
-        ...((typeof exitCode === "number" && exitCode !== 0) || status === "failed"
-          ? { isError: true }
-          : {}),
-      }));
-    }
+    emitToolUse(id, item);
+    if (method === "item/completed") emitToolResult(id, item);
   };
 
   const removeNotification = client.onNotification((method, rawParams) => {
@@ -797,6 +969,16 @@ async function runCodexAppServerTurn(
     }
     if (method === "item/started" || method === "item/completed") {
       handleItem(method, params);
+      return;
+    }
+    if (method === "rawResponseItem/completed") {
+      if (params.threadId !== threadId) return;
+      const eventTurnId = text(params.turnId);
+      if (!eventTurnId || isPreviousTurn(eventTurnId) || (turnId && eventTurnId !== turnId)) {
+        return;
+      }
+      turnId ??= eventTurnId;
+      handleRawResponseItem(params);
       return;
     }
     if (method === "turn/plan/updated" && params.threadId === threadId) {
@@ -818,6 +1000,7 @@ async function runCodexAppServerTurn(
     }
     if (method === "error" && params.threadId === threadId) {
       if (params.willRetry === true) return;
+      flushPendingWebTools();
       const message = text(record(params.error)?.message) ?? "Codex turn failed";
       settleError(new CodexTurnError(`Codex error: ${message}`));
       return;
@@ -829,6 +1012,7 @@ async function runCodexAppServerTurn(
       return;
     }
     turnId ??= completedTurnId;
+    flushPendingWebTools();
     if (interruption) {
       failLifecycle(interruption);
       return;
@@ -903,6 +1087,7 @@ async function runCodexAppServerTurn(
     };
   } finally {
     if (timeout) clearTimeout(timeout);
+    flushPendingWebTools();
     opts.signal?.removeEventListener("abort", abortHandler);
     removeNotification();
     removeClose();

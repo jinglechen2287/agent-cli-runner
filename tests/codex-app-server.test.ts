@@ -173,7 +173,7 @@ describe("Codex app-server runner", () => {
     );
     expect(requests[0]).toMatchObject({
       method: "initialize",
-      params: { capabilities: { experimentalApi: false } },
+      params: { capabilities: { experimentalApi: true } },
     });
     expect(requests).toContainEqual({ method: "initialized", params: {} });
     expect(requests.find(({ method }) => method === "thread/start")?.params).toMatchObject({
@@ -182,6 +182,7 @@ describe("Codex app-server runner", () => {
       developerInstructions: "project rules",
       approvalPolicy: "never",
       sandbox: "danger-full-access",
+      experimentalRawEvents: true,
     });
     expect(requests.find(({ method }) => method === "turn/start")?.params).toMatchObject({
       threadId: "thread-1",
@@ -250,7 +251,7 @@ describe("Codex app-server runner", () => {
     });
   });
 
-  it("maps web, plan, and collaboration notifications without rollout polling", async () => {
+  it("waits for authoritative completed web items before mapping them", async () => {
     const child = makeFakeChild();
     const onToolUse = vi.fn();
     const onBackgroundAgentUpdate = vi.fn();
@@ -267,6 +268,20 @@ describe("Codex app-server runner", () => {
             threadId: "thread-3",
             turnId: "turn-3",
             startedAtMs: 1_000,
+            item: {
+              type: "webSearch",
+              id: "web-1",
+              query: "",
+              action: null,
+            },
+          },
+        });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-3",
+            turnId: "turn-3",
+            completedAtMs: 1_050,
             item: {
               type: "webSearch",
               id: "web-1",
@@ -296,9 +311,23 @@ describe("Codex app-server runner", () => {
             item: {
               type: "webSearch",
               id: "web-2",
-              query: "https://developers.openai.com/codex/app-server",
+              query: "",
+              action: null,
+            },
+          },
+        });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-3",
+            turnId: "turn-3",
+            completedAtMs: 1_150,
+            item: {
+              type: "webSearch",
+              id: "web-2",
+              query: "",
               action: {
-                type: "open_page",
+                type: "openPage",
                 url: "https://developers.openai.com/codex/app-server",
               },
             },
@@ -313,9 +342,23 @@ describe("Codex app-server runner", () => {
             item: {
               type: "webSearch",
               id: "web-3",
+              query: "",
+              action: null,
+            },
+          },
+        });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-3",
+            turnId: "turn-3",
+            completedAtMs: 1_250,
+            item: {
+              type: "webSearch",
+              id: "web-3",
               query: "turn/start",
               action: {
-                type: "find_in_page",
+                type: "findInPage",
                 url: "https://developers.openai.com/codex/app-server",
                 pattern: "turn/start",
               },
@@ -424,6 +467,307 @@ describe("Codex app-server runner", () => {
         endedAt: 3_000,
       }),
     ]);
+  });
+
+  it("enriches hosted fetches and partial find actions from raw web outputs", async () => {
+    const child = makeFakeChild();
+    const callbacks: Array<{ type: "use" | "result"; value: unknown }> = [];
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, {
+          id: message.id,
+          result: { thread: { id: "thread-web-raw" }, model: "gpt-test" },
+        });
+      } else if (message.method === "turn/start") {
+        send(child, {
+          id: message.id,
+          result: { turn: completedTurn("turn-web-raw", "inProgress") },
+        });
+        send(child, {
+          method: "rawResponseItem/completed",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            item: {
+              type: "custom_tool_call",
+              call_id: "raw-unrelated",
+              name: "exec",
+              input: "const r = await tools.exec_command({cmd:\"rg tools.web__run( src\"}); text(r)",
+            },
+          },
+        });
+        send(child, {
+          method: "rawResponseItem/completed",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            item: {
+              type: "custom_tool_call",
+              call_id: "raw-open",
+              name: "exec",
+              input: "const r = await tools.web__run({open:[{ref_id:\"https://example.test/wiki/Foo_(bar)\"}]}); text(r)",
+            },
+          },
+        });
+        send(child, {
+          method: "item/started",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            startedAtMs: 1_000,
+            item: { type: "webSearch", id: "web-open", query: "", action: null },
+          },
+        });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            completedAtMs: 1_100,
+            item: {
+              type: "webSearch",
+              id: "web-open",
+              query: "",
+              action: { type: "other" },
+            },
+          },
+        });
+        send(child, {
+          method: "rawResponseItem/completed",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            item: {
+              type: "custom_tool_call_output",
+              call_id: "raw-open",
+              output: [
+                { type: "input_text", text: "Script completed\nOutput:\n" },
+                {
+                  type: "input_text",
+                  text: "Example page (https://example.test/wiki/Foo_(bar))\nSource: open",
+                },
+              ],
+            },
+          },
+        });
+        send(child, {
+          method: "rawResponseItem/completed",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            item: {
+              type: "custom_tool_call",
+              call_id: "raw-find",
+              name: "exec",
+              input: "const r = await tools.web__run({find:[{ref_id:\"turn1view0\",pattern:\"rawResponseItem/completed\"}]}); text(r)",
+            },
+          },
+        });
+        send(child, {
+          method: "rawResponseItem/completed",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            item: {
+              type: "custom_tool_call_output",
+              call_id: "raw-find",
+              output: [{
+                type: "input_text",
+                text: "Codex app-server notes (https://github.com/openai/codex/blob/main/codex-rs/app-server/README_(draft).md)\nFind results",
+              }],
+            },
+          },
+        });
+        send(child, {
+          method: "item/started",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            startedAtMs: 1_200,
+            item: { type: "webSearch", id: "web-find", query: "", action: null },
+          },
+        });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            completedAtMs: 1_300,
+            item: {
+              type: "webSearch",
+              id: "web-find",
+              query: "rawResponseItem/completed",
+              action: { type: "findInPage", url: null, pattern: "rawResponseItem/completed" },
+            },
+          },
+        });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-web-raw",
+            turnId: "turn-web-raw",
+            completedAtMs: 1_400,
+            item: { type: "agentMessage", id: "message-web-raw", text: "Done" },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-web-raw", turn: completedTurn("turn-web-raw") },
+        });
+      }
+    });
+
+    await runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse: (value) => callbacks.push({ type: "use", value }),
+      onToolResult: (value) => callbacks.push({ type: "result", value }),
+    });
+
+    expect(requests[0]).toMatchObject({
+      method: "initialize",
+      params: { capabilities: { experimentalApi: true } },
+    });
+    expect(requests.find(({ method }) => method === "thread/start")?.params)
+      .toMatchObject({ experimentalRawEvents: true });
+    expect(callbacks).toEqual([
+      {
+        type: "use",
+        value: expect.objectContaining({
+          callId: "web-open",
+          name: "WebFetch",
+          summary: "https://example.test/wiki/Foo_(bar)",
+          input: expect.objectContaining({ url: "https://example.test/wiki/Foo_(bar)" }),
+        }),
+      },
+      {
+        type: "result",
+        value: expect.objectContaining({
+          callId: "web-open",
+          content: expect.objectContaining({ url: "https://example.test/wiki/Foo_(bar)" }),
+        }),
+      },
+      {
+        type: "use",
+        value: expect.objectContaining({
+          callId: "web-find",
+          name: "WebFetch",
+          summary: "rawResponseItem/completed · https://github.com/openai/codex/blob/main/codex-rs/app-server/README_(draft).md",
+          input: expect.objectContaining({
+            url: "https://github.com/openai/codex/blob/main/codex-rs/app-server/README_(draft).md",
+            prompt: "Find rawResponseItem/completed in page",
+          }),
+        }),
+      },
+      {
+        type: "result",
+        value: expect.objectContaining({
+          callId: "web-find",
+          content: expect.objectContaining({
+            url: "https://github.com/openai/codex/blob/main/codex-rs/app-server/README_(draft).md",
+          }),
+        }),
+      },
+    ]);
+  });
+
+  it("does not guess a fetch URL when raw web call correlation is ambiguous", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-web-ambiguous" } } });
+      } else if (message.method === "turn/start") {
+        send(child, {
+          id: message.id,
+          result: { turn: completedTurn("turn-web-ambiguous", "inProgress") },
+        });
+        for (const callId of ["raw-first", "raw-second"]) {
+          send(child, {
+            method: "rawResponseItem/completed",
+            params: {
+              threadId: "thread-web-ambiguous",
+              turnId: "turn-web-ambiguous",
+              item: {
+                type: "custom_tool_call",
+                call_id: callId,
+                name: "exec",
+                input: `const r = await tools.web__run({open:[{ref_id:\"${callId}\"}]}); text(r)`,
+              },
+            },
+          });
+        }
+        send(child, {
+          method: "item/started",
+          params: {
+            threadId: "thread-web-ambiguous",
+            turnId: "turn-web-ambiguous",
+            item: { type: "webSearch", id: "web-ambiguous", query: "", action: null },
+          },
+        });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-web-ambiguous",
+            turnId: "turn-web-ambiguous",
+            item: {
+              type: "webSearch",
+              id: "web-ambiguous",
+              query: "",
+              action: { type: "other" },
+            },
+          },
+        });
+        for (const [callId, url] of [
+          ["raw-first", "https://first.test/"],
+          ["raw-second", "https://second.test/"],
+        ]) {
+          send(child, {
+            method: "rawResponseItem/completed",
+            params: {
+              threadId: "thread-web-ambiguous",
+              turnId: "turn-web-ambiguous",
+              item: {
+                type: "custom_tool_call_output",
+                call_id: callId,
+                output: [{ type: "input_text", text: `Page (${url})` }],
+              },
+            },
+          });
+        }
+        send(child, {
+          method: "turn/completed",
+          params: {
+            threadId: "thread-web-ambiguous",
+            turn: completedTurn("turn-web-ambiguous"),
+          },
+        });
+      }
+    });
+
+    await runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+
+    expect(onToolUse).toHaveBeenCalledTimes(1);
+    expect(onToolUse.mock.calls[0]?.[0]).toEqual({
+      callId: "web-ambiguous",
+      name: "WebFetch",
+      input: {
+        type: "webSearch",
+        id: "web-ambiguous",
+        query: "",
+        action: { type: "other" },
+      },
+    });
   });
 
   it("rejects unsupported native question requests instead of leaving a turn hung", async () => {
