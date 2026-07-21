@@ -964,7 +964,7 @@ function openedCodexThread(value, fallbackModel) {
 }
 async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false, continuity) {
   if (opts.signal?.aborted) throw new AbortError("codex run aborted");
-  const staleTurnId = continuity?.previousTurnId;
+  const isPreviousTurn = (turnId2) => continuity?.previousTurnIds?.has(turnId2) ?? false;
   let threadId = openedThread?.threadId ?? opts.resumeSessionId;
   let turnId;
   let resolvedModel = opts.model ?? openedThread?.model;
@@ -1062,7 +1062,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
   const handleItem = (method, params) => {
     if (params.threadId !== threadId) return;
     const eventTurnId = text(params.turnId);
-    if (!eventTurnId || eventTurnId === staleTurnId) return;
+    if (!eventTurnId || isPreviousTurn(eventTurnId)) return;
     turnId ??= eventTurnId;
     if (turnId !== eventTurnId) return;
     const item = record(params.item);
@@ -1105,7 +1105,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (!params) return;
     if (method === "turn/started" && params.threadId === threadId) {
       const startedTurnId = text(record(params.turn)?.id);
-      if (startedTurnId && startedTurnId !== staleTurnId) turnId ??= startedTurnId;
+      if (startedTurnId && !isPreviousTurn(startedTurnId)) turnId ??= startedTurnId;
       if (interruption) requestInterrupt();
       return;
     }
@@ -1115,7 +1115,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     }
     if (method === "turn/plan/updated" && params.threadId === threadId) {
       const eventTurnId = text(params.turnId);
-      if (!eventTurnId || eventTurnId === staleTurnId || turnId && eventTurnId !== turnId) {
+      if (!eventTurnId || isPreviousTurn(eventTurnId) || turnId && eventTurnId !== turnId) {
         return;
       }
       turnId ??= eventTurnId;
@@ -1138,7 +1138,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     }
     if (method !== "turn/completed" || params.threadId !== threadId) return;
     const completedTurnId = text(record(params.turn)?.id);
-    if (!completedTurnId || completedTurnId === staleTurnId || turnId && completedTurnId !== turnId) {
+    if (!completedTurnId || isPreviousTurn(completedTurnId) || turnId && completedTurnId !== turnId) {
       return;
     }
     turnId ??= completedTurnId;
@@ -1231,7 +1231,7 @@ async function createCodexAppServerSession(options) {
   }
   let closed = false;
   let running = false;
-  let lastTurnId;
+  const previousTurnIds = /* @__PURE__ */ new Set();
   let closePromise;
   client.onClose(() => {
     closed = true;
@@ -1258,9 +1258,9 @@ async function createCodexAppServerSession(options) {
           } : {},
           ...options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}
         }, client, opened, false, {
-          ...lastTurnId ? { previousTurnId: lastTurnId } : {},
+          previousTurnIds,
           onTurnId: (turnId) => {
-            lastTurnId = turnId;
+            previousTurnIds.add(turnId);
           }
         });
       } finally {

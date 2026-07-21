@@ -931,6 +931,107 @@ describe("Codex app-server runner", () => {
     await closing;
   });
 
+  it("ignores stale notifications from any earlier turn on a reused session", async () => {
+    const child = makeFakeChild();
+    const onAssistantText = vi.fn();
+    let turnNumber = 0;
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-older-stale" } } });
+      } else if (message.method === "turn/start") {
+        turnNumber += 1;
+        const currentTurnId = `turn-${turnNumber}`;
+        if (turnNumber < 3) {
+          send(child, {
+            id: message.id,
+            result: { turn: completedTurn(currentTurnId, "inProgress") },
+          });
+          send(child, {
+            method: "item/completed",
+            params: {
+              threadId: "thread-older-stale",
+              turnId: currentTurnId,
+              item: {
+                type: "agentMessage",
+                id: `message-${turnNumber}`,
+                text: turnNumber === 1 ? "First done" : "Second done",
+              },
+            },
+          });
+          send(child, {
+            method: "turn/completed",
+            params: {
+              threadId: "thread-older-stale",
+              turn: completedTurn(currentTurnId),
+            },
+          });
+          return;
+        }
+
+        // A notification from turn 1 arrives during turn 3. Tracking only
+        // turn 2 as stale lets this old completion settle turn 3 early.
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-older-stale",
+            turnId: "turn-1",
+            item: {
+              type: "agentMessage",
+              id: "very-stale-message",
+              text: "Very stale",
+            },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: {
+            threadId: "thread-older-stale",
+            turn: completedTurn("turn-1"),
+          },
+        });
+        send(child, {
+          id: message.id,
+          result: { turn: completedTurn("turn-3", "inProgress") },
+        });
+        setImmediate(() => {
+          send(child, {
+            method: "item/completed",
+            params: {
+              threadId: "thread-older-stale",
+              turnId: "turn-3",
+              item: { type: "agentMessage", id: "message-3", text: "Third done" },
+            },
+          });
+          send(child, {
+            method: "turn/completed",
+            params: {
+              threadId: "thread-older-stale",
+              turn: completedTurn("turn-3"),
+            },
+          });
+        });
+      }
+    });
+
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      spawnFn: (() => child) as never,
+    });
+    await session.runTurn({ prompt: "one" });
+    await session.runTurn({ prompt: "two" });
+    onAssistantText.mockClear();
+    const third = await session.runTurn({ prompt: "three", onAssistantText });
+
+    expect(third).toMatchObject({ text: "Third done" });
+    expect(onAssistantText).toHaveBeenCalledTimes(1);
+    expect(onAssistantText).toHaveBeenCalledWith("Third done");
+    const closing = Promise.resolve(session.close());
+    child.emit("close", 0);
+    await closing;
+  });
+
   it("rejects an unanswered request with TimeoutError", async () => {
     const child = makeFakeChild();
     captureRequests(child, (message) => {
