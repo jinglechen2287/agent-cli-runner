@@ -1,6 +1,6 @@
 # agent-cli-runner
 
-Spawn and stream the [Claude Code](https://claude.com/claude-code) and [Codex](https://developers.openai.com/codex/cli) CLIs from Node or Bun: session resume, JSONL event parsing, streaming callbacks, and abort/timeout handling — with zero runtime dependencies.
+Stream [Claude Code](https://claude.com/claude-code) and [Codex app-server](https://developers.openai.com/codex/app-server) from Node or Bun: session resume, tool events, live usage, and abort/timeout handling — with zero runtime dependencies.
 
 Extracted from two apps that each talked to both CLIs; this package is the shared protocol layer.
 
@@ -65,13 +65,13 @@ interface RunResult {
 
 | Option | Meaning |
 | --- | --- |
-| `prompt`, `cwd` | Required. The prompt is written to stdin, never argv. |
+| `prompt`, `cwd` | Required. Prompts never appear in argv: Claude and isolated Codex use stdin; regular Codex turns use app-server JSON-RPC. |
 | `executablePath` | Binary path; defaults to `"claude"` / `"codex"` on `PATH`. |
-| `signal` | `AbortSignal`; on abort the child gets SIGTERM, then SIGKILL after 2 s, and the promise rejects with `AbortError`. |
-| `timeoutMs` | Optional wall-clock limit; same kill path, rejects `TimeoutError`. No timeout by default. |
+| `signal` | `AbortSignal`; Claude and isolated Codex terminate their process tree, while regular Codex sends `turn/interrupt`. Rejects with `AbortError`. |
+| `timeoutMs` | Optional wall-clock limit using the provider-appropriate interruption path; rejects `TimeoutError`. No timeout by default. |
 | `env` | Base child environment (default `process.env`). Nesting-guard variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ACCESS_TOKEN` for Claude; `CODEX_THREAD_ID` for Codex) are always stripped. |
 | `spawnFn` | Injectable spawn primitive for tests. |
-| `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onBackgroundAgentUpdate`, `onUsage`, `onStderr` | Streaming callbacks. Claude tool uses and results share a provider call ID so hosts can correlate them. Codex tool items are mapped to Claude-style tool names (`command_execution` → `Bash`, `file_change` → `Edit`, `todo_list`/`plan_update` → `TodoWrite`). Codex plan snapshots are normalized as `ToolUseInfo.planItems`. Background subagents emit complete, replace-in-place snapshots keyed by their Claude task id or Codex child thread id. Usage snapshots always describe the latest request's context occupancy, never cumulative turn totals. |
+| `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onBackgroundAgentUpdate`, `onUsage`, `onStderr` | Streaming callbacks. Tool uses and results share a provider call ID. Codex app-server items are mapped to shared names (`commandExecution` → `Bash`, `fileChange` → `Edit`, web page operations → `WebFetch`) and plan notifications become normalized `TodoWrite` snapshots. Background subagents emit replace-in-place snapshots keyed by child thread id. Usage snapshots describe the latest request's context occupancy, never cumulative turn totals. |
 
 ### Claude-specific
 
@@ -81,13 +81,17 @@ interface RunResult {
 
 ### Codex-specific
 
-`developerInstructions`, `resumeSessionId`, `imagePaths`, `dangerouslyBypassApprovalsAndSandbox`, and `isolated`. Codex always gets `--skip-git-repo-check` and is spawned as a detached process-group leader so aborts kill its whole tool subtree. After a successful turn, the runner briefly attaches through `codex app-server` to read the authoritative last-request usage and effective context window; if that capability is unavailable, usage is omitted instead of substituting cumulative totals. `--dangerously-bypass-approvals-and-sandbox` (full host access, no approval prompts) is **off by default** — set `dangerouslyBypassApprovalsAndSandbox: true` only for trusted prompts in environments you accept the agent can modify.
+Regular Codex turns use the app-server V2 `thread/*` and `turn/*` flow. Options include `developerInstructions`, `resumeSessionId`, `imagePaths`, `model`, `reasoningEffort`, `dangerouslyBypassApprovalsAndSandbox`, `appServerClient`, and `isolated`. Images become `localImage` inputs, reasoning effort is sent on `turn/start`, usage streams from `thread/tokenUsage/updated`, and cancellation uses `turn/interrupt`.
 
-`isolated: true` runs Codex with an ephemeral session, ignores user config and exec-policy rules, and enforces a read-only sandbox. It cannot resume a thread or be combined with `dangerouslyBypassApprovalsAndSandbox`; ephemeral runs skip the app-server usage lookup because no persisted thread exists.
+`dangerouslyBypassApprovalsAndSandbox` is **off by default**. Enabling it maps to app-server's `approvalPolicy: "never"` and `sandbox: "danger-full-access"`; use it only for trusted prompts in environments you accept the agent can modify.
+
+By default each regular `runCodex` call owns one app-server process. Create a reusable connection with `createCodexAppServerClient(...)`, pass it as `appServerClient`, and close it when the host shuts down. A shared connection can route concurrent turns by thread and turn id. Native in-turn question and approval requests are not enabled; unsupported server requests receive a JSON-RPC method-not-found response.
+
+`isolated: true` remains on `codex exec` because app-server cannot currently reproduce both per-run ignore flags. It uses an ephemeral session, ignores user config and exec-policy rules, and enforces a read-only sandbox. It cannot resume a thread or be combined with `dangerouslyBypassApprovalsAndSandbox`.
 
 ### Errors
 
-`AbortError`, `TimeoutError`, `MissingCliError` (ENOENT; carries `.cli`), `CodexTurnError` (fatal `error` / `turn.failed` stream events; carries `.exitCode`).
+`AbortError`, `TimeoutError`, `MissingCliError` (ENOENT; carries `.cli`), and `CodexTurnError` (fatal Codex turn notifications; isolated exec failures may also carry `.exitCode`).
 
 ## Develop
 

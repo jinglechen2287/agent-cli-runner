@@ -180,32 +180,58 @@ interface RunClaudeOptions extends CommonRunOptions {
  * output) and translate its JSONL stream into callbacks plus a final result. */
 declare function runClaude(opts: RunClaudeOptions): Promise<RunResult>;
 
+interface CodexServerRequest {
+    id: number | string;
+    method: string;
+    params: unknown;
+}
+type CodexServerRequestHandler = (request: CodexServerRequest) => Promise<unknown> | unknown;
+interface CodexAppServerClient {
+    request(method: string, params?: Record<string, unknown>): Promise<unknown>;
+    notify(method: string, params?: unknown): void;
+    onNotification(handler: (method: string, params: unknown) => void): () => void;
+    onServerRequest(handler: CodexServerRequestHandler): () => void;
+    onStderr(handler: (chunk: string) => void): () => void;
+    onClose(handler: (error: Error) => void): () => void;
+    close(): void;
+}
+interface CreateCodexAppServerClientOptions {
+    executablePath?: string;
+    cwd: string;
+    env?: NodeJS.ProcessEnv;
+    spawnFn?: RunCodexOptions["spawnFn"];
+    requestTimeoutMs?: number;
+}
+declare function createCodexAppServerClient(options: CreateCodexAppServerClientOptions): Promise<CodexAppServerClient>;
+
 /** Stripped so a Codex turn spawned from within another Codex session does
  * not inherit the parent's thread. */
 declare const CODEX_STRIPPED_ENV_VARS: readonly ["CODEX_THREAD_ID"];
 interface RunCodexOptions extends CommonRunOptions {
-    /** Pass `--dangerously-bypass-approvals-and-sandbox` so Codex runs with
-     * full host access and no approval prompts. Off by default — only enable
-     * this for trusted prompts in environments you accept it can modify. */
+    /** Preserve the historical full-host-access behavior for trusted callers. */
     dangerouslyBypassApprovalsAndSandbox?: boolean;
-    /** Text passed via `-c developer_instructions=...` on every turn. */
+    /** Text applied as developer instructions for the thread. */
     developerInstructions?: string;
-    /** Resume an existing thread by id (turn 2+). */
+    /** Resume an existing app-server thread by id. */
     resumeSessionId?: string;
-    /** Image paths passed via repeated `-i` flags. */
+    /** Images supplied as app-server local-image inputs. */
     imagePaths?: string[];
-    /** Model to run, passed via `--model`. Used as usage attribution only when
-     * the app-server snapshot does not report the resolved model. */
+    /** Model used for the turn and usage attribution. */
     model?: string;
-    /** Explicit context-window fallback (tokens). Codex app-server's reported
-     * `modelContextWindow` is authoritative whenever it is available. */
+    /** Explicit context-window fallback when app-server omits one. */
     contextWindow?: number;
-    /** Run a non-persistent one-shot request in a read-only sandbox without
-     * user config or exec-policy rules. Intended for small metadata tasks. */
+    /** Reasoning effort passed directly to app-server's `turn/start`. */
+    reasoningEffort?: string;
+    /** Reuse an initialized app-server connection. When omitted, regular runs
+     * create and close a connection for this turn. */
+    appServerClient?: CodexAppServerClient;
+    /** Run a non-persistent one-shot request without user config or rules.
+     * Codex app-server cannot currently reproduce both ignore flags per thread,
+     * so this narrow metadata path intentionally remains on `codex exec`. */
     isolated?: boolean;
 }
-/** Spawn a non-interactive Codex CLI turn (`codex exec --json`) and translate
- * its JSONL stream into the same callbacks used by the Claude runner. */
+/** Run a Codex turn. Regular work uses app-server; only isolated metadata
+ * requests retain the legacy non-interactive `codex exec` path. */
 declare function runCodex(opts: RunCodexOptions): Promise<RunResult>;
 
 declare class AbortError extends Error {
@@ -228,4 +254,4 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, CodexTurnError, type CommonRunOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type CodexAppServerClient, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, createCodexAppServerClient, runClaude, runCodex };

@@ -238,17 +238,17 @@ function claudeTodoPlanItems(name, input) {
   const items = [];
   for (const raw of input.todos) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return void 0;
-    const record = raw;
-    const text = normalizeSummary(record.content) ?? normalizeSummary(record.activeForm);
-    const status = normalizeSummary(record.status)?.toLowerCase().replace(/\s+/g, "_");
-    if (!text || !status) return void 0;
-    items.push({ text, status });
+    const record2 = raw;
+    const text2 = normalizeSummary(record2.content) ?? normalizeSummary(record2.activeForm);
+    const status = normalizeSummary(record2.status)?.toLowerCase().replace(/\s+/g, "_");
+    if (!text2 || !status) return void 0;
+    items.push({ text: text2, status });
   }
   return items.length > 0 ? items : void 0;
 }
-function planCompletionSummary(planItems) {
-  const completed = planItems.filter((item) => item.status === "completed").length;
-  return `${completed}/${planItems.length} steps completed`;
+function planCompletionSummary(planItems2) {
+  const completed = planItems2.filter((item) => item.status === "completed").length;
+  return `${completed}/${planItems2.length} steps completed`;
 }
 function claudeBackgroundAgentStatus(status) {
   switch (status) {
@@ -447,21 +447,21 @@ async function runClaude(opts) {
             if ((block.name === "Agent" || block.name === "Task") && typeof block.id === "string") {
               agentToolCallIds.add(block.id);
             }
-            const planItems = claudeTodoPlanItems(block.name, block.input);
-            const summary = planItems ? planCompletionSummary(planItems) : summarizeClaudeTool(block.name, block.input);
+            const planItems2 = claudeTodoPlanItems(block.name, block.input);
+            const summary = planItems2 ? planCompletionSummary(planItems2) : summarizeClaudeTool(block.name, block.input);
             opts.onToolUse?.({
               ...typeof block.id === "string" ? { callId: block.id } : {},
               name: block.name,
               ...summary !== void 0 ? { summary } : {},
               ...block.input ? { input: block.input } : {},
-              ...planItems ? { planItems } : {}
+              ...planItems2 ? { planItems: planItems2 } : {}
             });
           }
         }
         if (texts.length > 0) {
-          const text = texts.join("");
-          lastAssistantText = text;
-          opts.onAssistantText?.(text);
+          const text2 = texts.join("");
+          lastAssistantText = text2;
+          opts.onAssistantText?.(text2);
         }
         const model = parsed.message.model;
         if (model) lastAssistantModel = model;
@@ -530,21 +530,340 @@ async function runClaude(opts) {
 }
 
 // src/run-codex.ts
+import { spawn } from "child_process";
+
+// src/codex-app-server.ts
 import { spawn as nodeSpawn3 } from "child_process";
-import { open, readdir, stat } from "fs/promises";
-import { homedir } from "os";
-import { join } from "path";
-import { StringDecoder as StringDecoder2 } from "string_decoder";
-var CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"];
-var APP_SERVER_INITIALIZE_ID = 1;
-var APP_SERVER_RESUME_ID = 2;
-var APP_SERVER_USAGE_TIMEOUT_MS = 5e3;
-var ROLLOUT_POLL_INTERVAL_MS = 50;
+var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;
+var CLIENT_INFO = {
+  name: "agent_cli_runner",
+  title: "Agent CLI Runner",
+  version: "0.1.0"
+};
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-function codexBackgroundAgentStatus(status) {
-  switch (status) {
+function rpcError(value, fallback) {
+  if (!isRecord(value)) return new Error(fallback);
+  const message = typeof value.message === "string" ? value.message : fallback;
+  const error = new Error(message);
+  if (value.code !== void 0) error.code = value.code;
+  if (value.data !== void 0) error.data = value.data;
+  return error;
+}
+function safeCallback(use) {
+  try {
+    use();
+  } catch {
+  }
+}
+async function createCodexAppServerClient(options) {
+  const spawnFn = options.spawnFn ?? nodeSpawn3;
+  let child;
+  try {
+    child = spawnFn(options.executablePath ?? "codex", ["app-server", "--stdio"], {
+      cwd: options.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]),
+      detached: process.platform !== "win32"
+    });
+  } catch (error) {
+    if (error instanceof Error && isMissingExecutable(error)) throw new MissingCliError("codex");
+    throw error;
+  }
+  const pending = /* @__PURE__ */ new Map();
+  const notificationHandlers = /* @__PURE__ */ new Set();
+  const serverRequestHandlers = /* @__PURE__ */ new Set();
+  const stderrHandlers = /* @__PURE__ */ new Set();
+  const closeHandlers = /* @__PURE__ */ new Set();
+  const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  let nextId = 1;
+  let closed = false;
+  let stderr = "";
+  const send = (message) => {
+    if (closed) return;
+    child.stdin?.write(`${JSON.stringify(message)}
+`);
+  };
+  const rejectPending = (error) => {
+    for (const request of pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+    pending.clear();
+  };
+  const fail = (error) => {
+    if (closed) return;
+    closed = true;
+    rejectPending(error);
+    for (const handler of closeHandlers) safeCallback(() => handler(error));
+  };
+  const respondToServerRequest = async (message) => {
+    const id = message.id;
+    const method = message.method;
+    if (typeof id !== "number" && typeof id !== "string" || typeof method !== "string") return;
+    const handler = serverRequestHandlers.values().next().value;
+    if (!handler) {
+      send({
+        id,
+        error: { code: -32601, message: `Unsupported server request: ${method}` }
+      });
+      return;
+    }
+    try {
+      const result = await handler({ id, method, params: message.params });
+      send({ id, result: result ?? null });
+    } catch (error) {
+      send({
+        id,
+        error: {
+          code: -32603,
+          message: error instanceof Error ? error.message : "Server request handler failed"
+        }
+      });
+    }
+  };
+  const handleLine = (line) => {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (typeof message.method === "string" && message.id !== void 0) {
+      void respondToServerRequest(message);
+      return;
+    }
+    if (typeof message.method === "string") {
+      for (const handler of notificationHandlers) {
+        safeCallback(() => handler(message.method, message.params));
+      }
+      return;
+    }
+    if (typeof message.id !== "number") return;
+    const request = pending.get(message.id);
+    if (!request) return;
+    pending.delete(message.id);
+    clearTimeout(request.timer);
+    if (message.error !== void 0) {
+      request.reject(rpcError(message.error, "Codex app-server request failed"));
+    } else {
+      request.resolve(message.result);
+    }
+  };
+  const splitter = createLineSplitter(handleLine);
+  child.stdout?.on("data", (chunk) => splitter.push(chunk));
+  child.stderr?.on("data", (chunk) => {
+    const text2 = chunk.toString();
+    stderr = (stderr + text2).slice(-4e3);
+    for (const handler of stderrHandlers) safeCallback(() => handler(text2));
+  });
+  child.stdin?.on("error", (error) => fail(error));
+  child.stdout?.on("error", (error) => fail(error));
+  child.stderr?.on("error", (error) => fail(error));
+  child.on("error", (error) => {
+    fail(isMissingExecutable(error) ? new MissingCliError("codex") : error);
+  });
+  child.on("close", (code) => {
+    splitter.flush();
+    const detail = stderr.trim();
+    fail(new Error(
+      `Codex app-server exited${code === null ? "" : ` with code ${code}`}${detail ? `: ${detail}` : ""}`
+    ));
+  });
+  const client = {
+    request(method, params = {}) {
+      if (closed) return Promise.reject(new Error("Codex app-server is closed"));
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`Codex app-server request timed out: ${method}`));
+        }, timeoutMs);
+        pending.set(id, { resolve, reject, timer });
+        send({ id, method, params });
+      });
+    },
+    notify(method, params) {
+      send({ method, params: params ?? {} });
+    },
+    onNotification(handler) {
+      notificationHandlers.add(handler);
+      return () => notificationHandlers.delete(handler);
+    },
+    onServerRequest(handler) {
+      serverRequestHandlers.add(handler);
+      return () => serverRequestHandlers.delete(handler);
+    },
+    onStderr(handler) {
+      stderrHandlers.add(handler);
+      return () => stderrHandlers.delete(handler);
+    },
+    onClose(handler) {
+      closeHandlers.add(handler);
+      return () => closeHandlers.delete(handler);
+    },
+    close() {
+      if (closed) return;
+      fail(new Error("Codex app-server was closed"));
+      signalProcessTree(child, "SIGTERM");
+    }
+  };
+  try {
+    await client.request("initialize", {
+      clientInfo: CLIENT_INFO,
+      capabilities: { experimentalApi: false }
+    });
+    client.notify("initialized", {});
+    return client;
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+}
+function record(value) {
+  return isRecord(value) ? value : void 0;
+}
+function text(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : void 0;
+}
+function property(item, camel, snake) {
+  return item[camel] ?? item[snake];
+}
+function itemType(item) {
+  return text(item.type);
+}
+function webAction(item) {
+  return record(item.action);
+}
+function webActionType(item) {
+  const type = text(webAction(item)?.type);
+  if (type === "openPage") return "open_page";
+  if (type === "findInPage") return "find_in_page";
+  return type;
+}
+function toolName(item) {
+  switch (itemType(item)) {
+    case "commandExecution":
+    case "command_execution":
+      return "Bash";
+    case "fileChange":
+    case "file_change":
+      return "Edit";
+    case "mcpToolCall":
+    case "mcp_tool_call":
+      return text(item.tool) ?? "MCP";
+    case "dynamicToolCall":
+      return text(item.tool) ?? "Tool";
+    case "webSearch":
+    case "web_search":
+      return webActionType(item) === "open_page" || webActionType(item) === "find_in_page" ? "WebFetch" : "WebSearch";
+    default:
+      return null;
+  }
+}
+function webSearchQuery(item) {
+  const direct = normalizeSummary(item.query);
+  if (direct) return direct;
+  const action = record(item.action);
+  const query = normalizeSummary(action?.query);
+  if (query) return query;
+  if (!Array.isArray(action?.queries)) return void 0;
+  for (const candidate of action.queries) {
+    const normalized = normalizeSummary(candidate);
+    if (normalized) return normalized;
+  }
+  return void 0;
+}
+function toolInput(item) {
+  const type = itemType(item);
+  if (type !== "webSearch" && type !== "web_search") return item;
+  const action = webAction(item);
+  const actionType = webActionType(item);
+  const url = text(action?.url) ?? text(item.url);
+  if (actionType === "open_page" && url) {
+    const input = { ...item, url };
+    delete input.query;
+    return input;
+  }
+  const pattern = text(action?.pattern) ?? text(item.pattern);
+  if (actionType === "find_in_page" && (url || pattern)) {
+    const input = {
+      ...item,
+      ...url ? { url } : {},
+      ...pattern ? { prompt: `Find ${pattern} in page` } : {}
+    };
+    delete input.query;
+    return input;
+  }
+  const query = webSearchQuery(item);
+  return query ? { ...item, query } : item;
+}
+function summarizeTool(item) {
+  switch (itemType(item)) {
+    case "commandExecution":
+    case "command_execution":
+      return normalizeSummary(item.command);
+    case "webSearch":
+    case "web_search": {
+      const action = webAction(item);
+      const actionType = webActionType(item);
+      const url = text(action?.url) ?? text(item.url);
+      if (actionType === "open_page") return url ?? webSearchQuery(item);
+      if (actionType === "find_in_page") {
+        const pattern = text(action?.pattern) ?? text(item.pattern);
+        if (pattern && url) return `${pattern} \xB7 ${url}`;
+        return pattern ?? url ?? webSearchQuery(item);
+      }
+      return webSearchQuery(item);
+    }
+    case "fileChange":
+    case "file_change": {
+      if (!Array.isArray(item.changes)) return void 0;
+      const paths = item.changes.flatMap((change) => {
+        const path = normalizeSummary(record(change)?.path);
+        return path ? [path] : [];
+      });
+      if (paths.length === 1) return paths[0];
+      return paths.length > 1 ? `${paths.length} files` : void 0;
+    }
+    default:
+      return void 0;
+  }
+}
+function normalizePlanStatus(value) {
+  const status = text(value);
+  if (!status) return void 0;
+  return status.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
+}
+function planItems(value) {
+  if (!Array.isArray(value)) return void 0;
+  const items = [];
+  for (const raw of value) {
+    const step = record(raw);
+    const itemText = normalizeSummary(step?.step ?? step?.text);
+    const status = normalizePlanStatus(step?.status);
+    if (!itemText || !status) return void 0;
+    items.push({ text: itemText, status });
+  }
+  return items.length > 0 ? items : void 0;
+}
+function planToolInfo(params, turnId) {
+  const items = planItems(params.plan);
+  if (!items) return void 0;
+  const completed = items.filter(({ status }) => status === "completed").length;
+  return {
+    callId: `${turnId}:plan`,
+    name: "TodoWrite",
+    summary: `${completed}/${items.length} steps completed`,
+    planItems: items,
+    input: params
+  };
+}
+function backgroundStatus(value) {
+  switch (value) {
+    case "pending":
+    case "pendingInit":
     case "pending_init":
       return "pending";
     case "running":
@@ -552,6 +871,7 @@ function codexBackgroundAgentStatus(status) {
     case "completed":
       return "completed";
     case "errored":
+    case "notFound":
     case "not_found":
       return "failed";
     case "interrupted":
@@ -561,141 +881,19 @@ function codexBackgroundAgentStatus(status) {
       return void 0;
   }
 }
-function isTerminalBackgroundAgentStatus(status) {
+function terminalBackgroundStatus(status) {
   return status === "completed" || status === "failed" || status === "interrupted";
 }
-async function findCodexRollout(root, threadId) {
-  const suffix = `${threadId}.jsonl`;
-  const pending = [root];
-  while (pending.length > 0) {
-    const directory = pending.pop();
-    if (!directory) break;
-    let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) pending.push(path);
-      else if (entry.isFile() && entry.name.endsWith(suffix)) return path;
-    }
-  }
-  return void 0;
-}
-function tailCodexRollout(threadId, env, fromStart, onLine) {
-  const sessionsRoot = join(env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions");
-  let rolloutPath;
-  let offset;
-  let partial = "";
-  const decoder = new StringDecoder2("utf8");
-  let closed = false;
-  let timer;
-  let inFlight = Promise.resolve();
-  const readAvailable = async () => {
-    rolloutPath ??= await findCodexRollout(sessionsRoot, threadId);
-    if (!rolloutPath) return;
-    let size;
-    try {
-      size = (await stat(rolloutPath)).size;
-    } catch {
-      return;
-    }
-    if (offset === void 0) offset = fromStart ? 0 : size;
-    if (size <= offset) return;
-    const length = size - offset;
-    const buffer = Buffer.alloc(length);
-    const file = await open(rolloutPath, "r");
-    try {
-      const { bytesRead } = await file.read(buffer, 0, length, offset);
-      offset += bytesRead;
-      partial += decoder.write(buffer.subarray(0, bytesRead));
-    } finally {
-      await file.close();
-    }
-    const lines = partial.split("\n");
-    partial = lines.pop() ?? "";
-    for (const line of lines) {
-      if (line.trim()) onLine(line);
-    }
-  };
-  const poll = () => {
-    inFlight = readAvailable().catch(() => {
-    }).finally(() => {
-      if (closed) return;
-      timer = setTimeout(poll, ROLLOUT_POLL_INTERVAL_MS);
-      timer.unref?.();
-    });
-  };
-  poll();
-  return {
-    async ready() {
-      await inFlight;
-    },
-    async stop() {
-      closed = true;
-      if (timer) clearTimeout(timer);
-      await inFlight;
-      await readAvailable().catch(() => {
-      });
-      partial += decoder.end();
-      if (partial.trim()) onLine(partial);
-      partial = "";
-    }
-  };
-}
-function rolloutTimestamp(event, payload) {
-  if (typeof payload?.occurred_at_ms === "number") return payload.occurred_at_ms;
-  if (typeof event.timestamp === "string") {
-    const parsed = Date.parse(event.timestamp);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return Date.now();
-}
-function rolloutContentText(content) {
-  if (!Array.isArray(content)) return void 0;
-  const text = content.flatMap((part) => {
-    if (!isRecord(part) || typeof part.text !== "string") return [];
-    return [part.text];
-  }).join("\n").trim();
-  return text || void 0;
-}
-function finalAgentMessage(text) {
-  if (!/^Message Type: FINAL_ANSWER$/m.test(text)) return void 0;
-  const marker = "Payload:\n";
-  const markerIndex = text.indexOf(marker);
-  return (markerIndex === -1 ? text : text.slice(markerIndex + marker.length)).trim();
-}
-function rolloutActivityStatus(kind) {
-  switch (kind) {
-    case "started":
-      return "running";
-    case "completed":
-      return "completed";
-    case "failed":
-    case "errored":
-      return "failed";
-    case "interrupted":
-    case "stopped":
-    case "shutdown":
-      return "interrupted";
-    default:
-      return void 0;
-  }
-}
-function toCodexUsage(params, threadId, model, explicitContextWindow) {
-  if (!isRecord(params) || params.threadId !== threadId || !isRecord(params.tokenUsage)) {
-    return void 0;
-  }
-  const tokenUsage = params.tokenUsage;
-  if (!isRecord(tokenUsage.last)) return void 0;
-  const last = tokenUsage.last;
+function toUsage(params, threadId, turnId, model, fallbackWindow) {
+  if (params.threadId !== threadId || params.turnId !== turnId) return void 0;
+  const tokenUsage = record(params.tokenUsage);
+  const last = record(tokenUsage?.last);
+  if (!last) return void 0;
   const used = toTokenCount(last.totalTokens);
   if (used <= 0) return void 0;
   const input = toTokenCount(last.inputTokens);
   const cached = toTokenCount(last.cachedInputTokens);
-  const contextWindow = toContextWindow(tokenUsage.modelContextWindow) ?? explicitContextWindow;
+  const contextWindow = toContextWindow(tokenUsage?.modelContextWindow) ?? fallbackWindow;
   return {
     contextTokens: used,
     inputTokens: Math.max(0, input - cached),
@@ -705,107 +903,288 @@ function toCodexUsage(params, threadId, model, explicitContextWindow) {
     ...contextWindow !== void 0 ? { contextWindow } : {}
   };
 }
-function queryCodexUsage(opts, threadId, spawnFn) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawnFn(opts.executablePath ?? "codex", ["app-server", "--stdio"], {
-        cwd: opts.cwd,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS),
-        detached: process.platform !== "win32"
-      });
-    } catch {
-      resolve(void 0);
+function threadIdFrom(value) {
+  return text(record(record(value)?.thread)?.id);
+}
+function turnIdFrom(value) {
+  return text(record(record(value)?.turn)?.id);
+}
+function turnStatus(value) {
+  return text(record(record(value)?.turn)?.status);
+}
+async function runCodexAppServer(opts) {
+  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  const ownedClient = !opts.appServerClient;
+  const client = opts.appServerClient ?? await createCodexAppServerClient({
+    cwd: opts.cwd,
+    ...opts.executablePath ? { executablePath: opts.executablePath } : {},
+    ...opts.env ? { env: opts.env } : {},
+    ...opts.spawnFn ? { spawnFn: opts.spawnFn } : {}
+  });
+  let threadId = opts.resumeSessionId;
+  let turnId;
+  let resolvedModel = opts.model;
+  let finalText = "";
+  let latestUsage;
+  let settled = false;
+  let interruption;
+  let turnStarting = false;
+  let timeout;
+  const emittedTools = /* @__PURE__ */ new Set();
+  const backgroundAgents = /* @__PURE__ */ new Map();
+  let resolveCompletion;
+  let rejectCompletion;
+  const completion = new Promise((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  void completion.catch(() => {
+  });
+  let rejectLifecycle;
+  let lifecycleFailed = false;
+  const lifecycleFailure = new Promise((_resolve, reject) => {
+    rejectLifecycle = reject;
+  });
+  const failLifecycle = (error) => {
+    if (lifecycleFailed) return;
+    lifecycleFailed = true;
+    rejectLifecycle(error);
+  };
+  const raceLifecycle = (operation) => Promise.race([operation, lifecycleFailure]);
+  const settleError = (error) => {
+    if (settled) return;
+    settled = true;
+    rejectCompletion(error);
+  };
+  const requestInterrupt = () => {
+    if (!interruption || !threadId || !turnId) return;
+    void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
+    }).finally(() => failLifecycle(interruption));
+  };
+  const interrupt = (error) => {
+    if (interruption || settled) return;
+    interruption = error;
+    if (threadId && turnId) requestInterrupt();
+    else if (!turnStarting) failLifecycle(error);
+  };
+  const abortHandler = () => interrupt(new AbortError("codex run aborted"));
+  if (opts.signal) {
+    if (opts.signal.aborted) abortHandler();
+    else opts.signal.addEventListener("abort", abortHandler, { once: true });
+  }
+  if (opts.timeoutMs !== void 0) {
+    timeout = setTimeout(
+      () => interrupt(new TimeoutError(`codex run timed out after ${opts.timeoutMs}ms`)),
+      opts.timeoutMs
+    );
+  }
+  const updateBackgroundAgents = (item, occurredAt) => {
+    const type = itemType(item);
+    if (type !== "collabAgentToolCall" && type !== "collab_tool_call") return;
+    const tool = text(item.tool);
+    const isSpawn = tool === "spawnAgent" || tool === "spawn_agent";
+    const states = record(property(item, "agentsStates", "agents_states")) ?? {};
+    const rawReceiverIds = property(item, "receiverThreadIds", "receiver_thread_ids");
+    const receiverIds = Array.isArray(rawReceiverIds) ? rawReceiverIds.filter((id) => typeof id === "string") : [];
+    for (const id of /* @__PURE__ */ new Set([...receiverIds, ...Object.keys(states)])) {
+      const current = backgroundAgents.get(id);
+      if (!current && !isSpawn) continue;
+      const state = record(states[id]);
+      const status = backgroundStatus(state?.status) ?? current?.status ?? "pending";
+      const message = text(state?.message);
+      const itemId = text(item.id);
+      const description = current?.description ?? text(item.prompt);
+      const agent = {
+        ...current ?? {
+          id,
+          provider: "codex",
+          startedAt: occurredAt
+        },
+        ...!current?.parentToolCallId && itemId ? { parentToolCallId: itemId } : {},
+        ...description ? { description } : {},
+        status,
+        ...message && status === "failed" ? { error: message } : {},
+        ...message && status !== "failed" ? { summary: message } : {},
+        updatedAt: occurredAt,
+        ...terminalBackgroundStatus(status) ? { endedAt: current?.endedAt ?? occurredAt } : {}
+      };
+      if (status === "failed") delete agent.summary;
+      else delete agent.error;
+      backgroundAgents.set(id, agent);
+      safeCallback(() => opts.onBackgroundAgentUpdate?.(agent));
+    }
+  };
+  const handleItem = (method, params) => {
+    if (params.threadId !== threadId) return;
+    const eventTurnId = text(params.turnId);
+    if (!eventTurnId) return;
+    turnId ??= eventTurnId;
+    if (turnId !== eventTurnId) return;
+    const item = record(params.item);
+    if (!item) return;
+    const occurredAt = typeof params.startedAtMs === "number" ? params.startedAtMs : typeof params.completedAtMs === "number" ? params.completedAtMs : Date.now();
+    updateBackgroundAgents(item, occurredAt);
+    if (method === "item/completed" && itemType(item) === "agentMessage") {
+      const message = text(item.text);
+      if (message) {
+        finalText = message;
+        safeCallback(() => opts.onAssistantText?.(message));
+      }
       return;
     }
-    let settled = false;
-    let resumed = false;
-    let resolvedModel = opts.model;
-    let pendingParams;
-    const timer = setTimeout(() => finish(), APP_SERVER_USAGE_TIMEOUT_MS);
-    const send = (message) => {
-      child.stdin?.write(`${JSON.stringify(message)}
-`);
-    };
-    const finish = (usage) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signalProcessTree(child, "SIGTERM");
-      resolve(usage);
-    };
-    const maybeFinish = () => {
-      if (!resumed || pendingParams === void 0) return;
-      const usage = toCodexUsage(
-        pendingParams,
-        threadId,
-        resolvedModel,
-        opts.contextWindow
-      );
-      if (usage) finish(usage);
-    };
-    const handleLine = (line) => {
-      let message;
-      try {
-        message = JSON.parse(line);
-      } catch {
-        return;
+    const name = toolName(item);
+    if (!name) return;
+    const id = text(item.id) ?? `${itemType(item)}:${name}`;
+    if (!emittedTools.has(id)) {
+      emittedTools.add(id);
+      const summary = summarizeTool(item);
+      safeCallback(() => opts.onToolUse?.({
+        callId: id,
+        name,
+        ...summary ? { summary } : {},
+        input: toolInput(item)
+      }));
+    }
+    if (method === "item/completed") {
+      const exitCode = item.exitCode;
+      const status = text(item.status);
+      safeCallback(() => opts.onToolResult?.({
+        callId: id,
+        content: item,
+        ...typeof exitCode === "number" && exitCode !== 0 || status === "failed" ? { isError: true } : {}
+      }));
+    }
+  };
+  const removeNotification = client.onNotification((method, rawParams) => {
+    const params = record(rawParams);
+    if (!params) return;
+    if (method === "turn/started" && params.threadId === threadId) {
+      turnId ??= text(record(params.turn)?.id);
+      if (interruption) requestInterrupt();
+      return;
+    }
+    if (method === "item/started" || method === "item/completed") {
+      handleItem(method, params);
+      return;
+    }
+    if (method === "turn/plan/updated" && params.threadId === threadId) {
+      const eventTurnId = text(params.turnId);
+      if (!eventTurnId || turnId && eventTurnId !== turnId) return;
+      turnId ??= eventTurnId;
+      const info = planToolInfo(params, eventTurnId);
+      if (info) safeCallback(() => opts.onToolUse?.(info));
+      return;
+    }
+    if (method === "thread/tokenUsage/updated" && threadId && turnId) {
+      const usage = toUsage(params, threadId, turnId, resolvedModel, opts.contextWindow);
+      if (!usage) return;
+      latestUsage = usage;
+      safeCallback(() => opts.onUsage?.(usage));
+      return;
+    }
+    if (method === "error" && params.threadId === threadId) {
+      if (params.willRetry === true) return;
+      const message2 = text(record(params.error)?.message) ?? "Codex turn failed";
+      settleError(new CodexTurnError(`Codex error: ${message2}`));
+      return;
+    }
+    if (method !== "turn/completed" || params.threadId !== threadId) return;
+    const completedTurnId = text(record(params.turn)?.id);
+    if (!completedTurnId || turnId && completedTurnId !== turnId) return;
+    turnId ??= completedTurnId;
+    if (interruption) {
+      failLifecycle(interruption);
+      return;
+    }
+    const status = text(record(params.turn)?.status);
+    if (status === "completed") {
+      if (!settled) {
+        settled = true;
+        resolveCompletion();
       }
-      if (message.id === APP_SERVER_INITIALIZE_ID) {
-        if (message.error !== void 0) {
-          finish();
-          return;
-        }
-        send({ method: "initialized" });
-        send({
-          id: APP_SERVER_RESUME_ID,
-          method: "thread/resume",
-          params: { threadId }
-        });
-        return;
-      }
-      if (message.id === APP_SERVER_RESUME_ID) {
-        if (message.error !== void 0) {
-          finish();
-          return;
-        }
-        if (isRecord(message.result) && typeof message.result.model === "string") {
-          resolvedModel = message.result.model;
-        }
-        resumed = true;
-        maybeFinish();
-        return;
-      }
-      if (message.method === "thread/tokenUsage/updated") {
-        pendingParams = message.params;
-        maybeFinish();
-      }
-    };
-    const splitter = createLineSplitter(handleLine);
-    child.stdout?.on("data", (chunk) => splitter.push(chunk));
-    child.stderr?.resume();
-    child.stdin?.on("error", () => finish());
-    child.on("error", () => finish());
-    child.on("close", () => {
-      splitter.flush();
-      finish();
-    });
-    send({
-      id: APP_SERVER_INITIALIZE_ID,
-      method: "initialize",
-      params: {
-        clientInfo: {
-          name: "agent-cli-runner",
-          title: "Agent CLI Runner",
-          version: "0.1.0"
-        },
-        capabilities: null
-      }
-    });
+      return;
+    }
+    const message = text(record(record(params.turn)?.error)?.message) ?? `Codex turn ${status ?? "failed"}`;
+    settleError(new CodexTurnError(message));
   });
+  const removeClose = client.onClose((error) => settleError(error));
+  const removeStderr = client.onStderr((chunk) => safeCallback(() => opts.onStderr?.(chunk)));
+  try {
+    const threadRequest = opts.resumeSessionId ? client.request("thread/resume", {
+      threadId: opts.resumeSessionId,
+      cwd: opts.cwd,
+      ...opts.model ? { model: opts.model } : {},
+      ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
+      ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}
+    }) : client.request("thread/start", {
+      cwd: opts.cwd,
+      ...opts.model ? { model: opts.model } : {},
+      ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
+      ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}
+    });
+    const threadResult = await raceLifecycle(threadRequest);
+    threadId = threadIdFrom(threadResult) ?? threadId;
+    resolvedModel = text(record(threadResult)?.model) ?? resolvedModel;
+    if (!threadId) throw new CodexTurnError("Codex app-server did not return a thread ID");
+    safeCallback(() => opts.onSessionId?.(threadId));
+    turnStarting = true;
+    const input = [
+      { type: "text", text: opts.prompt, text_elements: [] },
+      ...(opts.imagePaths ?? []).map((path) => ({ type: "localImage", path }))
+    ];
+    const turnResult = await raceLifecycle(client.request("turn/start", {
+      threadId,
+      input,
+      ...opts.model ? { model: opts.model } : {},
+      ...opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}
+    }));
+    turnStarting = false;
+    turnId = turnIdFrom(turnResult) ?? turnId;
+    if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
+    if (interruption) requestInterrupt();
+    await raceLifecycle(completion);
+    const status = turnStatus(turnResult);
+    return {
+      text: finalText.trim(),
+      exitCode: status && status !== "completed" && status !== "inProgress" ? 1 : 0,
+      sessionId: threadId,
+      ...latestUsage ? { usage: latestUsage } : {}
+    };
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    opts.signal?.removeEventListener("abort", abortHandler);
+    removeNotification();
+    removeClose();
+    removeStderr();
+    if (ownedClient) client.close();
+  }
 }
-function toolName(item) {
+
+// src/run-codex.ts
+var CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"];
+function isRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function buildIsolatedArgs(opts) {
+  const args = [
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--sandbox",
+    "read-only"
+  ];
+  if (opts.model !== void 0) args.push("--model", opts.model);
+  if (opts.developerInstructions !== void 0) {
+    args.push("-c", `developer_instructions=${JSON.stringify(opts.developerInstructions)}`);
+  }
+  for (const path of opts.imagePaths ?? []) args.push("-i", path);
+  args.push("-");
+  return args;
+}
+function execToolName(item) {
   switch (item.type) {
     case "command_execution":
       return "Bash";
@@ -822,321 +1201,128 @@ function toolName(item) {
       return null;
   }
 }
-function codexPlanItems(item) {
-  const rawItems = Array.isArray(item.items) ? item.items : Array.isArray(item.plan) ? item.plan : void 0;
-  if (!rawItems) return void 0;
-  const items = [];
-  for (const rawItem of rawItems) {
-    if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) {
-      return void 0;
-    }
-    const record = rawItem;
-    const text = normalizeSummary(record.text) ?? normalizeSummary(record.step);
-    if (!text) return void 0;
-    let status;
-    if (typeof record.completed === "boolean") {
-      status = record.completed ? "completed" : "pending";
-    } else {
-      status = normalizeSummary(record.status)?.toLowerCase().replace(/\s+/g, "_");
-    }
-    if (!status) return void 0;
-    items.push({ text, status });
-  }
-  return items.length > 0 ? items : void 0;
-}
-function codexWebSearchQuery(item) {
+function execWebQuery(item) {
   const direct = normalizeSummary(item.query);
   if (direct) return direct;
-  const action = item.action;
-  if (!action || typeof action !== "object" || Array.isArray(action)) return void 0;
-  const record = action;
-  const query = normalizeSummary(record.query);
+  if (!isRecord2(item.action)) return void 0;
+  const query = normalizeSummary(item.action.query);
   if (query) return query;
-  if (Array.isArray(record.queries)) {
-    for (const candidate of record.queries) {
-      const normalized = normalizeSummary(candidate);
-      if (normalized) return normalized;
-    }
+  if (!Array.isArray(item.action.queries)) return void 0;
+  for (const candidate of item.action.queries) {
+    const normalized = normalizeSummary(candidate);
+    if (normalized) return normalized;
   }
   return void 0;
 }
-function codexToolInput(item) {
-  if (item.type !== "web_search") return item;
-  return { ...item, query: codexWebSearchQuery(item) };
+function execPlanItems(item) {
+  const values = Array.isArray(item.items) ? item.items : Array.isArray(item.plan) ? item.plan : void 0;
+  if (!values) return void 0;
+  const items = [];
+  for (const value of values) {
+    if (!isRecord2(value)) return void 0;
+    const text2 = normalizeSummary(value.text) ?? normalizeSummary(value.step);
+    const rawStatus = typeof value.completed === "boolean" ? value.completed ? "completed" : "pending" : normalizeSummary(value.status);
+    const status = rawStatus?.toLowerCase().replace(/\s+/g, "_");
+    if (!text2 || !status) return void 0;
+    items.push({ text: text2, status });
+  }
+  return items.length > 0 ? items : void 0;
 }
-function summarizeCodexTool(item, planItems) {
-  switch (item.type) {
-    case "command_execution":
-      return normalizeSummary(item.command);
-    case "web_search":
-      return codexWebSearchQuery(item);
-    case "file_change": {
-      if (!Array.isArray(item.changes)) return void 0;
-      const paths = item.changes.map(
-        (change) => change && typeof change === "object" ? normalizeSummary(change.path) : void 0
-      ).filter((path) => path !== void 0);
-      if (paths.length === 1) return paths[0];
-      if (paths.length > 1) return `${paths.length} files`;
-      return void 0;
-    }
-    case "todo_list":
-    case "plan_update": {
-      if (!planItems || planItems.length === 0) return void 0;
-      const completed = planItems.filter((planItem) => planItem.status === "completed").length;
-      return `${completed}/${planItems.length} steps completed`;
-    }
-    default:
-      return void 0;
+function execToolSummary(item, planItems2) {
+  if (item.type === "command_execution") return normalizeSummary(item.command);
+  if (item.type === "web_search") return execWebQuery(item);
+  if (item.type === "file_change" && Array.isArray(item.changes)) {
+    const paths = item.changes.flatMap((change) => {
+      const path = isRecord2(change) ? normalizeSummary(change.path) : void 0;
+      return path ? [path] : [];
+    });
+    if (paths.length === 1) return paths[0];
+    if (paths.length > 1) return `${paths.length} files`;
   }
+  if ((item.type === "todo_list" || item.type === "plan_update") && planItems2) {
+    const complete = planItems2.filter(({ status }) => status === "completed").length;
+    return `${complete}/${planItems2.length} steps completed`;
+  }
+  return void 0;
 }
-function fatalEventError(event) {
-  if (event.type !== "error" && event.type !== "turn.failed") return null;
-  let detail;
-  if (typeof event.message === "string") {
-    detail = event.message;
-  } else if (typeof event.error === "string") {
-    detail = event.error;
-  } else if (event.error && typeof event.error === "object") {
-    const message = event.error.message;
-    if (typeof message === "string") detail = message;
-  }
-  const label = event.type === "turn.failed" ? "Codex turn failed" : "Codex error";
-  return new CodexTurnError(detail ? `${label}: ${detail}` : label);
+function execFatalError(event) {
+  if (event.type !== "error" && event.type !== "turn.failed") return void 0;
+  const detail = typeof event.message === "string" ? event.message : typeof event.error === "string" ? event.error : isRecord2(event.error) && typeof event.error.message === "string" ? event.error.message : void 0;
+  return new CodexTurnError(detail ? `Codex error: ${detail}` : "Codex error");
 }
-function buildArgs(opts) {
-  const args = opts.resumeSessionId ? ["exec", "resume", "--json"] : ["exec", "--json"];
-  if (opts.dangerouslyBypassApprovalsAndSandbox) {
-    args.push("--dangerously-bypass-approvals-and-sandbox");
+async function runIsolatedCodex(opts) {
+  const spawnFn = opts.spawnFn ?? spawn;
+  let child;
+  try {
+    child = spawnFn(opts.executablePath ?? "codex", buildIsolatedArgs(opts), {
+      cwd: opts.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS),
+      detached: process.platform !== "win32"
+    });
+  } catch (error) {
+    if (error instanceof Error && isMissingExecutable(error)) throw new MissingCliError("codex");
+    throw error;
   }
-  args.push("--skip-git-repo-check");
-  if (opts.isolated) {
-    args.push(
-      "--ephemeral",
-      "--ignore-user-config",
-      "--ignore-rules",
-      "--sandbox",
-      "read-only"
-    );
-  }
-  if (opts.model !== void 0) {
-    args.push("--model", opts.model);
-  }
-  if (opts.developerInstructions !== void 0) {
-    args.push("-c", `developer_instructions=${JSON.stringify(opts.developerInstructions)}`);
-  }
-  for (const imagePath of opts.imagePaths ?? []) {
-    args.push("-i", imagePath);
-  }
-  if (opts.resumeSessionId) args.push(opts.resumeSessionId);
-  args.push("-");
-  return args;
-}
-async function runCodex(opts) {
-  if (opts.isolated && opts.resumeSessionId) {
-    throw new Error("isolated Codex runs cannot resume a session");
-  }
-  if (opts.isolated && opts.dangerouslyBypassApprovalsAndSandbox) {
-    throw new Error("isolated Codex runs cannot bypass approvals and sandboxing");
-  }
-  const spawnFn = opts.spawnFn ?? nodeSpawn3;
-  const child = spawnFn(opts.executablePath ?? "codex", buildArgs(opts), {
-    cwd: opts.cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS),
-    detached: process.platform !== "win32"
-  });
   return new Promise((resolve, reject) => {
     let settled = false;
     let sessionId;
-    let finalText;
+    let finalText = "";
     let fatalError;
-    let lastUsage;
     const emittedTools = /* @__PURE__ */ new Set();
-    const backgroundAgents = /* @__PURE__ */ new Map();
-    const backgroundAgentIdsByPath = /* @__PURE__ */ new Map();
-    const backgroundAgentDescriptions = /* @__PURE__ */ new Map();
-    let rolloutTail;
-    let hasCumulativeUsage = false;
     const lifecycle = watchLifecycle({
       cli: "codex",
       signal: opts.signal,
       timeoutMs: opts.timeoutMs,
       kill: (signal) => signalProcessTree(child, signal)
     });
-    const emitBackgroundAgent = (agent) => {
-      backgroundAgents.set(agent.id, agent);
-      try {
-        opts.onBackgroundAgentUpdate?.(agent);
-      } catch {
-      }
-    };
-    const handleRolloutLine = (line) => {
-      let event;
-      try {
-        const parsed = JSON.parse(line);
-        if (!isRecord(parsed)) return;
-        event = parsed;
-      } catch {
-        return;
-      }
-      if (!isRecord(event.payload)) return;
-      const payload = event.payload;
-      if (event.type === "response_item" && payload.type === "function_call" && payload.namespace === "collaboration" && (payload.name === "spawn_agent" || payload.name === "spawnAgent") && typeof payload.call_id === "string") {
-        if (typeof payload.arguments !== "string") return;
-        try {
-          const args = JSON.parse(payload.arguments);
-          if (isRecord(args) && typeof args.task_name === "string") {
-            backgroundAgentDescriptions.set(payload.call_id, args.task_name);
-          }
-        } catch {
-        }
-        return;
-      }
-      if (event.type === "event_msg" && payload.type === "sub_agent_activity" && typeof payload.agent_thread_id === "string") {
-        const id = payload.agent_thread_id;
-        const current = backgroundAgents.get(id);
-        const status = rolloutActivityStatus(payload.kind) ?? current?.status ?? "running";
-        const updatedAt = rolloutTimestamp(event, payload);
-        const parentToolCallId = typeof payload.event_id === "string" ? payload.event_id : current?.parentToolCallId;
-        const agentPath = typeof payload.agent_path === "string" ? payload.agent_path : void 0;
-        if (agentPath) backgroundAgentIdsByPath.set(agentPath, id);
-        const description = current?.description ?? (parentToolCallId ? backgroundAgentDescriptions.get(parentToolCallId) : void 0) ?? agentPath?.split("/").filter(Boolean).at(-1);
-        emitBackgroundAgent({
-          ...current ?? {
-            id,
-            provider: "codex",
-            startedAt: updatedAt
-          },
-          ...parentToolCallId ? { parentToolCallId } : {},
-          ...description ? { description } : {},
-          status,
-          updatedAt,
-          ...isTerminalBackgroundAgentStatus(status) ? { endedAt: current?.endedAt ?? updatedAt } : {}
-        });
-        return;
-      }
-      if (event.type === "response_item" && payload.type === "agent_message" && typeof payload.author === "string") {
-        const id = backgroundAgentIdsByPath.get(payload.author);
-        if (!id) return;
-        const current = backgroundAgents.get(id);
-        if (!current) return;
-        const text = rolloutContentText(payload.content);
-        if (!text) return;
-        const finalSummary = finalAgentMessage(text);
-        const updatedAt = rolloutTimestamp(event);
-        emitBackgroundAgent({
-          ...current,
-          status: finalSummary === void 0 ? current.status : "completed",
-          summary: finalSummary ?? text,
-          updatedAt,
-          ...finalSummary === void 0 ? {} : { endedAt: updatedAt }
-        });
-      }
-    };
-    const startRolloutTail = (threadId, fromStart) => {
-      if (rolloutTail || opts.isolated || !opts.onBackgroundAgentUpdate) return;
-      rolloutTail = tailCodexRollout(
-        threadId,
-        opts.env ?? process.env,
-        fromStart,
-        handleRolloutLine
-      );
-    };
-    if (opts.resumeSessionId) startRolloutTail(opts.resumeSessionId, false);
     const handleLine = (line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
       let event;
       try {
-        event = JSON.parse(trimmed);
+        event = JSON.parse(line);
       } catch {
         return;
       }
-      const eventError = fatalEventError(event);
-      if (eventError) {
-        fatalError ??= eventError;
-        return;
-      }
+      fatalError ??= execFatalError(event);
       if (event.type === "thread.started" && typeof event.thread_id === "string") {
         sessionId = event.thread_id;
-        startRolloutTail(event.thread_id, !opts.resumeSessionId);
         opts.onSessionId?.(event.thread_id);
         return;
       }
-      if (event.type === "turn.completed" && event.usage) {
-        hasCumulativeUsage = true;
+      if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
+        finalText = event.item.text;
+        opts.onAssistantText?.(event.item.text);
         return;
       }
-      if (event.type !== "item.started" && event.type !== "item.completed") {
-        if (event.type !== "item.updated") return;
-      }
+      if (event.type !== "item.started" && event.type !== "item.completed") return;
       const item = event.item;
       if (!item) return;
-      if (item.type === "collab_tool_call") {
-        const tool = item.tool;
-        const isSpawn = tool === "spawn_agent" || tool === "spawnAgent";
-        const states = isRecord(item.agents_states) ? item.agents_states : {};
-        const receiverIds = Array.isArray(item.receiver_thread_ids) ? item.receiver_thread_ids.filter((id2) => typeof id2 === "string") : [];
-        for (const id2 of /* @__PURE__ */ new Set([...receiverIds, ...Object.keys(states)])) {
-          const current = backgroundAgents.get(id2);
-          if (!current && !isSpawn) continue;
-          const state = isRecord(states[id2]) ? states[id2] : void 0;
-          const status = codexBackgroundAgentStatus(state?.status) ?? current?.status ?? "pending";
-          const message = typeof state?.message === "string" ? state.message : void 0;
-          const now = Date.now();
-          const agent = {
-            ...current ?? {
-              id: id2,
-              provider: "codex",
-              startedAt: now
-            },
-            ...current?.parentToolCallId ? {} : typeof item.id === "string" ? { parentToolCallId: item.id } : {},
-            ...typeof item.prompt === "string" ? { description: item.prompt } : {},
-            status,
-            ...message && status === "failed" ? { error: message } : {},
-            ...message && status !== "failed" ? { summary: message } : {},
-            updatedAt: now,
-            ...isTerminalBackgroundAgentStatus(status) ? { endedAt: current?.endedAt ?? now } : {}
-          };
-          if (status === "failed") {
-            delete agent.summary;
-          } else {
-            delete agent.error;
-          }
-          emitBackgroundAgent(agent);
-        }
-        return;
-      }
-      if (event.type === "item.completed" && item.type === "agent_message" && typeof item.text === "string") {
-        finalText = item.text;
-        opts.onAssistantText?.(item.text);
-        return;
-      }
-      const name = toolName(item);
+      const name = execToolName(item);
       if (!name) return;
-      const id = typeof item.id === "string" ? item.id : `${item.type}:${name}`;
-      if (emittedTools.has(id)) return;
-      emittedTools.add(id);
-      const planItems = codexPlanItems(item);
-      const summary = summarizeCodexTool(item, planItems);
-      opts.onToolUse?.({
-        ...typeof item.id === "string" ? { callId: item.id } : {},
-        name,
-        ...summary !== void 0 ? { summary } : {},
-        ...planItems !== void 0 ? { planItems } : {},
-        input: codexToolInput(item)
-      });
+      const id = typeof item.id === "string" ? item.id : `${String(item.type)}:${name}`;
+      if (!emittedTools.has(id)) {
+        emittedTools.add(id);
+        const planItems2 = execPlanItems(item);
+        const summary = execToolSummary(item, planItems2);
+        opts.onToolUse?.({
+          callId: id,
+          name,
+          ...summary ? { summary } : {},
+          ...planItems2 ? { planItems: planItems2 } : {},
+          input: item.type === "web_search" ? { ...item, query: execWebQuery(item) } : item
+        });
+      }
+      if (event.type === "item.completed") {
+        opts.onToolResult?.({ callId: id, content: item });
+      }
     };
     const splitter = createLineSplitter(handleLine);
     child.stdout?.on("data", (chunk) => splitter.push(chunk));
-    child.stderr?.on("data", (chunk) => {
-      opts.onStderr?.(chunk.toString());
-    });
+    child.stderr?.on("data", (chunk) => opts.onStderr?.(chunk.toString()));
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
       lifecycle.cleanup();
-      void rolloutTail?.stop();
       reject(isMissingExecutable(error) ? new MissingCliError("codex") : error);
     });
     child.on("close", (code) => {
@@ -1144,49 +1330,32 @@ async function runCodex(opts) {
       settled = true;
       splitter.flush();
       lifecycle.cleanup();
-      const complete = async () => {
-        if (rolloutTail) await rolloutTail.stop();
-        const interruption = lifecycle.interruptionError();
-        if (interruption) {
-          reject(interruption);
-          return;
-        }
-        if (fatalError) {
-          fatalError.exitCode = code ?? -1;
-          reject(fatalError);
-          return;
-        }
-        const exitCode = code ?? -1;
-        if (exitCode === 0 && sessionId && hasCumulativeUsage && !opts.isolated) {
-          lastUsage = await queryCodexUsage(opts, sessionId, spawnFn);
-          if (lastUsage) {
-            try {
-              opts.onUsage?.(lastUsage);
-            } catch {
-            }
-          }
-        }
-        resolve({
-          text: (finalText ?? "").trim(),
-          exitCode,
-          ...sessionId !== void 0 ? { sessionId } : {},
-          ...lastUsage !== void 0 ? { usage: lastUsage } : {}
-        });
-      };
-      void complete();
+      const interruption = lifecycle.interruptionError();
+      if (interruption) {
+        reject(interruption);
+        return;
+      }
+      if (fatalError) {
+        fatalError.exitCode = code ?? -1;
+        reject(fatalError);
+        return;
+      }
+      resolve({
+        text: finalText.trim(),
+        exitCode: code ?? -1,
+        ...sessionId ? { sessionId } : {}
+      });
     });
-    const sendPrompt = async () => {
-      if (rolloutTail) await rolloutTail.ready();
-      writePrompt(child, opts.prompt);
-    };
-    void sendPrompt().catch((error) => {
-      if (settled) return;
-      settled = true;
-      lifecycle.cleanup();
-      void rolloutTail?.stop();
-      reject(error);
-    });
+    writePrompt(child, opts.prompt);
   });
+}
+async function runCodex(opts) {
+  if (!opts.isolated) return runCodexAppServer(opts);
+  if (opts.resumeSessionId) throw new Error("isolated Codex runs cannot resume a session");
+  if (opts.dangerouslyBypassApprovalsAndSandbox) {
+    throw new Error("isolated Codex runs cannot bypass approvals and sandboxing");
+  }
+  return runIsolatedCodex(opts);
 }
 export {
   AbortError,
@@ -1197,6 +1366,7 @@ export {
   MissingCliError,
   TimeoutError,
   contextWindowForModel,
+  createCodexAppServerClient,
   runClaude,
   runCodex
 };

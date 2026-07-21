@@ -1,0 +1,773 @@
+import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { AbortError, CodexTurnError, MissingCliError, TimeoutError } from "./errors.js";
+import {
+  createLineSplitter,
+  filterEnv,
+  isMissingExecutable,
+  normalizeSummary,
+  signalProcessTree,
+  toContextWindow,
+  toTokenCount,
+} from "./internal.js";
+import type { RunCodexOptions } from "./run-codex.js";
+import type {
+  BackgroundAgentInfo,
+  BackgroundAgentStatus,
+  RunResult,
+  ToolPlanItem,
+  ToolUseInfo,
+} from "./types.js";
+import type { TokenUsage } from "./usage.js";
+
+interface JsonRpcMessage {
+  id?: unknown;
+  method?: unknown;
+  params?: unknown;
+  result?: unknown;
+  error?: unknown;
+}
+
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+export interface CodexServerRequest {
+  id: number | string;
+  method: string;
+  params: unknown;
+}
+
+export type CodexServerRequestHandler = (
+  request: CodexServerRequest,
+) => Promise<unknown> | unknown;
+
+export interface CodexAppServerClient {
+  request(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  notify(method: string, params?: unknown): void;
+  onNotification(handler: (method: string, params: unknown) => void): () => void;
+  onServerRequest(handler: CodexServerRequestHandler): () => void;
+  onStderr(handler: (chunk: string) => void): () => void;
+  onClose(handler: (error: Error) => void): () => void;
+  close(): void;
+}
+
+export interface CreateCodexAppServerClientOptions {
+  executablePath?: string;
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  spawnFn?: RunCodexOptions["spawnFn"];
+  requestTimeoutMs?: number;
+}
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const CLIENT_INFO = {
+  name: "agent_cli_runner",
+  title: "Agent CLI Runner",
+  version: "0.1.0",
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function rpcError(value: unknown, fallback: string): Error {
+  if (!isRecord(value)) return new Error(fallback);
+  const message = typeof value.message === "string" ? value.message : fallback;
+  const error = new Error(message) as Error & { code?: unknown; data?: unknown };
+  if (value.code !== undefined) error.code = value.code;
+  if (value.data !== undefined) error.data = value.data;
+  return error;
+}
+
+function safeCallback(use: () => void): void {
+  try {
+    use();
+  } catch {
+    // Host callbacks must never corrupt the provider stream.
+  }
+}
+
+export async function createCodexAppServerClient(
+  options: CreateCodexAppServerClientOptions,
+): Promise<CodexAppServerClient> {
+  const spawnFn = options.spawnFn ?? nodeSpawn;
+  let child: ChildProcess;
+  try {
+    child = spawnFn(options.executablePath ?? "codex", ["app-server", "--stdio"], {
+      cwd: options.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]),
+      detached: process.platform !== "win32",
+    });
+  } catch (error) {
+    if (error instanceof Error && isMissingExecutable(error)) throw new MissingCliError("codex");
+    throw error;
+  }
+
+  const pending = new Map<number, PendingRequest>();
+  const notificationHandlers = new Set<(method: string, params: unknown) => void>();
+  const serverRequestHandlers = new Set<CodexServerRequestHandler>();
+  const stderrHandlers = new Set<(chunk: string) => void>();
+  const closeHandlers = new Set<(error: Error) => void>();
+  const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  let nextId = 1;
+  let closed = false;
+  let stderr = "";
+
+  const send = (message: Record<string, unknown>): void => {
+    if (closed) return;
+    child.stdin?.write(`${JSON.stringify(message)}\n`);
+  };
+
+  const rejectPending = (error: Error): void => {
+    for (const request of pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+    pending.clear();
+  };
+
+  const fail = (error: Error): void => {
+    if (closed) return;
+    closed = true;
+    rejectPending(error);
+    for (const handler of closeHandlers) safeCallback(() => handler(error));
+  };
+
+  const respondToServerRequest = async (message: JsonRpcMessage): Promise<void> => {
+    const id = message.id;
+    const method = message.method;
+    if ((typeof id !== "number" && typeof id !== "string") || typeof method !== "string") return;
+    const handler = serverRequestHandlers.values().next().value as
+      | CodexServerRequestHandler
+      | undefined;
+    if (!handler) {
+      send({
+        id,
+        error: { code: -32601, message: `Unsupported server request: ${method}` },
+      });
+      return;
+    }
+    try {
+      const result = await handler({ id, method, params: message.params });
+      send({ id, result: result ?? null });
+    } catch (error) {
+      send({
+        id,
+        error: {
+          code: -32603,
+          message: error instanceof Error ? error.message : "Server request handler failed",
+        },
+      });
+    }
+  };
+
+  const handleLine = (line: string): void => {
+    let message: JsonRpcMessage;
+    try {
+      message = JSON.parse(line) as JsonRpcMessage;
+    } catch {
+      return;
+    }
+
+    if (typeof message.method === "string" && message.id !== undefined) {
+      void respondToServerRequest(message);
+      return;
+    }
+    if (typeof message.method === "string") {
+      for (const handler of notificationHandlers) {
+        safeCallback(() => handler(message.method as string, message.params));
+      }
+      return;
+    }
+    if (typeof message.id !== "number") return;
+    const request = pending.get(message.id);
+    if (!request) return;
+    pending.delete(message.id);
+    clearTimeout(request.timer);
+    if (message.error !== undefined) {
+      request.reject(rpcError(message.error, "Codex app-server request failed"));
+    } else {
+      request.resolve(message.result);
+    }
+  };
+
+  const splitter = createLineSplitter(handleLine);
+  child.stdout?.on("data", (chunk: Buffer | string) => splitter.push(chunk));
+  child.stderr?.on("data", (chunk: Buffer | string) => {
+    const text = chunk.toString();
+    stderr = (stderr + text).slice(-4_000);
+    for (const handler of stderrHandlers) safeCallback(() => handler(text));
+  });
+  child.stdin?.on("error", (error: Error) => fail(error));
+  child.stdout?.on("error", (error: Error) => fail(error));
+  child.stderr?.on("error", (error: Error) => fail(error));
+  child.on("error", (error: Error) => {
+    fail(isMissingExecutable(error) ? new MissingCliError("codex") : error);
+  });
+  child.on("close", (code) => {
+    splitter.flush();
+    const detail = stderr.trim();
+    fail(new Error(
+      `Codex app-server exited${code === null ? "" : ` with code ${code}`}${detail ? `: ${detail}` : ""}`,
+    ));
+  });
+
+  const client: CodexAppServerClient = {
+    request(method, params = {}) {
+      if (closed) return Promise.reject(new Error("Codex app-server is closed"));
+      const id = nextId++;
+      return new Promise<unknown>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`Codex app-server request timed out: ${method}`));
+        }, timeoutMs);
+        pending.set(id, { resolve, reject, timer });
+        send({ id, method, params });
+      });
+    },
+    notify(method, params) {
+      send({ method, params: params ?? {} });
+    },
+    onNotification(handler) {
+      notificationHandlers.add(handler);
+      return () => notificationHandlers.delete(handler);
+    },
+    onServerRequest(handler) {
+      serverRequestHandlers.add(handler);
+      return () => serverRequestHandlers.delete(handler);
+    },
+    onStderr(handler) {
+      stderrHandlers.add(handler);
+      return () => stderrHandlers.delete(handler);
+    },
+    onClose(handler) {
+      closeHandlers.add(handler);
+      return () => closeHandlers.delete(handler);
+    },
+    close() {
+      if (closed) return;
+      fail(new Error("Codex app-server was closed"));
+      signalProcessTree(child, "SIGTERM");
+    },
+  };
+
+  try {
+    await client.request("initialize", {
+      clientInfo: CLIENT_INFO,
+      capabilities: { experimentalApi: false },
+    });
+    client.notify("initialized", {});
+    return client;
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? value : undefined;
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function property(item: Record<string, unknown>, camel: string, snake: string): unknown {
+  return item[camel] ?? item[snake];
+}
+
+function itemType(item: Record<string, unknown>): string | undefined {
+  return text(item.type);
+}
+
+function webAction(item: Record<string, unknown>): Record<string, unknown> | undefined {
+  return record(item.action);
+}
+
+function webActionType(item: Record<string, unknown>): string | undefined {
+  const type = text(webAction(item)?.type);
+  if (type === "openPage") return "open_page";
+  if (type === "findInPage") return "find_in_page";
+  return type;
+}
+
+function toolName(item: Record<string, unknown>): string | null {
+  switch (itemType(item)) {
+    case "commandExecution":
+    case "command_execution":
+      return "Bash";
+    case "fileChange":
+    case "file_change":
+      return "Edit";
+    case "mcpToolCall":
+    case "mcp_tool_call":
+      return text(item.tool) ?? "MCP";
+    case "dynamicToolCall":
+      return text(item.tool) ?? "Tool";
+    case "webSearch":
+    case "web_search":
+      return webActionType(item) === "open_page" || webActionType(item) === "find_in_page"
+        ? "WebFetch"
+        : "WebSearch";
+    default:
+      return null;
+  }
+}
+
+function webSearchQuery(item: Record<string, unknown>): string | undefined {
+  const direct = normalizeSummary(item.query);
+  if (direct) return direct;
+  const action = record(item.action);
+  const query = normalizeSummary(action?.query);
+  if (query) return query;
+  if (!Array.isArray(action?.queries)) return undefined;
+  for (const candidate of action.queries) {
+    const normalized = normalizeSummary(candidate);
+    if (normalized) return normalized;
+  }
+  return undefined;
+}
+
+function toolInput(item: Record<string, unknown>): Record<string, unknown> {
+  const type = itemType(item);
+  if (type !== "webSearch" && type !== "web_search") return item;
+  const action = webAction(item);
+  const actionType = webActionType(item);
+  const url = text(action?.url) ?? text(item.url);
+  if (actionType === "open_page" && url) {
+    const input: Record<string, unknown> = { ...item, url };
+    delete input.query;
+    return input;
+  }
+  const pattern = text(action?.pattern) ?? text(item.pattern);
+  if (actionType === "find_in_page" && (url || pattern)) {
+    const input: Record<string, unknown> = {
+      ...item,
+      ...(url ? { url } : {}),
+      ...(pattern ? { prompt: `Find ${pattern} in page` } : {}),
+    };
+    delete input.query;
+    return input;
+  }
+  const query = webSearchQuery(item);
+  return query ? { ...item, query } : item;
+}
+
+function summarizeTool(item: Record<string, unknown>): string | undefined {
+  switch (itemType(item)) {
+    case "commandExecution":
+    case "command_execution":
+      return normalizeSummary(item.command);
+    case "webSearch":
+    case "web_search": {
+      const action = webAction(item);
+      const actionType = webActionType(item);
+      const url = text(action?.url) ?? text(item.url);
+      if (actionType === "open_page") return url ?? webSearchQuery(item);
+      if (actionType === "find_in_page") {
+        const pattern = text(action?.pattern) ?? text(item.pattern);
+        if (pattern && url) return `${pattern} · ${url}`;
+        return pattern ?? url ?? webSearchQuery(item);
+      }
+      return webSearchQuery(item);
+    }
+    case "fileChange":
+    case "file_change": {
+      if (!Array.isArray(item.changes)) return undefined;
+      const paths = item.changes.flatMap((change) => {
+        const path = normalizeSummary(record(change)?.path);
+        return path ? [path] : [];
+      });
+      if (paths.length === 1) return paths[0];
+      return paths.length > 1 ? `${paths.length} files` : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+function normalizePlanStatus(value: unknown): string | undefined {
+  const status = text(value);
+  if (!status) return undefined;
+  return status.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
+}
+
+function planItems(value: unknown): ToolPlanItem[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items: ToolPlanItem[] = [];
+  for (const raw of value) {
+    const step = record(raw);
+    const itemText = normalizeSummary(step?.step ?? step?.text);
+    const status = normalizePlanStatus(step?.status);
+    if (!itemText || !status) return undefined;
+    items.push({ text: itemText, status });
+  }
+  return items.length > 0 ? items : undefined;
+}
+
+function planToolInfo(params: Record<string, unknown>, turnId: string): ToolUseInfo | undefined {
+  const items = planItems(params.plan);
+  if (!items) return undefined;
+  const completed = items.filter(({ status }) => status === "completed").length;
+  return {
+    callId: `${turnId}:plan`,
+    name: "TodoWrite",
+    summary: `${completed}/${items.length} steps completed`,
+    planItems: items,
+    input: params,
+  };
+}
+
+function backgroundStatus(value: unknown): BackgroundAgentStatus | undefined {
+  switch (value) {
+    case "pending":
+    case "pendingInit":
+    case "pending_init":
+      return "pending";
+    case "running":
+      return "running";
+    case "completed":
+      return "completed";
+    case "errored":
+    case "notFound":
+    case "not_found":
+      return "failed";
+    case "interrupted":
+    case "shutdown":
+      return "interrupted";
+    default:
+      return undefined;
+  }
+}
+
+function terminalBackgroundStatus(status: BackgroundAgentStatus): boolean {
+  return status === "completed" || status === "failed" || status === "interrupted";
+}
+
+function toUsage(
+  params: Record<string, unknown>,
+  threadId: string,
+  turnId: string,
+  model: string | undefined,
+  fallbackWindow: number | undefined,
+): TokenUsage | undefined {
+  if (params.threadId !== threadId || params.turnId !== turnId) return undefined;
+  const tokenUsage = record(params.tokenUsage);
+  const last = record(tokenUsage?.last);
+  if (!last) return undefined;
+  const used = toTokenCount(last.totalTokens);
+  if (used <= 0) return undefined;
+  const input = toTokenCount(last.inputTokens);
+  const cached = toTokenCount(last.cachedInputTokens);
+  const contextWindow = toContextWindow(tokenUsage?.modelContextWindow) ?? fallbackWindow;
+  return {
+    contextTokens: used,
+    inputTokens: Math.max(0, input - cached),
+    cachedInputTokens: cached,
+    outputTokens: toTokenCount(last.outputTokens),
+    ...(model ? { model } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
+}
+
+function threadIdFrom(value: unknown): string | undefined {
+  return text(record(record(value)?.thread)?.id);
+}
+
+function turnIdFrom(value: unknown): string | undefined {
+  return text(record(record(value)?.turn)?.id);
+}
+
+function turnStatus(value: unknown): string | undefined {
+  return text(record(record(value)?.turn)?.status);
+}
+
+export async function runCodexAppServer(opts: RunCodexOptions): Promise<RunResult> {
+  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  const ownedClient = !opts.appServerClient;
+  const client = opts.appServerClient ?? await createCodexAppServerClient({
+    cwd: opts.cwd,
+    ...(opts.executablePath ? { executablePath: opts.executablePath } : {}),
+    ...(opts.env ? { env: opts.env } : {}),
+    ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
+  });
+
+  let threadId = opts.resumeSessionId;
+  let turnId: string | undefined;
+  let resolvedModel = opts.model;
+  let finalText = "";
+  let latestUsage: TokenUsage | undefined;
+  let settled = false;
+  let interruption: AbortError | TimeoutError | undefined;
+  let turnStarting = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const emittedTools = new Set<string>();
+  const backgroundAgents = new Map<string, BackgroundAgentInfo>();
+
+  let resolveCompletion!: () => void;
+  let rejectCompletion!: (error: Error) => void;
+  const completion = new Promise<void>((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  // Notification errors can arrive while a request response is still being
+  // processed. Attach a handler immediately, then await the original promise
+  // below so Node never treats that legitimate ordering as unhandled.
+  void completion.catch(() => {});
+
+  let rejectLifecycle!: (error: AbortError | TimeoutError) => void;
+  let lifecycleFailed = false;
+  const lifecycleFailure = new Promise<never>((_resolve, reject) => {
+    rejectLifecycle = reject;
+  });
+
+  const failLifecycle = (error: AbortError | TimeoutError): void => {
+    if (lifecycleFailed) return;
+    lifecycleFailed = true;
+    rejectLifecycle(error);
+  };
+
+  const raceLifecycle = <T>(operation: Promise<T>): Promise<T> =>
+    Promise.race([operation, lifecycleFailure]);
+
+  const settleError = (error: Error): void => {
+    if (settled) return;
+    settled = true;
+    rejectCompletion(error);
+  };
+
+  const requestInterrupt = (): void => {
+    if (!interruption || !threadId || !turnId) return;
+    void client.request("turn/interrupt", { threadId, turnId })
+      .catch(() => {})
+      .finally(() => failLifecycle(interruption as AbortError | TimeoutError));
+  };
+
+  const interrupt = (error: AbortError | TimeoutError): void => {
+    if (interruption || settled) return;
+    interruption = error;
+    if (threadId && turnId) requestInterrupt();
+    else if (!turnStarting) failLifecycle(error);
+  };
+
+  const abortHandler = (): void => interrupt(new AbortError("codex run aborted"));
+  if (opts.signal) {
+    if (opts.signal.aborted) abortHandler();
+    else opts.signal.addEventListener("abort", abortHandler, { once: true });
+  }
+  if (opts.timeoutMs !== undefined) {
+    timeout = setTimeout(
+      () => interrupt(new TimeoutError(`codex run timed out after ${opts.timeoutMs}ms`)),
+      opts.timeoutMs,
+    );
+  }
+
+  const updateBackgroundAgents = (item: Record<string, unknown>, occurredAt: number): void => {
+    const type = itemType(item);
+    if (type !== "collabAgentToolCall" && type !== "collab_tool_call") return;
+    const tool = text(item.tool);
+    const isSpawn = tool === "spawnAgent" || tool === "spawn_agent";
+    const states = record(property(item, "agentsStates", "agents_states")) ?? {};
+    const rawReceiverIds = property(item, "receiverThreadIds", "receiver_thread_ids");
+    const receiverIds = Array.isArray(rawReceiverIds)
+      ? rawReceiverIds.filter((id): id is string => typeof id === "string")
+      : [];
+    for (const id of new Set([...receiverIds, ...Object.keys(states)])) {
+      const current = backgroundAgents.get(id);
+      if (!current && !isSpawn) continue;
+      const state = record(states[id]);
+      const status = backgroundStatus(state?.status) ?? current?.status ?? "pending";
+      const message = text(state?.message);
+      const itemId = text(item.id);
+      const description = current?.description ?? text(item.prompt);
+      const agent: BackgroundAgentInfo = {
+        ...(current ?? {
+          id,
+          provider: "codex" as const,
+          startedAt: occurredAt,
+        }),
+        ...(!current?.parentToolCallId && itemId ? { parentToolCallId: itemId } : {}),
+        ...(description ? { description } : {}),
+        status,
+        ...(message && status === "failed" ? { error: message } : {}),
+        ...(message && status !== "failed" ? { summary: message } : {}),
+        updatedAt: occurredAt,
+        ...(terminalBackgroundStatus(status)
+          ? { endedAt: current?.endedAt ?? occurredAt }
+          : {}),
+      };
+      if (status === "failed") delete agent.summary;
+      else delete agent.error;
+      backgroundAgents.set(id, agent);
+      safeCallback(() => opts.onBackgroundAgentUpdate?.(agent));
+    }
+  };
+
+  const handleItem = (method: string, params: Record<string, unknown>): void => {
+    if (params.threadId !== threadId) return;
+    const eventTurnId = text(params.turnId);
+    if (!eventTurnId) return;
+    turnId ??= eventTurnId;
+    if (turnId !== eventTurnId) return;
+    const item = record(params.item);
+    if (!item) return;
+    const occurredAt = typeof params.startedAtMs === "number"
+      ? params.startedAtMs
+      : typeof params.completedAtMs === "number" ? params.completedAtMs : Date.now();
+    updateBackgroundAgents(item, occurredAt);
+
+    if (method === "item/completed" && itemType(item) === "agentMessage") {
+      const message = text(item.text);
+      if (message) {
+        finalText = message;
+        safeCallback(() => opts.onAssistantText?.(message));
+      }
+      return;
+    }
+
+    const name = toolName(item);
+    if (!name) return;
+    const id = text(item.id) ?? `${itemType(item)}:${name}`;
+    if (!emittedTools.has(id)) {
+      emittedTools.add(id);
+      const summary = summarizeTool(item);
+      safeCallback(() => opts.onToolUse?.({
+        callId: id,
+        name,
+        ...(summary ? { summary } : {}),
+        input: toolInput(item),
+      }));
+    }
+    if (method === "item/completed") {
+      const exitCode = item.exitCode;
+      const status = text(item.status);
+      safeCallback(() => opts.onToolResult?.({
+        callId: id,
+        content: item,
+        ...((typeof exitCode === "number" && exitCode !== 0) || status === "failed"
+          ? { isError: true }
+          : {}),
+      }));
+    }
+  };
+
+  const removeNotification = client.onNotification((method, rawParams) => {
+    const params = record(rawParams);
+    if (!params) return;
+    if (method === "turn/started" && params.threadId === threadId) {
+      turnId ??= text(record(params.turn)?.id);
+      if (interruption) requestInterrupt();
+      return;
+    }
+    if (method === "item/started" || method === "item/completed") {
+      handleItem(method, params);
+      return;
+    }
+    if (method === "turn/plan/updated" && params.threadId === threadId) {
+      const eventTurnId = text(params.turnId);
+      if (!eventTurnId || (turnId && eventTurnId !== turnId)) return;
+      turnId ??= eventTurnId;
+      const info = planToolInfo(params, eventTurnId);
+      if (info) safeCallback(() => opts.onToolUse?.(info));
+      return;
+    }
+    if (method === "thread/tokenUsage/updated" && threadId && turnId) {
+      const usage = toUsage(params, threadId, turnId, resolvedModel, opts.contextWindow);
+      if (!usage) return;
+      latestUsage = usage;
+      safeCallback(() => opts.onUsage?.(usage));
+      return;
+    }
+    if (method === "error" && params.threadId === threadId) {
+      if (params.willRetry === true) return;
+      const message = text(record(params.error)?.message) ?? "Codex turn failed";
+      settleError(new CodexTurnError(`Codex error: ${message}`));
+      return;
+    }
+    if (method !== "turn/completed" || params.threadId !== threadId) return;
+    const completedTurnId = text(record(params.turn)?.id);
+    if (!completedTurnId || (turnId && completedTurnId !== turnId)) return;
+    turnId ??= completedTurnId;
+    if (interruption) {
+      failLifecycle(interruption);
+      return;
+    }
+    const status = text(record(params.turn)?.status);
+    if (status === "completed") {
+      if (!settled) {
+        settled = true;
+        resolveCompletion();
+      }
+      return;
+    }
+    const message = text(record(record(params.turn)?.error)?.message)
+      ?? `Codex turn ${status ?? "failed"}`;
+    settleError(new CodexTurnError(message));
+  });
+  const removeClose = client.onClose((error) => settleError(error));
+  const removeStderr = client.onStderr((chunk) => safeCallback(() => opts.onStderr?.(chunk)));
+
+  try {
+    const threadRequest = opts.resumeSessionId
+      ? client.request("thread/resume", {
+          threadId: opts.resumeSessionId,
+          cwd: opts.cwd,
+          ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.developerInstructions
+            ? { developerInstructions: opts.developerInstructions }
+            : {}),
+          ...(opts.dangerouslyBypassApprovalsAndSandbox
+            ? { approvalPolicy: "never", sandbox: "danger-full-access" }
+            : {}),
+        })
+      : client.request("thread/start", {
+          cwd: opts.cwd,
+          ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.developerInstructions
+            ? { developerInstructions: opts.developerInstructions }
+            : {}),
+          ...(opts.dangerouslyBypassApprovalsAndSandbox
+            ? { approvalPolicy: "never", sandbox: "danger-full-access" }
+            : {}),
+        });
+    const threadResult = await raceLifecycle(threadRequest);
+    threadId = threadIdFrom(threadResult) ?? threadId;
+    resolvedModel = text(record(threadResult)?.model) ?? resolvedModel;
+    if (!threadId) throw new CodexTurnError("Codex app-server did not return a thread ID");
+    safeCallback(() => opts.onSessionId?.(threadId as string));
+    turnStarting = true;
+    const input: Array<Record<string, unknown>> = [
+      { type: "text", text: opts.prompt, text_elements: [] },
+      ...(opts.imagePaths ?? []).map((path) => ({ type: "localImage", path })),
+    ];
+    const turnResult = await raceLifecycle(client.request("turn/start", {
+      threadId,
+      input,
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
+    }));
+    turnStarting = false;
+    turnId = turnIdFrom(turnResult) ?? turnId;
+    if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
+    if (interruption) requestInterrupt();
+    await raceLifecycle(completion);
+
+    const status = turnStatus(turnResult);
+    return {
+      text: finalText.trim(),
+      exitCode: status && status !== "completed" && status !== "inProgress" ? 1 : 0,
+      sessionId: threadId,
+      ...(latestUsage ? { usage: latestUsage } : {}),
+    };
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    opts.signal?.removeEventListener("abort", abortHandler);
+    removeNotification();
+    removeClose();
+    removeStderr();
+    if (ownedClient) client.close();
+  }
+}
