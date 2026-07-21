@@ -980,7 +980,10 @@ async function runCodexAppServerTurn(
         return;
       }
       turnId ??= eventTurnId;
-      const chunk = text(params.delta);
+      // Raw, not the trimming text() helper: word boundaries arrive as
+      // leading spaces and paragraph breaks as whitespace-only chunks, so
+      // trimming here jams the streamed words together.
+      const chunk = typeof params.delta === "string" ? params.delta : "";
       if (chunk) safeCallback(() => opts.onAssistantTextDelta?.(chunk));
       return;
     }

@@ -1269,7 +1269,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
         return;
       }
       turnId ??= eventTurnId;
-      const chunk = text(params.delta);
+      const chunk = typeof params.delta === "string" ? params.delta : "";
       if (chunk) safeCallback(() => opts.onAssistantTextDelta?.(chunk));
       return;
     }

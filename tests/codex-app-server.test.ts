@@ -1657,8 +1657,14 @@ describe("Codex app-server runner", () => {
         send(child, { id: message.id, result: { thread: { id: "thread-1" } } });
       } else if (message.method === "turn/start") {
         send(child, { id: message.id, result: { turn: completedTurn("turn-1", "inProgress") } });
+        // Word boundaries arrive as leading spaces and paragraph breaks as
+        // whitespace-only chunks — both must survive verbatim or streamed
+        // words jam together.
         delta({ threadId: "thread-1", turnId: "turn-1", itemId: "m1", delta: "Hel" });
         delta({ threadId: "thread-1", turnId: "turn-1", itemId: "m1", delta: "lo" });
+        delta({ threadId: "thread-1", turnId: "turn-1", itemId: "m1", delta: " there" });
+        delta({ threadId: "thread-1", turnId: "turn-1", itemId: "m1", delta: "\n\n" });
+        delta({ threadId: "thread-1", turnId: "turn-1", itemId: "m1", delta: "friend" });
         // A pooled connection carries other threads' turns, and an interrupted
         // turn can trail deltas after the next one starts.
         delta({ threadId: "thread-2", turnId: "turn-9", itemId: "m9", delta: "other thread" });
@@ -1669,7 +1675,7 @@ describe("Codex app-server runner", () => {
             threadId: "thread-1",
             turnId: "turn-1",
             completedAtMs: 2_000,
-            item: { type: "agentMessage", id: "m1", text: "Hello" },
+            item: { type: "agentMessage", id: "m1", text: "Hello there\n\nfriend" },
           },
         });
         send(child, {
@@ -1687,7 +1693,8 @@ describe("Codex app-server runner", () => {
       onAssistantText,
     });
 
-    expect(onAssistantTextDelta.mock.calls.map(([chunk]) => chunk)).toEqual(["Hel", "lo"]);
-    expect(onAssistantText).toHaveBeenCalledWith("Hello");
+    expect(onAssistantTextDelta.mock.calls.map(([chunk]) => chunk))
+      .toEqual(["Hel", "lo", " there", "\n\n", "friend"]);
+    expect(onAssistantText).toHaveBeenCalledWith("Hello there\n\nfriend");
   });
 });
