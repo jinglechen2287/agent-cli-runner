@@ -202,7 +202,28 @@ interface CreateCodexAppServerClientOptions {
     spawnFn?: RunCodexOptions["spawnFn"];
     requestTimeoutMs?: number;
 }
+type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "spawnFn">;
+interface CodexAppServerSession {
+    readonly threadId: string;
+    readonly cwd: string;
+    readonly closed: boolean;
+    runTurn(options: CodexAppServerTurnOptions): Promise<RunResult>;
+    onClose(handler: (error: Error) => void): () => void;
+    close(): Promise<void>;
+}
+interface CreateCodexAppServerSessionOptions {
+    cwd: string;
+    executablePath?: string;
+    env?: NodeJS.ProcessEnv;
+    spawnFn?: RunCodexOptions["spawnFn"];
+    requestTimeoutMs?: number;
+    resumeSessionId?: string;
+    model?: string;
+    developerInstructions?: string;
+    dangerouslyBypassApprovalsAndSandbox?: boolean;
+}
 declare function createCodexAppServerClient(options: CreateCodexAppServerClientOptions): Promise<CodexAppServerClient>;
+declare function createCodexAppServerSession(options: CreateCodexAppServerSessionOptions): Promise<CodexAppServerSession>;
 
 /** Stripped so a Codex turn spawned from within another Codex session does
  * not inherit the parent's thread. */
@@ -225,6 +246,8 @@ interface RunCodexOptions extends CommonRunOptions {
     /** Reuse an initialized app-server connection. When omitted, regular runs
      * create and close a connection for this turn. */
     appServerClient?: CodexAppServerClient;
+    /** Reuse an app-server process with one thread already started or resumed. */
+    appServerSession?: CodexAppServerSession;
     /** Run a non-persistent one-shot request without user config or rules.
      * Codex app-server cannot currently reproduce both ignore flags per thread,
      * so this narrow metadata path intentionally remains on `codex exec`. */
@@ -254,4 +277,4 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type CodexAppServerClient, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, createCodexAppServerClient, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, runClaude, runCodex };

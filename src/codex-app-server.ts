@@ -5,6 +5,7 @@ import {
   filterEnv,
   isMissingExecutable,
   normalizeSummary,
+  SIGTERM_GRACE_MS,
   signalProcessTree,
   toContextWindow,
   toTokenCount,
@@ -61,12 +62,48 @@ export interface CreateCodexAppServerClientOptions {
   requestTimeoutMs?: number;
 }
 
+export type CodexAppServerTurnOptions = Omit<
+  RunCodexOptions,
+  | "appServerClient"
+  | "appServerSession"
+  | "cwd"
+  | "dangerouslyBypassApprovalsAndSandbox"
+  | "developerInstructions"
+  | "env"
+  | "executablePath"
+  | "isolated"
+  | "resumeSessionId"
+  | "spawnFn"
+>;
+
+export interface CodexAppServerSession {
+  readonly threadId: string;
+  readonly cwd: string;
+  readonly closed: boolean;
+  runTurn(options: CodexAppServerTurnOptions): Promise<RunResult>;
+  onClose(handler: (error: Error) => void): () => void;
+  close(): Promise<void>;
+}
+
+export interface CreateCodexAppServerSessionOptions {
+  cwd: string;
+  executablePath?: string;
+  env?: NodeJS.ProcessEnv;
+  spawnFn?: RunCodexOptions["spawnFn"];
+  requestTimeoutMs?: number;
+  resumeSessionId?: string;
+  model?: string;
+  developerInstructions?: string;
+  dangerouslyBypassApprovalsAndSandbox?: boolean;
+}
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const CLIENT_INFO = {
   name: "agent_cli_runner",
   title: "Agent CLI Runner",
   version: "0.1.0",
 };
+const clientExitPromises = new WeakMap<CodexAppServerClient, Promise<void>>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -114,7 +151,16 @@ export async function createCodexAppServerClient(
   const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   let nextId = 1;
   let closed = false;
+  let closeError: Error | undefined;
+  let childExited = false;
+  let terminationRequested = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let exitFallbackTimer: ReturnType<typeof setTimeout> | undefined;
   let stderr = "";
+  let resolveExit!: () => void;
+  const exitPromise = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
 
   const send = (message: Record<string, unknown>): void => {
     if (closed) return;
@@ -132,6 +178,7 @@ export async function createCodexAppServerClient(
   const fail = (error: Error): void => {
     if (closed) return;
     closed = true;
+    closeError = error;
     rejectPending(error);
     for (const handler of closeHandlers) safeCallback(() => handler(error));
   };
@@ -208,6 +255,10 @@ export async function createCodexAppServerClient(
     fail(isMissingExecutable(error) ? new MissingCliError("codex") : error);
   });
   child.on("close", (code) => {
+    childExited = true;
+    resolveExit();
+    if (killTimer) clearTimeout(killTimer);
+    if (exitFallbackTimer) clearTimeout(exitFallbackTimer);
     splitter.flush();
     const detail = stderr.trim();
     fail(new Error(
@@ -244,15 +295,28 @@ export async function createCodexAppServerClient(
       return () => stderrHandlers.delete(handler);
     },
     onClose(handler) {
+      if (closed) {
+        safeCallback(() => handler(closeError ?? new Error("Codex app-server is closed")));
+        return () => {};
+      }
       closeHandlers.add(handler);
       return () => closeHandlers.delete(handler);
     },
     close() {
-      if (closed) return;
-      fail(new Error("Codex app-server was closed"));
+      if (terminationRequested || childExited) return;
+      terminationRequested = true;
+      if (!closed) fail(new Error("Codex app-server was closed"));
       signalProcessTree(child, "SIGTERM");
+      killTimer = setTimeout(() => {
+        if (childExited) return;
+        signalProcessTree(child, "SIGKILL");
+        exitFallbackTimer = setTimeout(resolveExit, SIGTERM_GRACE_MS);
+        exitFallbackTimer.unref();
+      }, SIGTERM_GRACE_MS);
+      killTimer.unref();
     },
   };
+  clientExitPromises.set(client, exitPromise);
 
   try {
     await client.request("initialize", {
@@ -485,19 +549,64 @@ function turnStatus(value: unknown): string | undefined {
   return text(record(record(value)?.turn)?.status);
 }
 
-export async function runCodexAppServer(opts: RunCodexOptions): Promise<RunResult> {
-  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
-  const ownedClient = !opts.appServerClient;
-  const client = opts.appServerClient ?? await createCodexAppServerClient({
-    cwd: opts.cwd,
-    ...(opts.executablePath ? { executablePath: opts.executablePath } : {}),
-    ...(opts.env ? { env: opts.env } : {}),
-    ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
-  });
+interface OpenedCodexThread {
+  threadId: string;
+  model?: string;
+}
 
-  let threadId = opts.resumeSessionId;
+function requestCodexThread(
+  client: CodexAppServerClient,
+  opts: Pick<
+    RunCodexOptions,
+    | "cwd"
+    | "dangerouslyBypassApprovalsAndSandbox"
+    | "developerInstructions"
+    | "model"
+    | "resumeSessionId"
+  >,
+): Promise<unknown> {
+  return opts.resumeSessionId
+    ? client.request("thread/resume", {
+        threadId: opts.resumeSessionId,
+        cwd: opts.cwd,
+        ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.developerInstructions
+          ? { developerInstructions: opts.developerInstructions }
+          : {}),
+        ...(opts.dangerouslyBypassApprovalsAndSandbox
+          ? { approvalPolicy: "never", sandbox: "danger-full-access" }
+          : {}),
+      })
+    : client.request("thread/start", {
+        cwd: opts.cwd,
+        ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.developerInstructions
+          ? { developerInstructions: opts.developerInstructions }
+          : {}),
+        ...(opts.dangerouslyBypassApprovalsAndSandbox
+          ? { approvalPolicy: "never", sandbox: "danger-full-access" }
+          : {}),
+      });
+}
+
+function openedCodexThread(value: unknown, fallbackModel?: string): OpenedCodexThread {
+  const threadId = threadIdFrom(value);
+  if (!threadId) throw new CodexTurnError("Codex app-server did not return a thread ID");
+  const model = text(record(value)?.model) ?? fallbackModel;
+  return { threadId, ...(model ? { model } : {}) };
+}
+
+async function runCodexAppServerTurn(
+  opts: RunCodexOptions,
+  client: CodexAppServerClient,
+  openedThread?: OpenedCodexThread,
+  ownedClient = false,
+): Promise<RunResult> {
+  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+
+  let threadId = openedThread?.threadId ?? opts.resumeSessionId;
   let turnId: string | undefined;
-  let resolvedModel = opts.model;
+  let resolvedModel = opts.model ?? openedThread?.model;
   let finalText = "";
   let latestUsage: TokenUsage | undefined;
   let settled = false;
@@ -711,32 +820,14 @@ export async function runCodexAppServer(opts: RunCodexOptions): Promise<RunResul
   const removeStderr = client.onStderr((chunk) => safeCallback(() => opts.onStderr?.(chunk)));
 
   try {
-    const threadRequest = opts.resumeSessionId
-      ? client.request("thread/resume", {
-          threadId: opts.resumeSessionId,
-          cwd: opts.cwd,
-          ...(opts.model ? { model: opts.model } : {}),
-          ...(opts.developerInstructions
-            ? { developerInstructions: opts.developerInstructions }
-            : {}),
-          ...(opts.dangerouslyBypassApprovalsAndSandbox
-            ? { approvalPolicy: "never", sandbox: "danger-full-access" }
-            : {}),
-        })
-      : client.request("thread/start", {
-          cwd: opts.cwd,
-          ...(opts.model ? { model: opts.model } : {}),
-          ...(opts.developerInstructions
-            ? { developerInstructions: opts.developerInstructions }
-            : {}),
-          ...(opts.dangerouslyBypassApprovalsAndSandbox
-            ? { approvalPolicy: "never", sandbox: "danger-full-access" }
-            : {}),
-        });
-    const threadResult = await raceLifecycle(threadRequest);
-    threadId = threadIdFrom(threadResult) ?? threadId;
-    resolvedModel = text(record(threadResult)?.model) ?? resolvedModel;
-    if (!threadId) throw new CodexTurnError("Codex app-server did not return a thread ID");
+    if (!openedThread) {
+      const opened = openedCodexThread(
+        await raceLifecycle(requestCodexThread(client, opts)),
+        resolvedModel,
+      );
+      threadId = opened.threadId;
+      resolvedModel = opened.model;
+    }
     safeCallback(() => opts.onSessionId?.(threadId as string));
     turnStarting = true;
     const input: Array<Record<string, unknown>> = [
@@ -759,7 +850,7 @@ export async function runCodexAppServer(opts: RunCodexOptions): Promise<RunResul
     return {
       text: finalText.trim(),
       exitCode: status && status !== "completed" && status !== "inProgress" ? 1 : 0,
-      sessionId: threadId,
+      sessionId: threadId as string,
       ...(latestUsage ? { usage: latestUsage } : {}),
     };
   } finally {
@@ -770,4 +861,87 @@ export async function runCodexAppServer(opts: RunCodexOptions): Promise<RunResul
     removeStderr();
     if (ownedClient) client.close();
   }
+}
+
+export async function createCodexAppServerSession(
+  options: CreateCodexAppServerSessionOptions,
+): Promise<CodexAppServerSession> {
+  const client = await createCodexAppServerClient({
+    cwd: options.cwd,
+    ...(options.executablePath ? { executablePath: options.executablePath } : {}),
+    ...(options.env ? { env: options.env } : {}),
+    ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
+    ...(options.requestTimeoutMs !== undefined
+      ? { requestTimeoutMs: options.requestTimeoutMs }
+      : {}),
+  });
+
+  let opened: OpenedCodexThread;
+  try {
+    opened = openedCodexThread(await requestCodexThread(client, options), options.model);
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+
+  let closed = false;
+  let running = false;
+  let closePromise: Promise<void> | undefined;
+  client.onClose(() => {
+    closed = true;
+  });
+
+  return {
+    threadId: opened.threadId,
+    cwd: options.cwd,
+    get closed() {
+      return closed;
+    },
+    async runTurn(turnOptions) {
+      if (closed) throw new Error("Codex app-server session is closed");
+      if (running) throw new Error("Codex app-server session already has an active turn");
+      running = true;
+      try {
+        return await runCodexAppServerTurn({
+          ...turnOptions,
+          cwd: options.cwd,
+          ...(options.executablePath ? { executablePath: options.executablePath } : {}),
+          ...(options.env ? { env: options.env } : {}),
+          ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
+          ...(options.dangerouslyBypassApprovalsAndSandbox !== undefined
+            ? {
+                dangerouslyBypassApprovalsAndSandbox:
+                  options.dangerouslyBypassApprovalsAndSandbox,
+              }
+            : {}),
+          ...(options.developerInstructions
+            ? { developerInstructions: options.developerInstructions }
+            : {}),
+        }, client, opened);
+      } finally {
+        running = false;
+      }
+    },
+    onClose(handler) {
+      return client.onClose(handler);
+    },
+    close(): Promise<void> {
+      closePromise ??= clientExitPromises.get(client) ?? Promise.resolve();
+      if (!closed) closed = true;
+      client.close();
+      return closePromise;
+    },
+  };
+}
+
+export async function runCodexAppServer(opts: RunCodexOptions): Promise<RunResult> {
+  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  const ownedClient = !opts.appServerClient;
+  const client = opts.appServerClient ?? await createCodexAppServerClient({
+    cwd: opts.cwd,
+    ...(opts.executablePath ? { executablePath: opts.executablePath } : {}),
+    ...(opts.env ? { env: opts.env } : {}),
+    ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
+  });
+  return runCodexAppServerTurn(opts, client, undefined, ownedClient);
 }

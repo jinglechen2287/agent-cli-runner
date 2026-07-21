@@ -2,12 +2,18 @@ export { runClaude, CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 export type { RunClaudeOptions } from "./run-claude.js";
 export { runCodex, CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
 export type { RunCodexOptions } from "./run-codex.js";
-export { createCodexAppServerClient } from "./codex-app-server.js";
+export {
+  createCodexAppServerClient,
+  createCodexAppServerSession,
+} from "./codex-app-server.js";
 export type {
   CodexAppServerClient,
+  CodexAppServerSession,
+  CodexAppServerTurnOptions,
   CodexServerRequest,
   CodexServerRequestHandler,
   CreateCodexAppServerClientOptions,
+  CreateCodexAppServerSessionOptions,
 } from "./codex-app-server.js";
 export {
   AbortError,

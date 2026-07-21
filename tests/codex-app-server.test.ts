@@ -1,7 +1,12 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
-import { createCodexAppServerClient, runCodex } from "../src/index.js";
+import {
+  createCodexAppServerClient,
+  createCodexAppServerSession,
+  runCodex,
+  type CodexAppServerSession,
+} from "../src/index.js";
 
 interface FakeChild extends EventEmitter {
   stdin: PassThrough;
@@ -513,6 +518,269 @@ describe("Codex app-server runner", () => {
     expect(child.kill).not.toHaveBeenCalled();
     client.close();
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("opens a thread once and reuses it for sequential session turns", async () => {
+    const child = makeFakeChild();
+    let turnNumber = 0;
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, {
+          id: message.id,
+          result: { thread: { id: "thread-session" }, model: "gpt-initial" },
+        });
+      } else if (message.method === "turn/start") {
+        turnNumber += 1;
+        const turnId = `turn-${turnNumber}`;
+        send(child, { id: message.id, result: { turn: completedTurn(turnId, "inProgress") } });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-session",
+            turnId,
+            completedAtMs: turnNumber,
+            item: { type: "agentMessage", id: `message-${turnNumber}`, text: `Done ${turnNumber}` },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-session", turn: completedTurn(turnId) },
+        });
+      }
+    });
+
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      model: "gpt-initial",
+      developerInstructions: "project rules",
+      dangerouslyBypassApprovalsAndSandbox: true,
+      spawnFn: (() => child) as never,
+    });
+
+    const first = await session.runTurn({ prompt: "one", model: "gpt-one" });
+    const second = await session.runTurn({
+      prompt: "two",
+      model: "gpt-two",
+      reasoningEffort: "medium",
+    });
+
+    expect(session.threadId).toBe("thread-session");
+    expect(session.closed).toBe(false);
+    expect(first).toMatchObject({ text: "Done 1", sessionId: "thread-session" });
+    expect(second).toMatchObject({ text: "Done 2", sessionId: "thread-session" });
+    expect(requests.filter(({ method }) => method === "initialize")).toHaveLength(1);
+    expect(requests.filter(({ method }) => method === "thread/start")).toHaveLength(1);
+    expect(requests.filter(({ method }) => method === "thread/resume")).toHaveLength(0);
+    expect(requests.filter(({ method }) => method === "turn/start").map(({ params }) => params))
+      .toEqual([
+        expect.objectContaining({ threadId: "thread-session", model: "gpt-one" }),
+        expect.objectContaining({
+          threadId: "thread-session",
+          model: "gpt-two",
+          effort: "medium",
+        }),
+      ]);
+    expect(child.kill).not.toHaveBeenCalled();
+
+    const closing = Promise.resolve(session.close());
+    let closeFinished = false;
+    void closing.then(() => {
+      closeFinished = true;
+    });
+    await Promise.resolve();
+    expect(session.closed).toBe(true);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(closeFinished).toBe(false);
+    child.emit("close", 0);
+    await closing;
+    expect(closeFinished).toBe(true);
+  });
+
+  it("resumes a session thread only once before running later turns", async () => {
+    const child = makeFakeChild();
+    let turnNumber = 0;
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/resume") {
+        send(child, {
+          id: message.id,
+          result: { thread: { id: "thread-resumed" }, model: "gpt-test" },
+        });
+      } else if (message.method === "turn/start") {
+        turnNumber += 1;
+        const turnId = `resume-turn-${turnNumber}`;
+        send(child, { id: message.id, result: { turn: completedTurn(turnId, "inProgress") } });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-resumed",
+            turnId,
+            item: { type: "agentMessage", id: `resume-message-${turnNumber}`, text: "Continued" },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-resumed", turn: completedTurn(turnId) },
+        });
+      }
+    });
+
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      resumeSessionId: "thread-resumed",
+      spawnFn: (() => child) as never,
+    });
+
+    await session.runTurn({ prompt: "one" });
+    await session.runTurn({ prompt: "two" });
+
+    expect(requests.filter(({ method }) => method === "thread/resume")).toHaveLength(1);
+    expect(requests.filter(({ method }) => method === "thread/start")).toHaveLength(0);
+    expect(requests.filter(({ method }) => method === "turn/start")).toHaveLength(2);
+    const closing = Promise.resolve(session.close());
+    child.emit("close", 0);
+    await closing;
+  });
+
+  it("rejects cwd and resume options that conflict with a bound session", async () => {
+    const runTurn = vi.fn(async () => ({
+      text: "unexpected",
+      exitCode: 0,
+      sessionId: "thread-bound",
+    }));
+    const session: CodexAppServerSession = {
+      threadId: "thread-bound",
+      cwd: "/tmp/bound",
+      closed: false,
+      runTurn,
+      onClose: () => () => {},
+      close: async () => {},
+    };
+
+    await expect(runCodex({
+      prompt: "wrong cwd",
+      cwd: "/tmp/other",
+      appServerSession: session,
+    })).rejects.toThrow("cwd must match");
+    await expect(runCodex({
+      prompt: "wrong resume",
+      cwd: "/tmp/bound",
+      resumeSessionId: "thread-other",
+      appServerSession: session,
+    })).rejects.toThrow("cannot resume");
+    for (const fixedOptions of [
+      { developerInstructions: "different rules" },
+      { dangerouslyBypassApprovalsAndSandbox: true },
+      { env: { RUNNER_TEST: "1" } },
+      { executablePath: "other-codex" },
+      { spawnFn: (() => makeFakeChild()) as never },
+    ]) {
+      await expect(runCodex({
+        prompt: "fixed option",
+        cwd: "/tmp/bound",
+        appServerSession: session,
+        ...fixedOptions,
+      })).rejects.toThrow("cannot override thread or client options");
+    }
+    expect(runTurn).not.toHaveBeenCalled();
+  });
+
+  it("marks a session closed and notifies its owner when app-server exits", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-crash" } } });
+      }
+    });
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      spawnFn: (() => child) as never,
+    });
+    const onClose = vi.fn();
+    session.onClose(onClose);
+
+    child.emit("close", 9);
+
+    expect(session.closed).toBe(true);
+    expect(onClose).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining("exited with code 9"),
+    }));
+    await expect(session.runTurn({ prompt: "after crash" }))
+      .rejects.toThrow("session is closed");
+  });
+
+  it("force-kills app-server when graceful session close does not exit", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeFakeChild();
+      captureRequests(child, (message) => {
+        if (message.method === "initialize") {
+          send(child, { id: message.id, result: {} });
+        } else if (message.method === "thread/start") {
+          send(child, { id: message.id, result: { thread: { id: "thread-force-close" } } });
+        }
+      });
+      const session = await createCodexAppServerSession({
+        cwd: "/tmp/project",
+        spawnFn: (() => child) as never,
+      });
+
+      const closing = session.close();
+      let closeFinished = false;
+      void closing.then(() => {
+        closeFinished = true;
+      });
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      vi.advanceTimersByTime(2_100);
+      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+      expect(closeFinished).toBe(false);
+      vi.advanceTimersByTime(2_100);
+      await closing;
+      expect(closeFinished).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("observes an app-server exit that races with session creation", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-race" } } });
+        child.emit("close", 9);
+      }
+    });
+
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      spawnFn: (() => child) as never,
+    });
+
+    expect(session.closed).toBe(true);
+    await expect(session.runTurn({ prompt: "after race" }))
+      .rejects.toThrow("session is closed");
+  });
+
+  it("does not spawn app-server for an already-aborted one-shot run", async () => {
+    const spawnFn = vi.fn();
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      signal: controller.signal,
+      spawnFn: spawnFn as never,
+    })).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(spawnFn).not.toHaveBeenCalled();
   });
 
   it("rejects active turns when the owner closes a reusable client", async () => {

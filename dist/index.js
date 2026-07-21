@@ -540,6 +540,7 @@ var CLIENT_INFO = {
   title: "Agent CLI Runner",
   version: "0.1.0"
 };
+var clientExitPromises = /* @__PURE__ */ new WeakMap();
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -579,7 +580,16 @@ async function createCodexAppServerClient(options) {
   const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   let nextId = 1;
   let closed = false;
+  let closeError;
+  let childExited = false;
+  let terminationRequested = false;
+  let killTimer;
+  let exitFallbackTimer;
   let stderr = "";
+  let resolveExit;
+  const exitPromise = new Promise((resolve) => {
+    resolveExit = resolve;
+  });
   const send = (message) => {
     if (closed) return;
     child.stdin?.write(`${JSON.stringify(message)}
@@ -595,6 +605,7 @@ async function createCodexAppServerClient(options) {
   const fail = (error) => {
     if (closed) return;
     closed = true;
+    closeError = error;
     rejectPending(error);
     for (const handler of closeHandlers) safeCallback(() => handler(error));
   };
@@ -665,6 +676,10 @@ async function createCodexAppServerClient(options) {
     fail(isMissingExecutable(error) ? new MissingCliError("codex") : error);
   });
   child.on("close", (code) => {
+    childExited = true;
+    resolveExit();
+    if (killTimer) clearTimeout(killTimer);
+    if (exitFallbackTimer) clearTimeout(exitFallbackTimer);
     splitter.flush();
     const detail = stderr.trim();
     fail(new Error(
@@ -700,15 +715,29 @@ async function createCodexAppServerClient(options) {
       return () => stderrHandlers.delete(handler);
     },
     onClose(handler) {
+      if (closed) {
+        safeCallback(() => handler(closeError ?? new Error("Codex app-server is closed")));
+        return () => {
+        };
+      }
       closeHandlers.add(handler);
       return () => closeHandlers.delete(handler);
     },
     close() {
-      if (closed) return;
-      fail(new Error("Codex app-server was closed"));
+      if (terminationRequested || childExited) return;
+      terminationRequested = true;
+      if (!closed) fail(new Error("Codex app-server was closed"));
       signalProcessTree(child, "SIGTERM");
+      killTimer = setTimeout(() => {
+        if (childExited) return;
+        signalProcessTree(child, "SIGKILL");
+        exitFallbackTimer = setTimeout(resolveExit, SIGTERM_GRACE_MS);
+        exitFallbackTimer.unref();
+      }, SIGTERM_GRACE_MS);
+      killTimer.unref();
     }
   };
+  clientExitPromises.set(client, exitPromise);
   try {
     await client.request("initialize", {
       clientInfo: CLIENT_INFO,
@@ -912,18 +941,31 @@ function turnIdFrom(value) {
 function turnStatus(value) {
   return text(record(record(value)?.turn)?.status);
 }
-async function runCodexAppServer(opts) {
-  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
-  const ownedClient = !opts.appServerClient;
-  const client = opts.appServerClient ?? await createCodexAppServerClient({
+function requestCodexThread(client, opts) {
+  return opts.resumeSessionId ? client.request("thread/resume", {
+    threadId: opts.resumeSessionId,
     cwd: opts.cwd,
-    ...opts.executablePath ? { executablePath: opts.executablePath } : {},
-    ...opts.env ? { env: opts.env } : {},
-    ...opts.spawnFn ? { spawnFn: opts.spawnFn } : {}
+    ...opts.model ? { model: opts.model } : {},
+    ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
+    ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}
+  }) : client.request("thread/start", {
+    cwd: opts.cwd,
+    ...opts.model ? { model: opts.model } : {},
+    ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
+    ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}
   });
-  let threadId = opts.resumeSessionId;
+}
+function openedCodexThread(value, fallbackModel) {
+  const threadId = threadIdFrom(value);
+  if (!threadId) throw new CodexTurnError("Codex app-server did not return a thread ID");
+  const model = text(record(value)?.model) ?? fallbackModel;
+  return { threadId, ...model ? { model } : {} };
+}
+async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false) {
+  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  let threadId = openedThread?.threadId ?? opts.resumeSessionId;
   let turnId;
-  let resolvedModel = opts.model;
+  let resolvedModel = opts.model ?? openedThread?.model;
   let finalText = "";
   let latestUsage;
   let settled = false;
@@ -1110,22 +1152,14 @@ async function runCodexAppServer(opts) {
   const removeClose = client.onClose((error) => settleError(error));
   const removeStderr = client.onStderr((chunk) => safeCallback(() => opts.onStderr?.(chunk)));
   try {
-    const threadRequest = opts.resumeSessionId ? client.request("thread/resume", {
-      threadId: opts.resumeSessionId,
-      cwd: opts.cwd,
-      ...opts.model ? { model: opts.model } : {},
-      ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
-      ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}
-    }) : client.request("thread/start", {
-      cwd: opts.cwd,
-      ...opts.model ? { model: opts.model } : {},
-      ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
-      ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}
-    });
-    const threadResult = await raceLifecycle(threadRequest);
-    threadId = threadIdFrom(threadResult) ?? threadId;
-    resolvedModel = text(record(threadResult)?.model) ?? resolvedModel;
-    if (!threadId) throw new CodexTurnError("Codex app-server did not return a thread ID");
+    if (!openedThread) {
+      const opened = openedCodexThread(
+        await raceLifecycle(requestCodexThread(client, opts)),
+        resolvedModel
+      );
+      threadId = opened.threadId;
+      resolvedModel = opened.model;
+    }
     safeCallback(() => opts.onSessionId?.(threadId));
     turnStarting = true;
     const input = [
@@ -1158,6 +1192,75 @@ async function runCodexAppServer(opts) {
     removeStderr();
     if (ownedClient) client.close();
   }
+}
+async function createCodexAppServerSession(options) {
+  const client = await createCodexAppServerClient({
+    cwd: options.cwd,
+    ...options.executablePath ? { executablePath: options.executablePath } : {},
+    ...options.env ? { env: options.env } : {},
+    ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
+    ...options.requestTimeoutMs !== void 0 ? { requestTimeoutMs: options.requestTimeoutMs } : {}
+  });
+  let opened;
+  try {
+    opened = openedCodexThread(await requestCodexThread(client, options), options.model);
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+  let closed = false;
+  let running = false;
+  let closePromise;
+  client.onClose(() => {
+    closed = true;
+  });
+  return {
+    threadId: opened.threadId,
+    cwd: options.cwd,
+    get closed() {
+      return closed;
+    },
+    async runTurn(turnOptions) {
+      if (closed) throw new Error("Codex app-server session is closed");
+      if (running) throw new Error("Codex app-server session already has an active turn");
+      running = true;
+      try {
+        return await runCodexAppServerTurn({
+          ...turnOptions,
+          cwd: options.cwd,
+          ...options.executablePath ? { executablePath: options.executablePath } : {},
+          ...options.env ? { env: options.env } : {},
+          ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
+          ...options.dangerouslyBypassApprovalsAndSandbox !== void 0 ? {
+            dangerouslyBypassApprovalsAndSandbox: options.dangerouslyBypassApprovalsAndSandbox
+          } : {},
+          ...options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}
+        }, client, opened);
+      } finally {
+        running = false;
+      }
+    },
+    onClose(handler) {
+      return client.onClose(handler);
+    },
+    close() {
+      closePromise ??= clientExitPromises.get(client) ?? Promise.resolve();
+      if (!closed) closed = true;
+      client.close();
+      return closePromise;
+    }
+  };
+}
+async function runCodexAppServer(opts) {
+  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  const ownedClient = !opts.appServerClient;
+  const client = opts.appServerClient ?? await createCodexAppServerClient({
+    cwd: opts.cwd,
+    ...opts.executablePath ? { executablePath: opts.executablePath } : {},
+    ...opts.env ? { env: opts.env } : {},
+    ...opts.spawnFn ? { spawnFn: opts.spawnFn } : {}
+  });
+  return runCodexAppServerTurn(opts, client, void 0, ownedClient);
 }
 
 // src/run-codex.ts
@@ -1350,7 +1453,27 @@ async function runIsolatedCodex(opts) {
   });
 }
 async function runCodex(opts) {
-  if (!opts.isolated) return runCodexAppServer(opts);
+  if (!opts.isolated) {
+    if (opts.appServerClient && opts.appServerSession) {
+      throw new Error("Codex runs cannot use both appServerClient and appServerSession");
+    }
+    if (opts.appServerSession) {
+      if (opts.resumeSessionId) {
+        throw new Error("Session-backed Codex runs cannot resume another session");
+      }
+      if (opts.developerInstructions !== void 0 || opts.dangerouslyBypassApprovalsAndSandbox !== void 0 || opts.env !== void 0 || opts.executablePath !== void 0 || opts.spawnFn !== void 0) {
+        throw new Error("Session-backed Codex runs cannot override thread or client options");
+      }
+      if (opts.cwd !== opts.appServerSession.cwd) {
+        throw new Error("Codex run cwd must match the app-server session cwd");
+      }
+      return opts.appServerSession.runTurn(opts);
+    }
+    return runCodexAppServer(opts);
+  }
+  if (opts.appServerSession || opts.appServerClient) {
+    throw new Error("isolated Codex runs cannot reuse app-server state");
+  }
   if (opts.resumeSessionId) throw new Error("isolated Codex runs cannot resume a session");
   if (opts.dangerouslyBypassApprovalsAndSandbox) {
     throw new Error("isolated Codex runs cannot bypass approvals and sandboxing");
@@ -1367,6 +1490,7 @@ export {
   TimeoutError,
   contextWindowForModel,
   createCodexAppServerClient,
+  createCodexAppServerSession,
   runClaude,
   runCodex
 };

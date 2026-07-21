@@ -3,6 +3,7 @@ import { CodexTurnError, MissingCliError } from "./errors.js";
 import {
   runCodexAppServer,
   type CodexAppServerClient,
+  type CodexAppServerSession,
 } from "./codex-app-server.js";
 import {
   createLineSplitter,
@@ -37,6 +38,8 @@ export interface RunCodexOptions extends CommonRunOptions {
   /** Reuse an initialized app-server connection. When omitted, regular runs
    * create and close a connection for this turn. */
   appServerClient?: CodexAppServerClient;
+  /** Reuse an app-server process with one thread already started or resumed. */
+  appServerSession?: CodexAppServerSession;
   /** Run a non-persistent one-shot request without user config or rules.
    * Codex app-server cannot currently reproduce both ignore flags per thread,
    * so this narrow metadata path intentionally remains on `codex exec`. */
@@ -269,7 +272,33 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
 /** Run a Codex turn. Regular work uses app-server; only isolated metadata
  * requests retain the legacy non-interactive `codex exec` path. */
 export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
-  if (!opts.isolated) return runCodexAppServer(opts);
+  if (!opts.isolated) {
+    if (opts.appServerClient && opts.appServerSession) {
+      throw new Error("Codex runs cannot use both appServerClient and appServerSession");
+    }
+    if (opts.appServerSession) {
+      if (opts.resumeSessionId) {
+        throw new Error("Session-backed Codex runs cannot resume another session");
+      }
+      if (
+        opts.developerInstructions !== undefined
+        || opts.dangerouslyBypassApprovalsAndSandbox !== undefined
+        || opts.env !== undefined
+        || opts.executablePath !== undefined
+        || opts.spawnFn !== undefined
+      ) {
+        throw new Error("Session-backed Codex runs cannot override thread or client options");
+      }
+      if (opts.cwd !== opts.appServerSession.cwd) {
+        throw new Error("Codex run cwd must match the app-server session cwd");
+      }
+      return opts.appServerSession.runTurn(opts);
+    }
+    return runCodexAppServer(opts);
+  }
+  if (opts.appServerSession || opts.appServerClient) {
+    throw new Error("isolated Codex runs cannot reuse app-server state");
+  }
   if (opts.resumeSessionId) throw new Error("isolated Codex runs cannot resume a session");
   if (opts.dangerouslyBypassApprovalsAndSandbox) {
     throw new Error("isolated Codex runs cannot bypass approvals and sandboxing");
