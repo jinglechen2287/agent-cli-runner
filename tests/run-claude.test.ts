@@ -289,6 +289,125 @@ describe("runClaude", () => {
     expect(onAssistantText).toHaveBeenCalledWith("Hello there");
   });
 
+  it("requests partial messages only when a delta callback is supplied", async () => {
+    const withoutDelta = makeFakeChild();
+    const plainSpawn = vi.fn().mockReturnValue(withoutDelta);
+    const plain = runClaude({ prompt: "x", cwd: "/tmp", spawnFn: plainSpawn as never });
+    expect(plainSpawn.mock.calls[0]![1]).not.toContain("--include-partial-messages");
+    finish(withoutDelta);
+    await plain;
+
+    const withDelta = makeFakeChild();
+    const streamingSpawn = vi.fn().mockReturnValue(withDelta);
+    const streaming = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: streamingSpawn as never,
+      onAssistantTextDelta: vi.fn(),
+    });
+    expect(streamingSpawn.mock.calls[0]![1]).toContain("--include-partial-messages");
+    finish(withDelta);
+    await streaming;
+  });
+
+  it("emits text deltas in order and still reports the completed message", async () => {
+    const child = makeFakeChild();
+    const onAssistantTextDelta = vi.fn();
+    const onAssistantText = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onAssistantTextDelta,
+      onAssistantText,
+    });
+    for (const text of ["Hello", " there"]) {
+      child.stdout.write(
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text } },
+        }) + "\n",
+      );
+    }
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Hello there" }] },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onAssistantTextDelta.mock.calls.map(([chunk]) => chunk)).toEqual(["Hello", " there"]);
+    expect(onAssistantText).toHaveBeenCalledWith("Hello there");
+  });
+
+  // Extended thinking and streamed tool input share the content_block_delta
+  // envelope; only text_delta belongs in the transcript.
+  it("ignores thinking, signature, and tool-input deltas", async () => {
+    const child = makeFakeChild();
+    const onAssistantTextDelta = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onAssistantTextDelta,
+    });
+    const deltas = [
+      { type: "thinking_delta", thinking: "pondering" },
+      { type: "signature_delta", signature: "sig" },
+      { type: "input_json_delta", partial_json: '{"a":' },
+    ];
+    for (const delta of deltas) {
+      child.stdout.write(
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_delta", index: 0, delta },
+        }) + "\n",
+      );
+    }
+    finish(child);
+    await promise;
+    expect(onAssistantTextDelta).not.toHaveBeenCalled();
+  });
+
+  // Background subagents stream through the parent's stdout tagged with the
+  // spawning tool call; their prose is not the parent turn's transcript.
+  it("ignores text deltas emitted by a background subagent", async () => {
+    const child = makeFakeChild();
+    const onAssistantTextDelta = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onAssistantTextDelta,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "subagent prose" },
+        },
+        parent_tool_use_id: "toolu_123",
+      }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "main prose" },
+        },
+        parent_tool_use_id: null,
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onAssistantTextDelta.mock.calls.map(([chunk]) => chunk)).toEqual(["main prose"]);
+  });
+
   it("emits full lifecycle snapshots for background subagents", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);

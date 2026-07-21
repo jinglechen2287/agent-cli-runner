@@ -116,6 +116,17 @@ interface AgentCallbacks {
     onSessionId?: (id: string) => void;
     /** Fired for each completed assistant message. */
     onAssistantText?: (text: string) => void;
+    /** Fired with each fragment of assistant prose as the model produces it,
+     * before the completed message arrives via {@link onAssistantText}. Supplying
+     * it opts the run into partial-message streaming, which roughly doubles the
+     * CLI's output volume — omit it for metadata runs that only need the result.
+     *
+     * Fragments cover assistant prose only: extended thinking, streamed tool
+     * input, and background-subagent output are excluded. Concatenating every
+     * fragment between two `onAssistantText` calls reproduces the later message,
+     * so hosts should treat a fragment as scratch state that the completed
+     * message supersedes, never as transcript content in its own right. */
+    onAssistantTextDelta?: (delta: string) => void;
     /** Fired when the agent invokes a tool (deduplicated per tool invocation). */
     onToolUse?: (info: ToolUseInfo) => void;
     /** Fired when the provider reports the result for a tool invocation. */

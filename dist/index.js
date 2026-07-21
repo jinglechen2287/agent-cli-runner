@@ -316,6 +316,9 @@ async function runClaude(opts) {
       "--no-session-persistence"
     );
   }
+  if (opts.onAssistantTextDelta) {
+    args.push("--include-partial-messages");
+  }
   if (opts.appendSystemPrompt) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
   }
@@ -376,6 +379,14 @@ async function runClaude(opts) {
       try {
         parsed = JSON.parse(trimmed);
       } catch {
+        return;
+      }
+      if (parsed.type === "stream_event") {
+        if (parsed.parent_tool_use_id) return;
+        const delta = parsed.event?.type === "content_block_delta" ? parsed.event.delta : void 0;
+        if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+          opts.onAssistantTextDelta?.(delta.text);
+        }
         return;
       }
       if (parsed.type === "system" && parsed.subtype === "init" && parsed.session_id) {
@@ -1249,6 +1260,17 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     }
     if (method === "item/started" || method === "item/completed") {
       handleItem(method, params);
+      return;
+    }
+    if (method === "item/agentMessage/delta") {
+      if (params.threadId !== threadId) return;
+      const eventTurnId = text(params.turnId);
+      if (!eventTurnId || isPreviousTurn(eventTurnId) || turnId && eventTurnId !== turnId) {
+        return;
+      }
+      turnId ??= eventTurnId;
+      const chunk = text(params.delta);
+      if (chunk) safeCallback(() => opts.onAssistantTextDelta?.(chunk));
       return;
     }
     if (method === "rawResponseItem/completed") {

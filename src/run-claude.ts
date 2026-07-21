@@ -154,10 +154,23 @@ interface ClaudeModelUsage {
   contextWindow?: unknown;
 }
 
+/** One `stream_event` payload from `--include-partial-messages`. The CLI wraps
+ * the raw Anthropic streaming event, so `content_block_delta` carries the same
+ * `delta` union the API uses — text, extended thinking, its signature, or a
+ * tool's streamed input JSON. */
+interface ClaudeStreamEvent {
+  type?: string;
+  delta?: { type?: string; text?: string };
+}
+
 interface StreamLine {
   type?: string;
   subtype?: string;
   session_id?: string;
+  event?: ClaudeStreamEvent;
+  /** Set on lines produced by a background subagent, naming the tool call that
+   * spawned it. Null/absent on the parent turn's own output. */
+  parent_tool_use_id?: string | null;
   result?: string;
   message?: { content?: ClaudeContentBlock[]; usage?: ClaudeUsage; model?: string };
   usage?: ClaudeUsage;
@@ -264,6 +277,11 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
       "--no-session-persistence",
     );
   }
+  // Partial messages roughly double the CLI's stdout, so only ask for them
+  // when the host is actually rendering the fragments.
+  if (opts.onAssistantTextDelta) {
+    args.push("--include-partial-messages");
+  }
   if (opts.appendSystemPrompt) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
   }
@@ -333,6 +351,20 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
       try {
         parsed = JSON.parse(trimmed) as StreamLine;
       } catch {
+        return;
+      }
+      // Checked first: with --include-partial-messages these outnumber every
+      // other line type by an order of magnitude.
+      if (parsed.type === "stream_event") {
+        // Subagent prose streams through the parent's stdout tagged with the
+        // spawning tool call — it belongs to that agent, not this transcript.
+        if (parsed.parent_tool_use_id) return;
+        const delta = parsed.event?.type === "content_block_delta"
+          ? parsed.event.delta
+          : undefined;
+        if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+          opts.onAssistantTextDelta?.(delta.text);
+        }
         return;
       }
       if (parsed.type === "system" && parsed.subtype === "init" && parsed.session_id) {

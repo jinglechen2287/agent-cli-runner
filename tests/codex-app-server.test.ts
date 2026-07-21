@@ -1642,4 +1642,52 @@ describe("Codex app-server runner", () => {
       spawnFn: (() => child) as never,
     })).rejects.toMatchObject({ name: "CodexTurnError", message: "Codex error: rate limited" });
   });
+
+  it("streams agent message deltas for the active turn and ignores foreign ones", async () => {
+    const child = makeFakeChild();
+    const onAssistantTextDelta = vi.fn();
+    const onAssistantText = vi.fn();
+    const delta = (params: Record<string, unknown>) => {
+      send(child, { method: "item/agentMessage/delta", params });
+    };
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-1" } } });
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("turn-1", "inProgress") } });
+        delta({ threadId: "thread-1", turnId: "turn-1", itemId: "m1", delta: "Hel" });
+        delta({ threadId: "thread-1", turnId: "turn-1", itemId: "m1", delta: "lo" });
+        // A pooled connection carries other threads' turns, and an interrupted
+        // turn can trail deltas after the next one starts.
+        delta({ threadId: "thread-2", turnId: "turn-9", itemId: "m9", delta: "other thread" });
+        delta({ threadId: "thread-1", turnId: "turn-0", itemId: "m0", delta: "stale turn" });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            completedAtMs: 2_000,
+            item: { type: "agentMessage", id: "m1", text: "Hello" },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-1", turn: completedTurn("turn-1") },
+        });
+      }
+    });
+
+    await runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onAssistantTextDelta,
+      onAssistantText,
+    });
+
+    expect(onAssistantTextDelta.mock.calls.map(([chunk]) => chunk)).toEqual(["Hel", "lo"]);
+    expect(onAssistantText).toHaveBeenCalledWith("Hello");
+  });
 });

@@ -971,6 +971,19 @@ async function runCodexAppServerTurn(
       handleItem(method, params);
       return;
     }
+    if (method === "item/agentMessage/delta") {
+      // A pooled connection multiplexes threads, and an interrupted turn can
+      // trail deltas after the next one starts — both must be filtered out.
+      if (params.threadId !== threadId) return;
+      const eventTurnId = text(params.turnId);
+      if (!eventTurnId || isPreviousTurn(eventTurnId) || (turnId && eventTurnId !== turnId)) {
+        return;
+      }
+      turnId ??= eventTurnId;
+      const chunk = text(params.delta);
+      if (chunk) safeCallback(() => opts.onAssistantTextDelta?.(chunk));
+      return;
+    }
     if (method === "rawResponseItem/completed") {
       if (params.threadId !== threadId) return;
       const eventTurnId = text(params.turnId);
