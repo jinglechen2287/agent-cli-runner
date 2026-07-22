@@ -1688,9 +1688,14 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     const answers = {};
     for (const [questionId, values] of Object.entries(response.answers)) {
       if (!questionIds.has(questionId) || !Array.isArray(values)) continue;
-      answers[questionId] = {
-        answers: values.filter((value) => typeof value === "string")
-      };
+      Object.defineProperty(answers, questionId, {
+        value: {
+          answers: values.filter((value) => typeof value === "string")
+        },
+        enumerable: true,
+        configurable: true,
+        writable: true
+      });
     }
     return { answers };
   }) : () => {

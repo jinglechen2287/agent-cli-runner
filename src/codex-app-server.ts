@@ -1067,9 +1067,14 @@ async function runCodexAppServerTurn(
         const answers: Record<string, { answers: string[] }> = {};
         for (const [questionId, values] of Object.entries(response.answers)) {
           if (!questionIds.has(questionId) || !Array.isArray(values)) continue;
-          answers[questionId] = {
-            answers: values.filter((value): value is string => typeof value === "string"),
-          };
+          Object.defineProperty(answers, questionId, {
+            value: {
+              answers: values.filter((value): value is string => typeof value === "string"),
+            },
+            enumerable: true,
+            configurable: true,
+            writable: true,
+          });
         }
         return { answers };
       })

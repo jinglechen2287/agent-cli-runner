@@ -818,12 +818,14 @@ describe("Codex app-server runner", () => {
 
   it("answers native question requests through the normalized callback", async () => {
     const child = makeFakeChild();
-    const onUserInputRequest = vi.fn(async () => ({
-      answers: {
+    const callbackAnswers = Object.defineProperty({
         framework: ["React"],
         notes: ["Keep it small"],
-      },
-    }));
+    }, "__proto__", {
+      value: ["safe"],
+      enumerable: true,
+    }) as Record<string, string[]>;
+    const onUserInputRequest = vi.fn(async () => ({ answers: callbackAnswers }));
     const requests = captureRequests(child, (message) => {
       if (message.method === "initialize") {
         send(child, { id: message.id, result: {} });
@@ -864,6 +866,14 @@ describe("Codex app-server runner", () => {
                 isOther: false,
                 isSecret: true,
                 options: null,
+              },
+              {
+                id: "__proto__",
+                header: "Special",
+                question: "Preserve this ID?",
+                isOther: false,
+                isSecret: false,
+                options: [{ label: "safe" }],
               },
             ],
           },
@@ -911,17 +921,25 @@ describe("Codex app-server runner", () => {
           secret: true,
           options: [],
         },
+        {
+          id: "__proto__",
+          header: "Special",
+          question: "Preserve this ID?",
+          multiSelect: false,
+          allowOther: false,
+          secret: false,
+          options: [{ label: "safe" }],
+        },
       ],
     });
-    expect(requests).toContainEqual({
-      id: 99,
-      result: {
-        answers: {
-          framework: { answers: ["React"] },
-          notes: { answers: ["Keep it small"] },
-        },
-      },
-    });
+    const response = requests.find(({ id, result }) => id === 99 && result !== undefined)?.result as {
+      answers: Record<string, { answers: string[] }>;
+    };
+    expect(response.answers.framework).toEqual({ answers: ["React"] });
+    expect(response.answers.notes).toEqual({ answers: ["Keep it small"] });
+    expect(Object.hasOwn(response.answers, "__proto__")).toBe(true);
+    expect(response.answers["__proto__"]).toEqual({ answers: ["safe"] });
+    expect(Object.getPrototypeOf(response.answers)).toBe(Object.prototype);
   });
 
   it("rejects malformed native questions and does not consume another turn's request", async () => {
