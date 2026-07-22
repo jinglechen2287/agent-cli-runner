@@ -50,6 +50,7 @@ describe("runCodex isolated mode", () => {
       cwd: "/tmp",
       isolated: true,
       model: "gpt-test",
+      serviceTier: "priority",
       developerInstructions: "Return a title",
       spawnFn: spawnFn as never,
     });
@@ -70,6 +71,7 @@ describe("runCodex isolated mode", () => {
       'developer_instructions="Return a title"',
     ]));
     expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(args.join(" ")).not.toContain("service_tier");
     expect(options).toMatchObject({ cwd: "/tmp" });
 
     child.stdout.write(`${JSON.stringify({

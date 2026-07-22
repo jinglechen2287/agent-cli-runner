@@ -903,11 +903,16 @@ describe("Codex app-server runner", () => {
       spawnFn: (() => child) as never,
     });
 
-    const first = await session.runTurn({ prompt: "one", model: "gpt-one" });
+    const first = await session.runTurn({
+      prompt: "one",
+      model: "gpt-one",
+      serviceTier: "priority",
+    });
     const second = await session.runTurn({
       prompt: "two",
       model: "gpt-two",
       reasoningEffort: "medium",
+      serviceTier: null,
     });
 
     expect(session.threadId).toBe("thread-session");
@@ -917,15 +922,22 @@ describe("Codex app-server runner", () => {
     expect(requests.filter(({ method }) => method === "initialize")).toHaveLength(1);
     expect(requests.filter(({ method }) => method === "thread/start")).toHaveLength(1);
     expect(requests.filter(({ method }) => method === "thread/resume")).toHaveLength(0);
-    expect(requests.filter(({ method }) => method === "turn/start").map(({ params }) => params))
-      .toEqual([
-        expect.objectContaining({ threadId: "thread-session", model: "gpt-one" }),
-        expect.objectContaining({
-          threadId: "thread-session",
-          model: "gpt-two",
-          effort: "medium",
-        }),
-      ]);
+    const turnParams = requests
+      .filter(({ method }) => method === "turn/start")
+      .map(({ params }) => params);
+    expect(turnParams).toEqual([
+      expect.objectContaining({
+        threadId: "thread-session",
+        model: "gpt-one",
+        serviceTier: "priority",
+      }),
+      expect.objectContaining({
+        threadId: "thread-session",
+        model: "gpt-two",
+        effort: "medium",
+        serviceTier: null,
+      }),
+    ]);
     expect(child.kill).not.toHaveBeenCalled();
 
     const closing = Promise.resolve(session.close());

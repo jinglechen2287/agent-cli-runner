@@ -1352,7 +1352,8 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
         threadId,
         input,
         ...opts.model ? { model: opts.model } : {},
-        ...opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}
+        ...opts.reasoningEffort ? { effort: opts.reasoningEffort } : {},
+        ...opts.serviceTier !== void 0 ? { serviceTier: opts.serviceTier } : {}
       }, turnStartTimeoutMs));
     } catch (error) {
       if ((error instanceof TimeoutError || error instanceof AbortError) && threadId) {

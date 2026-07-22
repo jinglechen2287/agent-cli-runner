@@ -35,6 +35,9 @@ export interface RunCodexOptions extends CommonRunOptions {
   contextWindow?: number;
   /** Reasoning effort passed directly to app-server's `turn/start`. */
   reasoningEffort?: string;
+  /** Service tier passed directly to app-server's `turn/start`.
+   * Null explicitly clears a tier retained by the thread. */
+  serviceTier?: string | null;
   /** Reuse an initialized app-server connection. When omitted, regular runs
    * create and close a connection for this turn. */
   appServerClient?: CodexAppServerClient;

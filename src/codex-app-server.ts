@@ -1074,6 +1074,7 @@ async function runCodexAppServerTurn(
         input,
         ...(opts.model ? { model: opts.model } : {}),
         ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
+        ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
       }, turnStartTimeoutMs));
     } catch (error) {
       // The turn may have started server-side despite the lost ack, and an
