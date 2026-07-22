@@ -864,6 +864,65 @@ describe("Codex app-server runner", () => {
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
   });
 
+  it("forwards a per-turn sandboxPolicy override in turn/start", async () => {
+    const child = makeFakeChild();
+    let turnNumber = 0;
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-sbx" } } });
+      } else if (message.method === "turn/start") {
+        turnNumber += 1;
+        const turnId = `turn-${turnNumber}`;
+        send(child, { id: message.id, result: { turn: completedTurn(turnId, "inProgress") } });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-sbx",
+            turnId,
+            completedAtMs: turnNumber,
+            item: { type: "agentMessage", id: `message-${turnNumber}`, text: `Done ${turnNumber}` },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-sbx", turn: completedTurn(turnId) },
+        });
+      }
+    });
+
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      dangerouslyBypassApprovalsAndSandbox: true,
+      spawnFn: (() => child) as never,
+    });
+
+    await session.runTurn({
+      prompt: "plan it",
+      sandboxPolicy: { type: "readOnly", networkAccess: true },
+    });
+    await session.runTurn({
+      prompt: "build it",
+      sandboxPolicy: { type: "dangerFullAccess" },
+    });
+    await session.runTurn({ prompt: "no override" });
+
+    const turnParams = requests
+      .filter(({ method }) => method === "turn/start")
+      .map(({ params }) => params);
+    expect(turnParams[0]).toMatchObject({
+      threadId: "thread-sbx",
+      sandboxPolicy: { type: "readOnly", networkAccess: true },
+    });
+    expect(turnParams[1]).toMatchObject({
+      threadId: "thread-sbx",
+      sandboxPolicy: { type: "dangerFullAccess" },
+    });
+    expect(turnParams[2]).not.toHaveProperty("sandboxPolicy");
+    await session.close();
+  });
+
   it("opens a thread once and reuses it for sequential session turns", async () => {
     const child = makeFakeChild();
     let turnNumber = 0;

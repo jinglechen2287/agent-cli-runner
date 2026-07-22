@@ -28,11 +28,29 @@ export const CLAUDE_STRIPPED_ENV_VARS = [
   "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
 ] as const;
 
+/** The Claude Code CLI's --permission-mode choices. Like the system prompt,
+ * the mode is rebuilt from flags on each run, so it must be supplied on
+ * resumed turns too — a session does not remember it. */
+export type ClaudePermissionMode =
+  | "acceptEdits"
+  | "auto"
+  | "bypassPermissions"
+  | "manual"
+  | "dontAsk"
+  | "plan";
+
 export interface RunClaudeOptions extends CommonRunOptions {
   /** Text passed via --append-system-prompt. The CLI rebuilds the system
    * prompt from flags on each run, so this must be supplied on resumed turns
    * too, not just the first spawn. */
   appendSystemPrompt?: string;
+  /** Permission mode passed via --permission-mode. `plan` keeps the turn
+   * read-only on the project while research tools still run. */
+  permissionMode?: ClaudePermissionMode;
+  /** Tool names passed via --disallowed-tools. Headless plan turns disallow
+   * ExitPlanMode: the CLI never enables it under -p, and suppressing it stops
+   * the model from hunting for an approval channel that doesn't exist. */
+  disallowedTools?: string[];
   /** Pre-assign a UUID for the new session (turn 1). Mutually exclusive with resumeSessionId. */
   newSessionId?: string;
   /** Resume an existing session by id (turn 2+). Mutually exclusive with newSessionId. */
@@ -265,6 +283,9 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
   if (opts.isolated && opts.resumeSessionId) {
     throw new Error("isolated Claude runs cannot resume a session");
   }
+  if (opts.isolated && opts.permissionMode) {
+    throw new Error("isolated Claude runs cannot set a permission mode");
+  }
 
   const spawnFn = opts.spawnFn ?? nodeSpawn;
   const args: string[] = ["-p", "--output-format", "stream-json", "--verbose"];
@@ -284,6 +305,14 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
   }
   if (opts.appendSystemPrompt) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
+  }
+  if (opts.permissionMode) {
+    args.push("--permission-mode", opts.permissionMode);
+  }
+  if (opts.disallowedTools && opts.disallowedTools.length > 0) {
+    // One space-separated argument: the flag is variadic, and separate
+    // arguments would swallow whatever positional followed them.
+    args.push("--disallowed-tools", opts.disallowedTools.join(" "));
   }
   if (opts.newSessionId) {
     args.push("--session-id", opts.newSessionId);

@@ -1,7 +1,7 @@
 export { runClaude, CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
-export type { RunClaudeOptions } from "./run-claude.js";
+export type { ClaudePermissionMode, RunClaudeOptions } from "./run-claude.js";
 export { runCodex, CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
-export type { RunCodexOptions } from "./run-codex.js";
+export type { CodexSandboxPolicy, RunCodexOptions } from "./run-codex.js";
 export {
   createCodexAppServerClient,
   createCodexAppServerSession,

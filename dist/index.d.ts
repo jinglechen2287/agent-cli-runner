@@ -174,11 +174,22 @@ interface RunResult {
  * another Claude Code session. Stripped so hosts launched by Claude Code
  * (or exposing it, like a bot) can still spawn turns. */
 declare const CLAUDE_STRIPPED_ENV_VARS: readonly ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ACCESS_TOKEN"];
+/** The Claude Code CLI's --permission-mode choices. Like the system prompt,
+ * the mode is rebuilt from flags on each run, so it must be supplied on
+ * resumed turns too — a session does not remember it. */
+type ClaudePermissionMode = "acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan";
 interface RunClaudeOptions extends CommonRunOptions {
     /** Text passed via --append-system-prompt. The CLI rebuilds the system
      * prompt from flags on each run, so this must be supplied on resumed turns
      * too, not just the first spawn. */
     appendSystemPrompt?: string;
+    /** Permission mode passed via --permission-mode. `plan` keeps the turn
+     * read-only on the project while research tools still run. */
+    permissionMode?: ClaudePermissionMode;
+    /** Tool names passed via --disallowed-tools. Headless plan turns disallow
+     * ExitPlanMode: the CLI never enables it under -p, and suppressing it stops
+     * the model from hunting for an approval channel that doesn't exist. */
+    disallowedTools?: string[];
     /** Pre-assign a UUID for the new session (turn 1). Mutually exclusive with resumeSessionId. */
     newSessionId?: string;
     /** Resume an existing session by id (turn 2+). Mutually exclusive with newSessionId. */
@@ -239,9 +250,31 @@ declare function createCodexAppServerSession(options: CreateCodexAppServerSessio
 /** Stripped so a Codex turn spawned from within another Codex session does
  * not inherit the parent's thread. */
 declare const CODEX_STRIPPED_ENV_VARS: readonly ["CODEX_THREAD_ID"];
+/** A per-turn sandbox override, mirroring app-server's SandboxPolicy union.
+ * `turn/start` documents it as applying "for this turn and subsequent turns",
+ * so hosts that flip it (e.g. a read-only plan turn) must send an explicit
+ * policy on every turn rather than relying on the thread's starting value. */
+type CodexSandboxPolicy = {
+    type: "dangerFullAccess";
+} | {
+    type: "readOnly";
+    networkAccess?: boolean;
+} | {
+    type: "workspaceWrite";
+    networkAccess?: boolean;
+    writableRoots?: string[];
+    excludeSlashTmp?: boolean;
+    excludeTmpdirEnvVar?: boolean;
+} | {
+    type: "externalSandbox";
+    networkAccess?: "restricted" | "enabled";
+};
 interface RunCodexOptions extends CommonRunOptions {
     /** Preserve the historical full-host-access behavior for trusted callers. */
     dangerouslyBypassApprovalsAndSandbox?: boolean;
+    /** Sandbox override passed directly to app-server's `turn/start`. Sticky
+     * across turns on the same thread — see {@link CodexSandboxPolicy}. */
+    sandboxPolicy?: CodexSandboxPolicy;
     /** Text applied as developer instructions for the thread. */
     developerInstructions?: string;
     /** Resume an existing app-server thread by id. */
@@ -291,4 +324,4 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, runClaude, runCodex };

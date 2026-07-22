@@ -20,9 +20,28 @@ import type { CommonRunOptions, RunResult, ToolPlanItem } from "./types.js";
  * not inherit the parent's thread. */
 export const CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"] as const;
 
+/** A per-turn sandbox override, mirroring app-server's SandboxPolicy union.
+ * `turn/start` documents it as applying "for this turn and subsequent turns",
+ * so hosts that flip it (e.g. a read-only plan turn) must send an explicit
+ * policy on every turn rather than relying on the thread's starting value. */
+export type CodexSandboxPolicy =
+  | { type: "dangerFullAccess" }
+  | { type: "readOnly"; networkAccess?: boolean }
+  | {
+      type: "workspaceWrite";
+      networkAccess?: boolean;
+      writableRoots?: string[];
+      excludeSlashTmp?: boolean;
+      excludeTmpdirEnvVar?: boolean;
+    }
+  | { type: "externalSandbox"; networkAccess?: "restricted" | "enabled" };
+
 export interface RunCodexOptions extends CommonRunOptions {
   /** Preserve the historical full-host-access behavior for trusted callers. */
   dangerouslyBypassApprovalsAndSandbox?: boolean;
+  /** Sandbox override passed directly to app-server's `turn/start`. Sticky
+   * across turns on the same thread — see {@link CodexSandboxPolicy}. */
+  sandboxPolicy?: CodexSandboxPolicy;
   /** Text applied as developer instructions for the thread. */
   developerInstructions?: string;
   /** Resume an existing app-server thread by id. */
@@ -305,6 +324,9 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
   if (opts.resumeSessionId) throw new Error("isolated Codex runs cannot resume a session");
   if (opts.dangerouslyBypassApprovalsAndSandbox) {
     throw new Error("isolated Codex runs cannot bypass approvals and sandboxing");
+  }
+  if (opts.sandboxPolicy) {
+    throw new Error("isolated Codex runs cannot override the sandbox policy");
   }
   return runIsolatedCodex(opts);
 }

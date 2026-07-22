@@ -148,6 +148,94 @@ describe("runClaude", () => {
     await promise;
   });
 
+  it("passes --permission-mode with the given mode", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "plan the change",
+      cwd: "/tmp",
+      permissionMode: "plan",
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    const flagIndex = args.indexOf("--permission-mode");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe("plan");
+    finish(child);
+    await promise;
+  });
+
+  it("omits --permission-mode by default", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({ prompt: "x", cwd: "/tmp", spawnFn: spawnFn as never });
+    expect(spawnFn.mock.calls[0]![1]).not.toContain("--permission-mode");
+    finish(child);
+    await promise;
+  });
+
+  it("passes --disallowed-tools with the given tool names", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "plan the change",
+      cwd: "/tmp",
+      permissionMode: "plan",
+      disallowedTools: ["ExitPlanMode", "Task"],
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    const flagIndex = args.indexOf("--disallowed-tools");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe("ExitPlanMode Task");
+    finish(child);
+    await promise;
+  });
+
+  it("omits --disallowed-tools when the list is empty", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      disallowedTools: [],
+      spawnFn: spawnFn as never,
+    });
+    expect(spawnFn.mock.calls[0]![1]).not.toContain("--disallowed-tools");
+    finish(child);
+    await promise;
+  });
+
+  it("passes --permission-mode alongside --resume on follow-up turns", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "follow up",
+      cwd: "/tmp",
+      resumeSessionId: "abc",
+      permissionMode: "plan",
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    expect(args).toContain("--resume");
+    expect(args).toContain("--permission-mode");
+    expect(args).toContain("plan");
+    finish(child);
+    await promise;
+  });
+
+  it("rejects isolated runs that set a permission mode", async () => {
+    await expect(
+      runClaude({
+        prompt: "x",
+        cwd: "/tmp",
+        isolated: true,
+        permissionMode: "plan",
+        spawnFn: (() => makeFakeChild()) as never,
+      }),
+    ).rejects.toThrow(/isolated.*permission/i);
+  });
+
   it("passes --session-id when newSessionId is provided", async () => {
     const child = makeFakeChild();
     const spawnFn = vi.fn().mockReturnValue(child);

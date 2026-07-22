@@ -305,6 +305,9 @@ async function runClaude(opts) {
   if (opts.isolated && opts.resumeSessionId) {
     throw new Error("isolated Claude runs cannot resume a session");
   }
+  if (opts.isolated && opts.permissionMode) {
+    throw new Error("isolated Claude runs cannot set a permission mode");
+  }
   const spawnFn = opts.spawnFn ?? nodeSpawn2;
   const args = ["-p", "--output-format", "stream-json", "--verbose"];
   if (opts.isolated) {
@@ -321,6 +324,12 @@ async function runClaude(opts) {
   }
   if (opts.appendSystemPrompt) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
+  }
+  if (opts.permissionMode) {
+    args.push("--permission-mode", opts.permissionMode);
+  }
+  if (opts.disallowedTools && opts.disallowedTools.length > 0) {
+    args.push("--disallowed-tools", opts.disallowedTools.join(" "));
   }
   if (opts.newSessionId) {
     args.push("--session-id", opts.newSessionId);
@@ -1353,7 +1362,8 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
         input,
         ...opts.model ? { model: opts.model } : {},
         ...opts.reasoningEffort ? { effort: opts.reasoningEffort } : {},
-        ...opts.serviceTier !== void 0 ? { serviceTier: opts.serviceTier } : {}
+        ...opts.serviceTier !== void 0 ? { serviceTier: opts.serviceTier } : {},
+        ...opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}
       }, turnStartTimeoutMs));
     } catch (error) {
       if ((error instanceof TimeoutError || error instanceof AbortError) && threadId) {
@@ -1678,6 +1688,9 @@ async function runCodex(opts) {
   if (opts.resumeSessionId) throw new Error("isolated Codex runs cannot resume a session");
   if (opts.dangerouslyBypassApprovalsAndSandbox) {
     throw new Error("isolated Codex runs cannot bypass approvals and sandboxing");
+  }
+  if (opts.sandboxPolicy) {
+    throw new Error("isolated Codex runs cannot override the sandbox policy");
   }
   return runIsolatedCodex(opts);
 }
