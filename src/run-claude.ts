@@ -51,6 +51,23 @@ export interface RunClaudeOptions extends CommonRunOptions {
    * ExitPlanMode: the CLI never enables it under -p, and suppressing it stops
    * the model from hunting for an approval channel that doesn't exist. */
   disallowedTools?: string[];
+  /** Built-in tool whitelist passed via --tools as one comma-joined argument
+   * (the CLI's documented "Bash,Edit,Read" form; the flag is variadic, so
+   * separate arguments would swallow whatever followed). Unlike
+   * disallowedTools, an explicit empty array is emitted as --tools "" — the
+   * CLI's disable-all form — rather than omitted, so an empty whitelist can
+   * never silently widen back to the full set. MCP tools are outside this
+   * flag's scope; gate those with permission settings instead. */
+  tools?: string[];
+  /** Settings sources the CLI may load ("user", "project", "local"), passed
+   * via --setting-sources as one comma-joined argument. Omitting a source
+   * drops its permission rules for the turn — e.g. excluding "user" keeps a
+   * broad `permissions.allow` in ~/.claude/settings.json from pre-approving
+   * what the turn's permission mode would otherwise gate. */
+  settingSources?: Array<"user" | "project" | "local">;
+  /** Extra session settings passed verbatim via --settings: a JSON string or
+   * a file path, per the CLI. Merged on top of the loaded setting sources. */
+  settings?: string;
   /** Pre-assign a UUID for the new session (turn 1). Mutually exclusive with resumeSessionId. */
   newSessionId?: string;
   /** Resume an existing session by id (turn 2+). Mutually exclusive with newSessionId. */
@@ -286,6 +303,9 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
   if (opts.isolated && opts.permissionMode) {
     throw new Error("isolated Claude runs cannot set a permission mode");
   }
+  if (opts.isolated && opts.tools) {
+    throw new Error("isolated Claude runs cannot set tools — isolated already disables them all");
+  }
 
   const spawnFn = opts.spawnFn ?? nodeSpawn;
   const args: string[] = ["-p", "--output-format", "stream-json", "--verbose"];
@@ -313,6 +333,17 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     // One space-separated argument: the flag is variadic, and separate
     // arguments would swallow whatever positional followed them.
     args.push("--disallowed-tools", opts.disallowedTools.join(" "));
+  }
+  // Presence check, not length: [] must reach the CLI as --tools "" (disable
+  // all built-ins), never fall back to the full set.
+  if (opts.tools) {
+    args.push("--tools", opts.tools.join(","));
+  }
+  if (opts.settingSources) {
+    args.push("--setting-sources", opts.settingSources.join(","));
+  }
+  if (opts.settings) {
+    args.push("--settings", opts.settings);
   }
   if (opts.newSessionId) {
     args.push("--session-id", opts.newSessionId);

@@ -206,6 +206,107 @@ describe("runClaude", () => {
     await promise;
   });
 
+  it("passes --tools as one comma-joined argument", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "answer a question",
+      cwd: "/tmp",
+      tools: ["Bash", "Read", "Glob"],
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    const flagIndex = args.indexOf("--tools");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe("Bash,Read,Glob");
+    finish(child);
+    await promise;
+  });
+
+  it('passes an explicit empty tools list as --tools "" to disable all built-ins', async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      tools: [],
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    const flagIndex = args.indexOf("--tools");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe("");
+    finish(child);
+    await promise;
+  });
+
+  it("omits --tools when the option is absent", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({ prompt: "x", cwd: "/tmp", spawnFn: spawnFn as never });
+    expect(spawnFn.mock.calls[0]![1]).not.toContain("--tools");
+    finish(child);
+    await promise;
+  });
+
+  it("rejects isolated runs that set tools", async () => {
+    await expect(
+      runClaude({
+        prompt: "x",
+        cwd: "/tmp",
+        isolated: true,
+        tools: ["Read"],
+        spawnFn: (() => makeFakeChild()) as never,
+      }),
+    ).rejects.toThrow(/isolated.*tools/i);
+  });
+
+  it("passes --setting-sources as one comma-joined argument", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      settingSources: ["project", "local"],
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    const flagIndex = args.indexOf("--setting-sources");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe("project,local");
+    finish(child);
+    await promise;
+  });
+
+  it("passes --settings through verbatim", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const settings = '{"permissions":{"allow":["WebFetch"]}}';
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      settings,
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    const flagIndex = args.indexOf("--settings");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe(settings);
+    finish(child);
+    await promise;
+  });
+
+  it("omits --setting-sources and --settings by default", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({ prompt: "x", cwd: "/tmp", spawnFn: spawnFn as never });
+    const args = spawnFn.mock.calls[0]![1];
+    expect(args).not.toContain("--setting-sources");
+    expect(args).not.toContain("--settings");
+    finish(child);
+    await promise;
+  });
+
   it("passes --permission-mode alongside --resume on follow-up turns", async () => {
     const child = makeFakeChild();
     const spawnFn = vi.fn().mockReturnValue(child);

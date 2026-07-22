@@ -308,6 +308,9 @@ async function runClaude(opts) {
   if (opts.isolated && opts.permissionMode) {
     throw new Error("isolated Claude runs cannot set a permission mode");
   }
+  if (opts.isolated && opts.tools) {
+    throw new Error("isolated Claude runs cannot set tools \u2014 isolated already disables them all");
+  }
   const spawnFn = opts.spawnFn ?? nodeSpawn2;
   const args = ["-p", "--output-format", "stream-json", "--verbose"];
   if (opts.isolated) {
@@ -330,6 +333,15 @@ async function runClaude(opts) {
   }
   if (opts.disallowedTools && opts.disallowedTools.length > 0) {
     args.push("--disallowed-tools", opts.disallowedTools.join(" "));
+  }
+  if (opts.tools) {
+    args.push("--tools", opts.tools.join(","));
+  }
+  if (opts.settingSources) {
+    args.push("--setting-sources", opts.settingSources.join(","));
+  }
+  if (opts.settings) {
+    args.push("--settings", opts.settings);
   }
   if (opts.newSessionId) {
     args.push("--session-id", opts.newSessionId);

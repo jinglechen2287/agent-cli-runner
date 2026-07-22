@@ -1,6 +1,6 @@
 {
   "name": "agent-cli-runner",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Stream Claude Code and Codex app-server from Node or Bun: session resume, tools, usage, and abort/timeout handling.",
   "type": "module",
   "main": "./dist/index.js",
