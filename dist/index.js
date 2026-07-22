@@ -1,5 +1,15 @@
 // src/run-claude.ts
 import { spawn as nodeSpawn2 } from "child_process";
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "fs";
+import { tmpdir } from "os";
+import { isAbsolute, join, resolve as resolvePath } from "path";
+import { fileURLToPath } from "url";
 
 // src/errors.ts
 var AbortError = class extends Error {
@@ -238,9 +248,9 @@ function claudeTodoPlanItems(name, input) {
   const items = [];
   for (const raw of input.todos) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return void 0;
-    const record2 = raw;
-    const text2 = normalizeSummary(record2.content) ?? normalizeSummary(record2.activeForm);
-    const status = normalizeSummary(record2.status)?.toLowerCase().replace(/\s+/g, "_");
+    const record3 = raw;
+    const text2 = normalizeSummary(record3.content) ?? normalizeSummary(record3.activeForm);
+    const status = normalizeSummary(record3.status)?.toLowerCase().replace(/\s+/g, "_");
     if (!text2 || !status) return void 0;
     items.push({ text: text2, status });
   }
@@ -296,7 +306,167 @@ function pickPrimaryModel(modelUsage, preferred) {
   }
   return { model: best[0], contextWindow: toContextWindow(best[1].contextWindow) };
 }
-async function runClaude(opts) {
+function record(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
+}
+function requiredText(value, field) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`Malformed Claude AskUserQuestion ${field}`);
+  }
+  return value.trim();
+}
+function normalizeClaudeQuestion(value, toolUseId, index) {
+  const question = record(value);
+  if (!question || !Array.isArray(question.options)) {
+    throw new Error("Malformed Claude AskUserQuestion question");
+  }
+  const options = question.options.map((value2) => {
+    const option = record(value2);
+    if (!option) throw new Error("Malformed Claude AskUserQuestion option");
+    const label = requiredText(option.label, "option label");
+    if (option.description !== void 0 && option.description !== null && typeof option.description !== "string") {
+      throw new Error("Malformed Claude AskUserQuestion option description");
+    }
+    const description = typeof option.description === "string" ? option.description.trim() : "";
+    return { label, ...description ? { description } : {} };
+  });
+  if (question.multiSelect !== void 0 && typeof question.multiSelect !== "boolean") {
+    throw new Error("Malformed Claude AskUserQuestion multiSelect");
+  }
+  return {
+    id: `${toolUseId}:${index}`,
+    header: requiredText(question.header, "header"),
+    question: requiredText(question.question, "question text"),
+    options,
+    multiSelect: question.multiSelect === true,
+    allowOther: true,
+    secret: false
+  };
+}
+function claudeQuestionContext(deferred) {
+  const rawQuestions = deferred.input.questions;
+  if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+    throw new Error("Malformed Claude AskUserQuestion input");
+  }
+  const questions = rawQuestions.map((value, index) => normalizeClaudeQuestion(value, deferred.id, index));
+  const answerKeys = rawQuestions.map((value) => {
+    const key = record(value)?.question;
+    if (typeof key !== "string" || !key.trim()) {
+      throw new Error("Malformed Claude AskUserQuestion question text");
+    }
+    return key;
+  });
+  const prompts = /* @__PURE__ */ new Set();
+  for (const question of questions) {
+    if (prompts.has(question.question)) {
+      throw new Error("Claude AskUserQuestion contains duplicate question text");
+    }
+    prompts.add(question.question);
+  }
+  return {
+    request: { requestId: deferred.id, questions },
+    updatedInput(response) {
+      const answers = {};
+      for (const [index, question] of questions.entries()) {
+        const values = response.answers[question.id];
+        if (!values || values.length === 0 || values.some((value) => typeof value !== "string")) {
+          throw new Error(`Missing answer for Claude question ${question.id}`);
+        }
+        if (!question.multiSelect && values.length !== 1) {
+          throw new Error(`Claude question ${question.id} accepts one answer`);
+        }
+        answers[answerKeys[index]] = question.multiSelect ? values.join(", ") : values[0];
+      }
+      return { ...deferred.input, questions: rawQuestions, answers };
+    }
+  };
+}
+function shellQuote(value) {
+  if (process.platform === "win32") return JSON.stringify(value);
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+function callerSettings(value, cwd) {
+  if (!value) return {};
+  const trimmed = value.trim();
+  let parsed;
+  try {
+    parsed = trimmed.startsWith("{") ? JSON.parse(trimmed) : JSON.parse(readFileSync(isAbsolute(value) ? value : resolvePath(cwd, value), "utf8"));
+  } catch (error) {
+    throw new Error(
+      `Unable to read Claude settings: ${error instanceof Error ? error.message : "invalid JSON"}`
+    );
+  }
+  const settings = record(parsed);
+  if (!settings) throw new Error("Claude settings must be a JSON object");
+  return settings;
+}
+function createClaudeHookFiles(opts) {
+  const directory = mkdtempSync(join(tmpdir(), "agent-cli-runner-claude-question-"));
+  try {
+    chmodSync(directory, 448);
+    const statePath = join(directory, "state.json");
+    const settingsPath = join(directory, "settings.json");
+    writeFileSync(statePath, JSON.stringify({ mode: "defer" }), { mode: 384 });
+    const settings = callerSettings(opts.settings, opts.cwd);
+    const existingHooks = settings.hooks === void 0 ? {} : record(settings.hooks);
+    if (!existingHooks) throw new Error("Claude settings hooks must be an object");
+    const preToolUse = existingHooks.PreToolUse === void 0 ? [] : existingHooks.PreToolUse;
+    if (!Array.isArray(preToolUse)) {
+      throw new Error("Claude settings PreToolUse hooks must be an array");
+    }
+    const hookScript = fileURLToPath(new URL("./claude-question-hook.js", import.meta.url));
+    const command = `${shellQuote(process.execPath)} ${shellQuote(hookScript)} ${shellQuote(statePath)}`;
+    const merged = {
+      ...settings,
+      hooks: {
+        ...existingHooks,
+        PreToolUse: [
+          ...preToolUse,
+          {
+            matcher: "AskUserQuestion",
+            hooks: [{ type: "command", command }]
+          }
+        ]
+      }
+    };
+    writeFileSync(settingsPath, JSON.stringify(merged), { mode: 384 });
+    return { directory, statePath, settingsPath };
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+function waitForUserInput(callback, signal, timeoutMs) {
+  if (signal?.aborted) {
+    void callback.catch(() => {
+    });
+    return Promise.reject(new AbortError("claude run aborted"));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const finish = (use) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      use();
+    };
+    const abort = () => finish(() => reject(new AbortError("claude run aborted")));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (timeoutMs !== void 0) {
+      timer = setTimeout(
+        () => finish(() => reject(new TimeoutError(`claude run timed out after ${timeoutMs}ms`))),
+        Math.max(0, timeoutMs)
+      );
+    }
+    callback.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error))
+    );
+  });
+}
+async function runClaudeProcess(opts) {
   if (opts.newSessionId && opts.resumeSessionId) {
     throw new Error(
       "newSessionId and resumeSessionId are mutually exclusive \u2014 pass one or the other"
@@ -360,6 +530,7 @@ async function runClaude(opts) {
     let sessionIdEmitted = false;
     let lastAssistantText;
     let resultText;
+    let deferredToolUse;
     let lastAssistantModel;
     let lastMessageUsage;
     let lastUsage;
@@ -476,6 +647,7 @@ async function runClaude(opts) {
           if (block.type === "text" && typeof block.text === "string") {
             texts.push(block.text);
           } else if (block.type === "tool_use" && typeof block.name === "string") {
+            if (block.name === "AskUserQuestion" && opts.onUserInputRequest) continue;
             if ((block.name === "Agent" || block.name === "Task") && typeof block.id === "string") {
               agentToolCallIds.add(block.id);
             }
@@ -521,6 +693,13 @@ async function runClaude(opts) {
       if (parsed.type === "result") {
         if (parsed.session_id) emitSessionId(parsed.session_id);
         if (typeof parsed.result === "string") resultText = parsed.result;
+        if (parsed.stop_reason === "tool_deferred" && parsed.deferred_tool_use?.name === "AskUserQuestion" && typeof parsed.deferred_tool_use.id === "string" && record(parsed.deferred_tool_use.input)) {
+          deferredToolUse = {
+            id: parsed.deferred_tool_use.id,
+            name: "AskUserQuestion",
+            input: parsed.deferred_tool_use.input
+          };
+        }
         const occupancy = lastMessageUsage ?? parsed.usage;
         if (occupancy) {
           const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
@@ -555,10 +734,158 @@ async function runClaude(opts) {
         text: (resultText ?? lastAssistantText ?? "").trim(),
         exitCode: code ?? -1,
         ...sessionId !== void 0 ? { sessionId } : {},
-        ...lastUsage !== void 0 ? { usage: lastUsage } : {}
+        ...lastUsage !== void 0 ? { usage: lastUsage } : {},
+        ...deferredToolUse ? { deferredToolUse } : {}
       });
     });
   });
+}
+var MINIMUM_QUESTION_VERSION = [2, 1, 89];
+var MAX_QUESTION_DEFERRALS = 64;
+function supportsNativeQuestions(version) {
+  for (let index = 0; index < MINIMUM_QUESTION_VERSION.length; index += 1) {
+    const actual = version[index] ?? 0;
+    const minimum = MINIMUM_QUESTION_VERSION[index];
+    if (actual !== minimum) return actual > minimum;
+  }
+  return true;
+}
+async function assertNativeQuestionSupport(opts, timeoutMs) {
+  const spawnFn = opts.spawnFn ?? nodeSpawn2;
+  const child = spawnFn(opts.executablePath ?? "claude", ["--version"], {
+    cwd: opts.cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS)
+  });
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    let output = "";
+    const lifecycle = watchLifecycle({
+      cli: "claude",
+      signal: opts.signal,
+      timeoutMs,
+      kill: (signal) => {
+        try {
+          child.kill(signal);
+        } catch {
+        }
+      }
+    });
+    child.stdout?.on("data", (chunk) => {
+      if (output.length < 256) output += chunk.toString().slice(0, 256 - output.length);
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      lifecycle.cleanup();
+      reject(isMissingExecutable(error) ? new MissingCliError("claude") : error);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      lifecycle.cleanup();
+      const interruption = lifecycle.interruptionError();
+      if (interruption) {
+        reject(interruption);
+        return;
+      }
+      const match = /(\d+)\.(\d+)\.(\d+)/.exec(output);
+      if (code !== 0 || !match) {
+        reject(new Error(
+          "Could not determine the Claude Code version required for native AskUserQuestion"
+        ));
+        return;
+      }
+      const version = match.slice(1, 4).map(Number);
+      if (!supportsNativeQuestions(version)) {
+        reject(new Error(
+          `Native AskUserQuestion requires Claude Code 2.1.89 or newer; found ${match[0]}`
+        ));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+async function runClaude(opts) {
+  if (opts.isolated && opts.onUserInputRequest) {
+    throw new Error("isolated Claude runs cannot request user input");
+  }
+  const startedAt = Date.now();
+  const deadline = opts.timeoutMs === void 0 ? void 0 : startedAt + opts.timeoutMs;
+  let hookFiles;
+  const {
+    newSessionId: _newSessionId,
+    resumeSessionId: _resumeSessionId,
+    settings: _settings,
+    timeoutMs: _timeoutMs,
+    prompt: _prompt,
+    onSessionId: _onSessionId,
+    ...shared
+  } = opts;
+  let prompt = opts.prompt;
+  let newSessionId = opts.newSessionId;
+  let resumeSessionId = opts.resumeSessionId;
+  let emittedSessionId;
+  let questionDeferrals = 0;
+  const remainingTimeout = () => {
+    if (deadline === void 0) return void 0;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new TimeoutError(`claude run timed out after ${opts.timeoutMs}ms`);
+    return remaining;
+  };
+  try {
+    if (opts.onUserInputRequest) {
+      await assertNativeQuestionSupport(opts, remainingTimeout());
+      hookFiles = createClaudeHookFiles(opts);
+    }
+    while (true) {
+      const timeoutMs = remainingTimeout();
+      const result = await runClaudeProcess({
+        ...shared,
+        prompt,
+        ...newSessionId ? { newSessionId } : {},
+        ...resumeSessionId ? { resumeSessionId } : {},
+        ...hookFiles ? { settings: hookFiles.settingsPath } : opts.settings ? { settings: opts.settings } : {},
+        ...timeoutMs !== void 0 ? { timeoutMs } : {},
+        onSessionId: (id) => {
+          if (emittedSessionId === id) return;
+          emittedSessionId = id;
+          opts.onSessionId?.(id);
+        }
+      });
+      if (!result.deferredToolUse) {
+        const { deferredToolUse: _deferred, ...runResult } = result;
+        return runResult;
+      }
+      if (!opts.onUserInputRequest || !hookFiles) {
+        throw new Error("Claude deferred AskUserQuestion without a user-input callback");
+      }
+      questionDeferrals += 1;
+      if (questionDeferrals > MAX_QUESTION_DEFERRALS) {
+        throw new Error(`Claude turn exceeded ${MAX_QUESTION_DEFERRALS} deferred questions`);
+      }
+      const sessionId = result.sessionId ?? emittedSessionId ?? resumeSessionId;
+      if (!sessionId) throw new Error("Claude deferred a question without a session ID");
+      const context = claudeQuestionContext(result.deferredToolUse);
+      const timeoutForInput = remainingTimeout();
+      const answer = await waitForUserInput(
+        opts.onUserInputRequest(context.request),
+        opts.signal,
+        timeoutForInput
+      );
+      writeFileSync(hookFiles.statePath, JSON.stringify({
+        mode: "answer",
+        toolUseId: result.deferredToolUse.id,
+        updatedInput: context.updatedInput(answer)
+      }), { mode: 384 });
+      prompt = "";
+      newSessionId = void 0;
+      resumeSessionId = sessionId;
+    }
+  } finally {
+    if (hookFiles) rmSync(hookFiles.directory, { recursive: true, force: true });
+  }
 }
 
 // src/run-codex.ts
@@ -607,7 +934,7 @@ async function createCodexAppServerClient(options) {
   }
   const pending = /* @__PURE__ */ new Map();
   const notificationHandlers = /* @__PURE__ */ new Set();
-  const serverRequestHandlers = /* @__PURE__ */ new Set();
+  const serverRequestHandlers = /* @__PURE__ */ new Map();
   const stderrHandlers = /* @__PURE__ */ new Set();
   const closeHandlers = /* @__PURE__ */ new Set();
   const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -646,26 +973,35 @@ async function createCodexAppServerClient(options) {
     const id = message.id;
     const method = message.method;
     if (typeof id !== "number" && typeof id !== "string" || typeof method !== "string") return;
-    const handler = serverRequestHandlers.values().next().value;
-    if (!handler) {
+    const handlers = serverRequestHandlers.get(method);
+    if (!handlers || handlers.size === 0) {
       send({
         id,
         error: { code: -32601, message: `Unsupported server request: ${method}` }
       });
       return;
     }
-    try {
-      const result = await handler({ id, method, params: message.params });
-      send({ id, result: result ?? null });
-    } catch (error) {
-      send({
-        id,
-        error: {
-          code: -32603,
-          message: error instanceof Error ? error.message : "Server request handler failed"
-        }
-      });
+    for (const handler of handlers) {
+      try {
+        const result = await handler({ id, method, params: message.params });
+        if (result === void 0) continue;
+        send({ id, result });
+        return;
+      } catch (error) {
+        send({
+          id,
+          error: {
+            code: -32603,
+            message: error instanceof Error ? error.message : "Server request handler failed"
+          }
+        });
+        return;
+      }
     }
+    send({
+      id,
+      error: { code: -32601, message: `Unsupported server request: ${method}` }
+    });
   };
   const handleLine = (line) => {
     let message;
@@ -739,9 +1075,14 @@ async function createCodexAppServerClient(options) {
       notificationHandlers.add(handler);
       return () => notificationHandlers.delete(handler);
     },
-    onServerRequest(handler) {
-      serverRequestHandlers.add(handler);
-      return () => serverRequestHandlers.delete(handler);
+    onServerRequest(method, handler) {
+      const handlers = serverRequestHandlers.get(method) ?? /* @__PURE__ */ new Set();
+      handlers.add(handler);
+      serverRequestHandlers.set(method, handlers);
+      return () => {
+        handlers.delete(handler);
+        if (handlers.size === 0) serverRequestHandlers.delete(method);
+      };
     },
     onStderr(handler) {
       stderrHandlers.add(handler);
@@ -783,11 +1124,76 @@ async function createCodexAppServerClient(options) {
     throw error;
   }
 }
-function record(value) {
+function record2(value) {
   return isRecord(value) ? value : void 0;
 }
 function text(value) {
   return typeof value === "string" && value.trim() ? value.trim() : void 0;
+}
+function codexUserInputQuestion(value) {
+  const question = record2(value);
+  const id = text(question?.id);
+  const header = text(question?.header);
+  const prompt = text(question?.question);
+  if (!question || !id || !header || !prompt) {
+    throw new Error("Malformed Codex user-input question");
+  }
+  const rawOptions = question.options;
+  if (rawOptions !== null && rawOptions !== void 0 && !Array.isArray(rawOptions)) {
+    throw new Error(`Malformed Codex options for question ${id}`);
+  }
+  const options = (rawOptions ?? []).map((value2) => {
+    const option = record2(value2);
+    const label = text(option?.label);
+    if (!option || !label) throw new Error(`Malformed Codex option for question ${id}`);
+    if (option.description !== void 0 && option.description !== null && typeof option.description !== "string") {
+      throw new Error(`Malformed Codex option for question ${id}`);
+    }
+    const description = text(option.description);
+    return { label, ...description ? { description } : {} };
+  });
+  if (question.isOther !== void 0 && typeof question.isOther !== "boolean") {
+    throw new Error(`Malformed Codex isOther for question ${id}`);
+  }
+  if (question.isSecret !== void 0 && typeof question.isSecret !== "boolean") {
+    throw new Error(`Malformed Codex isSecret for question ${id}`);
+  }
+  return {
+    id,
+    header,
+    question: prompt,
+    options,
+    multiSelect: false,
+    allowOther: question.isOther === true,
+    secret: question.isSecret === true
+  };
+}
+function codexUserInputRequest(value) {
+  const params = record2(value);
+  const threadId = text(params?.threadId);
+  const turnId = text(params?.turnId);
+  const requestId = text(params?.itemId);
+  if (!params || !threadId || !turnId || !requestId || !Array.isArray(params.questions)) {
+    throw new Error("Malformed Codex user-input request");
+  }
+  const questions = params.questions.map(codexUserInputQuestion);
+  if (questions.length === 0) throw new Error("Codex user-input request has no questions");
+  if (new Set(questions.map(({ id }) => id)).size !== questions.length) {
+    throw new Error("Codex user-input request has duplicate question IDs");
+  }
+  const autoResolutionMs = params.autoResolutionMs;
+  if (autoResolutionMs !== void 0 && autoResolutionMs !== null && (!Number.isSafeInteger(autoResolutionMs) || autoResolutionMs < 0)) {
+    throw new Error("Malformed Codex user-input auto-resolution timeout");
+  }
+  return {
+    threadId,
+    turnId,
+    request: {
+      requestId,
+      questions,
+      ...typeof autoResolutionMs === "number" ? { autoResolutionMs } : {}
+    }
+  };
 }
 function property(item, camel, snake) {
   return item[camel] ?? item[snake];
@@ -796,7 +1202,7 @@ function itemType(item) {
   return text(item.type);
 }
 function webAction(item) {
-  return record(item.action);
+  return record2(item.action);
 }
 function webActionType(item) {
   const type = text(webAction(item)?.type);
@@ -834,7 +1240,7 @@ function toolName(item) {
 function webSearchQuery(item) {
   const direct = normalizeSummary(item.query);
   if (direct) return direct;
-  const action = record(item.action);
+  const action = record2(item.action);
   const query = normalizeSummary(action?.query);
   if (query) return query;
   if (!Array.isArray(action?.queries)) return void 0;
@@ -891,7 +1297,7 @@ function summarizeTool(item) {
     case "file_change": {
       if (!Array.isArray(item.changes)) return void 0;
       const paths = item.changes.flatMap((change) => {
-        const path = normalizeSummary(record(change)?.path);
+        const path = normalizeSummary(record2(change)?.path);
         return path ? [path] : [];
       });
       if (paths.length === 1) return paths[0];
@@ -924,7 +1330,7 @@ function rawResponseOutputText(item) {
   if (typeof item.output === "string") return text(item.output);
   if (!Array.isArray(item.output)) return void 0;
   const parts = item.output.flatMap((part) => {
-    const value = text(record(part)?.text);
+    const value = text(record2(part)?.text);
     return value ? [value] : [];
   });
   return parts.length > 0 ? parts.join("\n") : void 0;
@@ -966,7 +1372,7 @@ function planItems(value) {
   if (!Array.isArray(value)) return void 0;
   const items = [];
   for (const raw of value) {
-    const step = record(raw);
+    const step = record2(raw);
     const itemText = normalizeSummary(step?.step ?? step?.text);
     const status = normalizePlanStatus(step?.status);
     if (!itemText || !status) return void 0;
@@ -1012,8 +1418,8 @@ function terminalBackgroundStatus(status) {
 }
 function toUsage(params, threadId, turnId, model, fallbackWindow) {
   if (params.threadId !== threadId || params.turnId !== turnId) return void 0;
-  const tokenUsage = record(params.tokenUsage);
-  const last = record(tokenUsage?.last);
+  const tokenUsage = record2(params.tokenUsage);
+  const last = record2(tokenUsage?.last);
   if (!last) return void 0;
   const used = toTokenCount(last.totalTokens);
   if (used <= 0) return void 0;
@@ -1030,13 +1436,13 @@ function toUsage(params, threadId, turnId, model, fallbackWindow) {
   };
 }
 function threadIdFrom(value) {
-  return text(record(record(value)?.thread)?.id);
+  return text(record2(record2(value)?.thread)?.id);
 }
 function turnIdFrom(value) {
-  return text(record(record(value)?.turn)?.id);
+  return text(record2(record2(value)?.turn)?.id);
 }
 function turnStatus(value) {
-  return text(record(record(value)?.turn)?.status);
+  return text(record2(record2(value)?.turn)?.status);
 }
 function requestCodexThread(client, opts) {
   return opts.resumeSessionId ? client.request("thread/resume", {
@@ -1056,7 +1462,7 @@ function requestCodexThread(client, opts) {
 function openedCodexThread(value, fallbackModel) {
   const threadId = threadIdFrom(value);
   if (!threadId) throw new CodexTurnError("Codex app-server did not return a thread ID");
-  const model = text(record(value)?.model) ?? fallbackModel;
+  const model = text(record2(value)?.model) ?? fallbackModel;
   return { threadId, ...model ? { model } : {} };
 }
 async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false, continuity) {
@@ -1174,7 +1580,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     for (const id of [...pendingWebTools.keys()]) emitPendingWebTool(id, true);
   };
   const handleRawResponseItem = (params) => {
-    const item = record(params.item);
+    const item = record2(params.item);
     if (!item) return;
     const rawCall = singleRawWebCall(item);
     if (rawCall) {
@@ -1202,13 +1608,13 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (type !== "collabAgentToolCall" && type !== "collab_tool_call") return;
     const tool = text(item.tool);
     const isSpawn = tool === "spawnAgent" || tool === "spawn_agent";
-    const states = record(property(item, "agentsStates", "agents_states")) ?? {};
+    const states = record2(property(item, "agentsStates", "agents_states")) ?? {};
     const rawReceiverIds = property(item, "receiverThreadIds", "receiver_thread_ids");
     const receiverIds = Array.isArray(rawReceiverIds) ? rawReceiverIds.filter((id) => typeof id === "string") : [];
     for (const id of /* @__PURE__ */ new Set([...receiverIds, ...Object.keys(states)])) {
       const current = backgroundAgents.get(id);
       if (!current && !isSpawn) continue;
-      const state = record(states[id]);
+      const state = record2(states[id]);
       const status = backgroundStatus(state?.status) ?? current?.status ?? "pending";
       const message = text(state?.message);
       const itemId = text(item.id);
@@ -1239,7 +1645,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (!eventTurnId || isPreviousTurn(eventTurnId)) return;
     turnId ??= eventTurnId;
     if (turnId !== eventTurnId) return;
-    const item = record(params.item);
+    const item = record2(params.item);
     if (!item) return;
     const occurredAt = typeof params.startedAtMs === "number" ? params.startedAtMs : typeof params.completedAtMs === "number" ? params.completedAtMs : Date.now();
     updateBackgroundAgents(item, occurredAt);
@@ -1270,11 +1676,30 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     emitToolUse(id, item);
     if (method === "item/completed") emitToolResult(id, item);
   };
+  const removeUserInputRequest = opts.onUserInputRequest ? client.onServerRequest("item/tool/requestUserInput", async ({ params: rawParams }) => {
+    const rawRecord = record2(rawParams);
+    if (!rawRecord || rawRecord.threadId !== threadId) return void 0;
+    const normalized = codexUserInputRequest(rawParams);
+    if (isPreviousTurn(normalized.turnId)) return void 0;
+    if (turnId && normalized.turnId !== turnId) return void 0;
+    turnId ??= normalized.turnId;
+    const response = await raceLifecycle(opts.onUserInputRequest(normalized.request));
+    const questionIds = new Set(normalized.request.questions.map(({ id }) => id));
+    const answers = {};
+    for (const [questionId, values] of Object.entries(response.answers)) {
+      if (!questionIds.has(questionId) || !Array.isArray(values)) continue;
+      answers[questionId] = {
+        answers: values.filter((value) => typeof value === "string")
+      };
+    }
+    return { answers };
+  }) : () => {
+  };
   const removeNotification = client.onNotification((method, rawParams) => {
-    const params = record(rawParams);
+    const params = record2(rawParams);
     if (!params) return;
     if (method === "turn/started" && params.threadId === threadId) {
-      const startedTurnId = text(record(params.turn)?.id);
+      const startedTurnId = text(record2(params.turn)?.id);
       if (startedTurnId && !isPreviousTurn(startedTurnId)) turnId ??= startedTurnId;
       if (interruption) requestInterrupt();
       return;
@@ -1324,12 +1749,12 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (method === "error" && params.threadId === threadId) {
       if (params.willRetry === true) return;
       flushPendingWebTools();
-      const message2 = text(record(params.error)?.message) ?? "Codex turn failed";
+      const message2 = text(record2(params.error)?.message) ?? "Codex turn failed";
       settleError(new CodexTurnError(`Codex error: ${message2}`));
       return;
     }
     if (method !== "turn/completed" || params.threadId !== threadId) return;
-    const completedTurnId = text(record(params.turn)?.id);
+    const completedTurnId = text(record2(params.turn)?.id);
     if (!completedTurnId || isPreviousTurn(completedTurnId) || turnId && completedTurnId !== turnId) {
       return;
     }
@@ -1339,7 +1764,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
       failLifecycle(interruption);
       return;
     }
-    const status = text(record(params.turn)?.status);
+    const status = text(record2(params.turn)?.status);
     if (status === "completed") {
       if (!settled) {
         settled = true;
@@ -1347,7 +1772,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
       }
       return;
     }
-    const message = text(record(record(params.turn)?.error)?.message) ?? `Codex turn ${status ?? "failed"}`;
+    const message = text(record2(record2(params.turn)?.error)?.message) ?? `Codex turn ${status ?? "failed"}`;
     settleError(new CodexTurnError(message));
   });
   const removeClose = client.onClose((error) => settleError(error));
@@ -1403,6 +1828,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     flushPendingWebTools();
     opts.signal?.removeEventListener("abort", abortHandler);
     removeNotification();
+    removeUserInputRequest();
     removeClose();
     removeStderr();
     const finishedTurnId = turnId;

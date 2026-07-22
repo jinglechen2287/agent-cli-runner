@@ -17,6 +17,8 @@ import type {
   RunResult,
   ToolPlanItem,
   ToolUseInfo,
+  UserInputQuestion,
+  UserInputRequest,
 } from "./types.js";
 import type { TokenUsage } from "./usage.js";
 
@@ -52,7 +54,10 @@ export interface CodexAppServerClient {
   ): Promise<unknown>;
   notify(method: string, params?: unknown): void;
   onNotification(handler: (method: string, params: unknown) => void): () => void;
-  onServerRequest(handler: CodexServerRequestHandler): () => void;
+  /** Register a handler for one server-initiated RPC method. Returning
+   * undefined leaves the request available to another handler (used when one
+   * client multiplexes several threads). */
+  onServerRequest(method: string, handler: CodexServerRequestHandler): () => void;
   onStderr(handler: (chunk: string) => void): () => void;
   onClose(handler: (error: Error) => void): () => void;
   close(): void;
@@ -153,7 +158,7 @@ export async function createCodexAppServerClient(
 
   const pending = new Map<number, PendingRequest>();
   const notificationHandlers = new Set<(method: string, params: unknown) => void>();
-  const serverRequestHandlers = new Set<CodexServerRequestHandler>();
+  const serverRequestHandlers = new Map<string, Set<CodexServerRequestHandler>>();
   const stderrHandlers = new Set<(chunk: string) => void>();
   const closeHandlers = new Set<(error: Error) => void>();
   const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -195,28 +200,35 @@ export async function createCodexAppServerClient(
     const id = message.id;
     const method = message.method;
     if ((typeof id !== "number" && typeof id !== "string") || typeof method !== "string") return;
-    const handler = serverRequestHandlers.values().next().value as
-      | CodexServerRequestHandler
-      | undefined;
-    if (!handler) {
+    const handlers = serverRequestHandlers.get(method);
+    if (!handlers || handlers.size === 0) {
       send({
         id,
         error: { code: -32601, message: `Unsupported server request: ${method}` },
       });
       return;
     }
-    try {
-      const result = await handler({ id, method, params: message.params });
-      send({ id, result: result ?? null });
-    } catch (error) {
-      send({
-        id,
-        error: {
-          code: -32603,
-          message: error instanceof Error ? error.message : "Server request handler failed",
-        },
-      });
+    for (const handler of handlers) {
+      try {
+        const result = await handler({ id, method, params: message.params });
+        if (result === undefined) continue;
+        send({ id, result });
+        return;
+      } catch (error) {
+        send({
+          id,
+          error: {
+            code: -32603,
+            message: error instanceof Error ? error.message : "Server request handler failed",
+          },
+        });
+        return;
+      }
     }
+    send({
+      id,
+      error: { code: -32601, message: `Unsupported server request: ${method}` },
+    });
   };
 
   const handleLine = (line: string): void => {
@@ -294,9 +306,14 @@ export async function createCodexAppServerClient(
       notificationHandlers.add(handler);
       return () => notificationHandlers.delete(handler);
     },
-    onServerRequest(handler) {
-      serverRequestHandlers.add(handler);
-      return () => serverRequestHandlers.delete(handler);
+    onServerRequest(method, handler) {
+      const handlers = serverRequestHandlers.get(method) ?? new Set<CodexServerRequestHandler>();
+      handlers.add(handler);
+      serverRequestHandlers.set(method, handlers);
+      return () => {
+        handlers.delete(handler);
+        if (handlers.size === 0) serverRequestHandlers.delete(method);
+      };
     },
     onStderr(handler) {
       stderrHandlers.add(handler);
@@ -345,6 +362,85 @@ function record(value: unknown): Record<string, unknown> | undefined {
 
 function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function codexUserInputQuestion(value: unknown): UserInputQuestion {
+  const question = record(value);
+  const id = text(question?.id);
+  const header = text(question?.header);
+  const prompt = text(question?.question);
+  if (!question || !id || !header || !prompt) {
+    throw new Error("Malformed Codex user-input question");
+  }
+  const rawOptions = question.options;
+  if (rawOptions !== null && rawOptions !== undefined && !Array.isArray(rawOptions)) {
+    throw new Error(`Malformed Codex options for question ${id}`);
+  }
+  const options = (rawOptions ?? []).map((value) => {
+    const option = record(value);
+    const label = text(option?.label);
+    if (!option || !label) throw new Error(`Malformed Codex option for question ${id}`);
+    if (
+      option.description !== undefined
+      && option.description !== null
+      && typeof option.description !== "string"
+    ) {
+      throw new Error(`Malformed Codex option for question ${id}`);
+    }
+    const description = text(option.description);
+    return { label, ...(description ? { description } : {}) };
+  });
+  if (question.isOther !== undefined && typeof question.isOther !== "boolean") {
+    throw new Error(`Malformed Codex isOther for question ${id}`);
+  }
+  if (question.isSecret !== undefined && typeof question.isSecret !== "boolean") {
+    throw new Error(`Malformed Codex isSecret for question ${id}`);
+  }
+  return {
+    id,
+    header,
+    question: prompt,
+    options,
+    multiSelect: false,
+    allowOther: question.isOther === true,
+    secret: question.isSecret === true,
+  };
+}
+
+function codexUserInputRequest(value: unknown): {
+  threadId: string;
+  turnId: string;
+  request: UserInputRequest;
+} {
+  const params = record(value);
+  const threadId = text(params?.threadId);
+  const turnId = text(params?.turnId);
+  const requestId = text(params?.itemId);
+  if (!params || !threadId || !turnId || !requestId || !Array.isArray(params.questions)) {
+    throw new Error("Malformed Codex user-input request");
+  }
+  const questions = params.questions.map(codexUserInputQuestion);
+  if (questions.length === 0) throw new Error("Codex user-input request has no questions");
+  if (new Set(questions.map(({ id }) => id)).size !== questions.length) {
+    throw new Error("Codex user-input request has duplicate question IDs");
+  }
+  const autoResolutionMs = params.autoResolutionMs;
+  if (
+    autoResolutionMs !== undefined
+    && autoResolutionMs !== null
+    && (!Number.isSafeInteger(autoResolutionMs) || (autoResolutionMs as number) < 0)
+  ) {
+    throw new Error("Malformed Codex user-input auto-resolution timeout");
+  }
+  return {
+    threadId,
+    turnId,
+    request: {
+      requestId,
+      questions,
+      ...(typeof autoResolutionMs === "number" ? { autoResolutionMs } : {}),
+    },
+  };
 }
 
 function property(item: Record<string, unknown>, camel: string, snake: string): unknown {
@@ -958,6 +1054,27 @@ async function runCodexAppServerTurn(
     if (method === "item/completed") emitToolResult(id, item);
   };
 
+  const removeUserInputRequest = opts.onUserInputRequest
+    ? client.onServerRequest("item/tool/requestUserInput", async ({ params: rawParams }) => {
+        const rawRecord = record(rawParams);
+        if (!rawRecord || rawRecord.threadId !== threadId) return undefined;
+        const normalized = codexUserInputRequest(rawParams);
+        if (isPreviousTurn(normalized.turnId)) return undefined;
+        if (turnId && normalized.turnId !== turnId) return undefined;
+        turnId ??= normalized.turnId;
+        const response = await raceLifecycle(opts.onUserInputRequest!(normalized.request));
+        const questionIds = new Set(normalized.request.questions.map(({ id }) => id));
+        const answers: Record<string, { answers: string[] }> = {};
+        for (const [questionId, values] of Object.entries(response.answers)) {
+          if (!questionIds.has(questionId) || !Array.isArray(values)) continue;
+          answers[questionId] = {
+            answers: values.filter((value): value is string => typeof value === "string"),
+          };
+        }
+        return { answers };
+      })
+    : () => {};
+
   const removeNotification = client.onNotification((method, rawParams) => {
     const params = record(rawParams);
     if (!params) return;
@@ -1108,6 +1225,7 @@ async function runCodexAppServerTurn(
     flushPendingWebTools();
     opts.signal?.removeEventListener("abort", abortHandler);
     removeNotification();
+    removeUserInputRequest();
     removeClose();
     removeStderr();
     const finishedTurnId = turnId;

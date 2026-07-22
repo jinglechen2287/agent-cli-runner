@@ -81,6 +81,32 @@ interface ToolResultInfo {
     content: unknown;
     isError?: boolean;
 }
+/** One selectable answer supplied by a provider-native question tool. */
+interface UserInputOption {
+    label: string;
+    /** Explanatory copy shown next to the label when the provider supplies it. */
+    description?: string;
+}
+/** One provider-native question normalized for a host UI. */
+interface UserInputQuestion {
+    id: string;
+    header: string;
+    question: string;
+    options: UserInputOption[];
+    multiSelect: boolean;
+    allowOther: boolean;
+    secret: boolean;
+}
+/** A question-tool invocation that pauses the current provider turn. */
+interface UserInputRequest {
+    requestId: string;
+    questions: UserInputQuestion[];
+    autoResolutionMs?: number;
+}
+/** Answers keyed by normalized question id. */
+interface UserInputResponse {
+    answers: Record<string, string[]>;
+}
 /** One provider-normalized item from a Codex plan/todo snapshot. */
 interface ToolPlanItem {
     text: string;
@@ -131,6 +157,8 @@ interface AgentCallbacks {
     onToolUse?: (info: ToolUseInfo) => void;
     /** Fired when the provider reports the result for a tool invocation. */
     onToolResult?: (info: ToolResultInfo) => void;
+    /** Fired when the provider pauses the current turn for structured user input. */
+    onUserInputRequest?: (request: UserInputRequest) => Promise<UserInputResponse>;
     /** Fired whenever a background subagent starts, progresses, or finishes.
      * Repeated calls with the same id are replace-in-place snapshots. */
     onBackgroundAgentUpdate?: (info: BackgroundAgentInfo) => void;
@@ -215,8 +243,8 @@ interface RunClaudeOptions extends CommonRunOptions {
      * disabled. Intended for small metadata tasks such as chat titles. */
     isolated?: boolean;
 }
-/** Spawn a non-interactive Claude Code CLI turn (`claude -p` with stream-json
- * output) and translate its JSONL stream into callbacks plus a final result. */
+/** Run one logical Claude turn. Native questions may stop and resume several
+ * `claude -p` processes, but hosts see one callback stream and one result. */
 declare function runClaude(opts: RunClaudeOptions): Promise<RunResult>;
 
 interface CodexServerRequest {
@@ -229,7 +257,10 @@ interface CodexAppServerClient {
     request(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
     notify(method: string, params?: unknown): void;
     onNotification(handler: (method: string, params: unknown) => void): () => void;
-    onServerRequest(handler: CodexServerRequestHandler): () => void;
+    /** Register a handler for one server-initiated RPC method. Returning
+     * undefined leaves the request available to another handler (used when one
+     * client multiplexes several threads). */
+    onServerRequest(method: string, handler: CodexServerRequestHandler): () => void;
     onStderr(handler: (chunk: string) => void): () => void;
     onClose(handler: (error: Error) => void): () => void;
     close(): void;
@@ -341,4 +372,4 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, type UserInputOption, type UserInputQuestion, type UserInputRequest, type UserInputResponse, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, runClaude, runCodex };

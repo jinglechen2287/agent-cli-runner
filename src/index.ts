@@ -32,6 +32,10 @@ export type {
   ToolResultInfo,
   ToolPlanItem,
   ToolUseInfo,
+  UserInputOption,
+  UserInputQuestion,
+  UserInputRequest,
+  UserInputResponse,
 } from "./types.js";
 export {
   contextWindowForModel,

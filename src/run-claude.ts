@@ -1,5 +1,15 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import { MissingCliError } from "./errors.js";
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
+import { AbortError, MissingCliError, TimeoutError } from "./errors.js";
 import {
   createLineSplitter,
   filterEnv,
@@ -16,6 +26,9 @@ import type {
   CommonRunOptions,
   RunResult,
   ToolPlanItem,
+  UserInputQuestion,
+  UserInputRequest,
+  UserInputResponse,
 } from "./types.js";
 import { contextWindowForModel, type TokenUsage } from "./usage.js";
 
@@ -207,6 +220,12 @@ interface StreamLine {
    * spawned it. Null/absent on the parent turn's own output. */
   parent_tool_use_id?: string | null;
   result?: string;
+  stop_reason?: string;
+  deferred_tool_use?: {
+    id?: unknown;
+    name?: unknown;
+    input?: unknown;
+  };
   message?: { content?: ClaudeContentBlock[]; usage?: ClaudeUsage; model?: string };
   usage?: ClaudeUsage;
   modelUsage?: Record<string, ClaudeModelUsage>;
@@ -289,9 +308,219 @@ function pickPrimaryModel(
   return { model: best[0], contextWindow: toContextWindow(best[1].contextWindow) };
 }
 
+interface ClaudeDeferredToolUse {
+  id: string;
+  name: "AskUserQuestion";
+  input: Record<string, unknown>;
+}
+
+interface ClaudeProcessResult extends RunResult {
+  deferredToolUse?: ClaudeDeferredToolUse;
+}
+
+interface ClaudeQuestionContext {
+  request: UserInputRequest;
+  updatedInput(response: UserInputResponse): Record<string, unknown>;
+}
+
+interface ClaudeHookFiles {
+  directory: string;
+  statePath: string;
+  settingsPath: string;
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function requiredText(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`Malformed Claude AskUserQuestion ${field}`);
+  }
+  return value.trim();
+}
+
+function normalizeClaudeQuestion(
+  value: unknown,
+  toolUseId: string,
+  index: number,
+): UserInputQuestion {
+  const question = record(value);
+  if (!question || !Array.isArray(question.options)) {
+    throw new Error("Malformed Claude AskUserQuestion question");
+  }
+  const options = question.options.map((value) => {
+    const option = record(value);
+    if (!option) throw new Error("Malformed Claude AskUserQuestion option");
+    const label = requiredText(option.label, "option label");
+    if (
+      option.description !== undefined
+      && option.description !== null
+      && typeof option.description !== "string"
+    ) {
+      throw new Error("Malformed Claude AskUserQuestion option description");
+    }
+    const description = typeof option.description === "string"
+      ? option.description.trim()
+      : "";
+    return { label, ...(description ? { description } : {}) };
+  });
+  if (question.multiSelect !== undefined && typeof question.multiSelect !== "boolean") {
+    throw new Error("Malformed Claude AskUserQuestion multiSelect");
+  }
+  return {
+    id: `${toolUseId}:${index}`,
+    header: requiredText(question.header, "header"),
+    question: requiredText(question.question, "question text"),
+    options,
+    multiSelect: question.multiSelect === true,
+    allowOther: true,
+    secret: false,
+  };
+}
+
+function claudeQuestionContext(deferred: ClaudeDeferredToolUse): ClaudeQuestionContext {
+  const rawQuestions = deferred.input.questions;
+  if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+    throw new Error("Malformed Claude AskUserQuestion input");
+  }
+  const questions = rawQuestions.map((value, index) =>
+    normalizeClaudeQuestion(value, deferred.id, index));
+  const answerKeys = rawQuestions.map((value) => {
+    const key = record(value)?.question;
+    if (typeof key !== "string" || !key.trim()) {
+      throw new Error("Malformed Claude AskUserQuestion question text");
+    }
+    return key;
+  });
+  const prompts = new Set<string>();
+  for (const question of questions) {
+    if (prompts.has(question.question)) {
+      throw new Error("Claude AskUserQuestion contains duplicate question text");
+    }
+    prompts.add(question.question);
+  }
+  return {
+    request: { requestId: deferred.id, questions },
+    updatedInput(response) {
+      const answers: Record<string, string> = {};
+      for (const [index, question] of questions.entries()) {
+        const values = response.answers[question.id];
+        if (!values || values.length === 0 || values.some((value) => typeof value !== "string")) {
+          throw new Error(`Missing answer for Claude question ${question.id}`);
+        }
+        if (!question.multiSelect && values.length !== 1) {
+          throw new Error(`Claude question ${question.id} accepts one answer`);
+        }
+        answers[answerKeys[index]!] = question.multiSelect
+          ? values.join(", ")
+          : values[0] as string;
+      }
+      return { ...deferred.input, questions: rawQuestions, answers };
+    },
+  };
+}
+
+function shellQuote(value: string): string {
+  if (process.platform === "win32") return JSON.stringify(value);
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function callerSettings(value: string | undefined, cwd: string): Record<string, unknown> {
+  if (!value) return {};
+  const trimmed = value.trim();
+  let parsed: unknown;
+  try {
+    parsed = trimmed.startsWith("{")
+      ? JSON.parse(trimmed)
+      : JSON.parse(readFileSync(isAbsolute(value) ? value : resolvePath(cwd, value), "utf8"));
+  } catch (error) {
+    throw new Error(
+      `Unable to read Claude settings: ${error instanceof Error ? error.message : "invalid JSON"}`,
+    );
+  }
+  const settings = record(parsed);
+  if (!settings) throw new Error("Claude settings must be a JSON object");
+  return settings;
+}
+
+function createClaudeHookFiles(opts: RunClaudeOptions): ClaudeHookFiles {
+  const directory = mkdtempSync(join(tmpdir(), "agent-cli-runner-claude-question-"));
+  try {
+    chmodSync(directory, 0o700);
+    const statePath = join(directory, "state.json");
+    const settingsPath = join(directory, "settings.json");
+    writeFileSync(statePath, JSON.stringify({ mode: "defer" }), { mode: 0o600 });
+
+    const settings = callerSettings(opts.settings, opts.cwd);
+    const existingHooks = settings.hooks === undefined ? {} : record(settings.hooks);
+    if (!existingHooks) throw new Error("Claude settings hooks must be an object");
+    const preToolUse = existingHooks.PreToolUse === undefined ? [] : existingHooks.PreToolUse;
+    if (!Array.isArray(preToolUse)) {
+      throw new Error("Claude settings PreToolUse hooks must be an array");
+    }
+    const hookScript = fileURLToPath(new URL("./claude-question-hook.js", import.meta.url));
+    const command = `${shellQuote(process.execPath)} ${shellQuote(hookScript)} ${shellQuote(statePath)}`;
+    const merged = {
+      ...settings,
+      hooks: {
+        ...existingHooks,
+        PreToolUse: [
+          ...preToolUse,
+          {
+            matcher: "AskUserQuestion",
+            hooks: [{ type: "command", command }],
+          },
+        ],
+      },
+    };
+    writeFileSync(settingsPath, JSON.stringify(merged), { mode: 0o600 });
+    return { directory, statePath, settingsPath };
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function waitForUserInput(
+  callback: Promise<UserInputResponse>,
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): Promise<UserInputResponse> {
+  if (signal?.aborted) {
+    void callback.catch(() => {});
+    return Promise.reject(new AbortError("claude run aborted"));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (use: () => void): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      use();
+    };
+    const abort = (): void => finish(() => reject(new AbortError("claude run aborted")));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(
+        () => finish(() => reject(new TimeoutError(`claude run timed out after ${timeoutMs}ms`))),
+        Math.max(0, timeoutMs),
+      );
+    }
+    callback.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    );
+  });
+}
+
 /** Spawn a non-interactive Claude Code CLI turn (`claude -p` with stream-json
  * output) and translate its JSONL stream into callbacks plus a final result. */
-export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
+async function runClaudeProcess(opts: RunClaudeOptions): Promise<ClaudeProcessResult> {
   if (opts.newSessionId && opts.resumeSessionId) {
     throw new Error(
       "newSessionId and resumeSessionId are mutually exclusive — pass one or the other",
@@ -364,6 +593,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     let sessionIdEmitted = false;
     let lastAssistantText: string | undefined;
     let resultText: string | undefined;
+    let deferredToolUse: ClaudeDeferredToolUse | undefined;
     let lastAssistantModel: string | undefined;
     let lastMessageUsage: ClaudeUsage | undefined;
     let lastUsage: TokenUsage | undefined;
@@ -524,6 +754,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
           if (block.type === "text" && typeof block.text === "string") {
             texts.push(block.text);
           } else if (block.type === "tool_use" && typeof block.name === "string") {
+            if (block.name === "AskUserQuestion" && opts.onUserInputRequest) continue;
             if (
               (block.name === "Agent" || block.name === "Task")
               && typeof block.id === "string"
@@ -579,6 +810,18 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
       if (parsed.type === "result") {
         if (parsed.session_id) emitSessionId(parsed.session_id);
         if (typeof parsed.result === "string") resultText = parsed.result;
+        if (
+          parsed.stop_reason === "tool_deferred"
+          && parsed.deferred_tool_use?.name === "AskUserQuestion"
+          && typeof parsed.deferred_tool_use.id === "string"
+          && record(parsed.deferred_tool_use.input)
+        ) {
+          deferredToolUse = {
+            id: parsed.deferred_tool_use.id,
+            name: "AskUserQuestion",
+            input: parsed.deferred_tool_use.input as Record<string, unknown>,
+          };
+        }
         // The result event's usage sums every request in the turn, so it does
         // not describe context occupancy on a multi-request turn — the last
         // per-message usage does. Take only the authoritative model/window
@@ -623,7 +866,166 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
         exitCode: code ?? -1,
         ...(sessionId !== undefined ? { sessionId } : {}),
         ...(lastUsage !== undefined ? { usage: lastUsage } : {}),
+        ...(deferredToolUse ? { deferredToolUse } : {}),
       });
     });
   });
+}
+
+const MINIMUM_QUESTION_VERSION = [2, 1, 89] as const;
+const MAX_QUESTION_DEFERRALS = 64;
+
+function supportsNativeQuestions(version: readonly number[]): boolean {
+  for (let index = 0; index < MINIMUM_QUESTION_VERSION.length; index += 1) {
+    const actual = version[index] ?? 0;
+    const minimum = MINIMUM_QUESTION_VERSION[index]!;
+    if (actual !== minimum) return actual > minimum;
+  }
+  return true;
+}
+
+async function assertNativeQuestionSupport(
+  opts: RunClaudeOptions,
+  timeoutMs: number | undefined,
+): Promise<void> {
+  const spawnFn = opts.spawnFn ?? nodeSpawn;
+  const child = spawnFn(opts.executablePath ?? "claude", ["--version"], {
+    cwd: opts.cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
+  });
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let output = "";
+    const lifecycle = watchLifecycle({
+      cli: "claude",
+      signal: opts.signal,
+      timeoutMs,
+      kill: (signal) => {
+        try {
+          child.kill(signal);
+        } catch {
+          // The version process may already have exited.
+        }
+      },
+    });
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      if (output.length < 256) output += chunk.toString().slice(0, 256 - output.length);
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      lifecycle.cleanup();
+      reject(isMissingExecutable(error) ? new MissingCliError("claude") : error);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      lifecycle.cleanup();
+      const interruption = lifecycle.interruptionError();
+      if (interruption) {
+        reject(interruption);
+        return;
+      }
+      const match = /(\d+)\.(\d+)\.(\d+)/.exec(output);
+      if (code !== 0 || !match) {
+        reject(new Error(
+          "Could not determine the Claude Code version required for native AskUserQuestion",
+        ));
+        return;
+      }
+      const version = match.slice(1, 4).map(Number);
+      if (!supportsNativeQuestions(version)) {
+        reject(new Error(
+          `Native AskUserQuestion requires Claude Code 2.1.89 or newer; found ${match[0]}`,
+        ));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+/** Run one logical Claude turn. Native questions may stop and resume several
+ * `claude -p` processes, but hosts see one callback stream and one result. */
+export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
+  if (opts.isolated && opts.onUserInputRequest) {
+    throw new Error("isolated Claude runs cannot request user input");
+  }
+  const startedAt = Date.now();
+  const deadline = opts.timeoutMs === undefined ? undefined : startedAt + opts.timeoutMs;
+  let hookFiles: ClaudeHookFiles | undefined;
+  const {
+    newSessionId: _newSessionId,
+    resumeSessionId: _resumeSessionId,
+    settings: _settings,
+    timeoutMs: _timeoutMs,
+    prompt: _prompt,
+    onSessionId: _onSessionId,
+    ...shared
+  } = opts;
+  let prompt = opts.prompt;
+  let newSessionId = opts.newSessionId;
+  let resumeSessionId = opts.resumeSessionId;
+  let emittedSessionId: string | undefined;
+  let questionDeferrals = 0;
+  const remainingTimeout = (): number | undefined => {
+    if (deadline === undefined) return undefined;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new TimeoutError(`claude run timed out after ${opts.timeoutMs}ms`);
+    return remaining;
+  };
+
+  try {
+    if (opts.onUserInputRequest) {
+      await assertNativeQuestionSupport(opts, remainingTimeout());
+      hookFiles = createClaudeHookFiles(opts);
+    }
+    while (true) {
+      const timeoutMs = remainingTimeout();
+      const result = await runClaudeProcess({
+        ...shared,
+        prompt,
+        ...(newSessionId ? { newSessionId } : {}),
+        ...(resumeSessionId ? { resumeSessionId } : {}),
+        ...(hookFiles ? { settings: hookFiles.settingsPath } : opts.settings ? { settings: opts.settings } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        onSessionId: (id) => {
+          if (emittedSessionId === id) return;
+          emittedSessionId = id;
+          opts.onSessionId?.(id);
+        },
+      });
+      if (!result.deferredToolUse) {
+        const { deferredToolUse: _deferred, ...runResult } = result;
+        return runResult;
+      }
+      if (!opts.onUserInputRequest || !hookFiles) {
+        throw new Error("Claude deferred AskUserQuestion without a user-input callback");
+      }
+      questionDeferrals += 1;
+      if (questionDeferrals > MAX_QUESTION_DEFERRALS) {
+        throw new Error(`Claude turn exceeded ${MAX_QUESTION_DEFERRALS} deferred questions`);
+      }
+      const sessionId = result.sessionId ?? emittedSessionId ?? resumeSessionId;
+      if (!sessionId) throw new Error("Claude deferred a question without a session ID");
+      const context = claudeQuestionContext(result.deferredToolUse);
+      const timeoutForInput = remainingTimeout();
+      const answer = await waitForUserInput(
+        opts.onUserInputRequest(context.request),
+        opts.signal,
+        timeoutForInput,
+      );
+      writeFileSync(hookFiles.statePath, JSON.stringify({
+        mode: "answer",
+        toolUseId: result.deferredToolUse.id,
+        updatedInput: context.updatedInput(answer),
+      }), { mode: 0o600 });
+      prompt = "";
+      newSessionId = undefined;
+      resumeSessionId = sessionId;
+    }
+  } finally {
+    if (hookFiles) rmSync(hookFiles.directory, { recursive: true, force: true });
+  }
 }

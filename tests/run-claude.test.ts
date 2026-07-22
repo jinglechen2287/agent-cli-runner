@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runClaude } from "../src/index.js";
@@ -305,6 +306,286 @@ describe("runClaude", () => {
     expect(args).not.toContain("--settings");
     finish(child);
     await promise;
+  });
+
+  it("defers AskUserQuestion, collects answers, and resumes the same session", async () => {
+    const version = makeFakeChild();
+    const first = makeFakeChild();
+    const resumed = makeFakeChild();
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(version)
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(resumed);
+    const onToolUse = vi.fn();
+    const onUserInputRequest = vi.fn(async () => ({
+      answers: {
+        "tool-question:0": ["React"],
+        "tool-question:1": ["TypeScript", "Tests"],
+      },
+    }));
+    const promise = runClaude({
+      prompt: "build it",
+      cwd: "/tmp",
+      settings: JSON.stringify({ permissions: { allow: ["Read"] } }),
+      spawnFn: spawnFn as never,
+      onToolUse,
+      onUserInputRequest,
+    });
+
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+    expect(spawnFn.mock.calls[0]![1]).toEqual(["--version"]);
+    version.stdout.write("2.1.89 (Claude Code)\n");
+    finish(version);
+    await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(2));
+    const initialArgs = spawnFn.mock.calls[1]![1] as string[];
+    const settingsIndex = initialArgs.indexOf("--settings");
+    const settingsPath = initialArgs[settingsIndex + 1] as string;
+    const mergedSettings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+      permissions: { allow: string[] };
+      hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
+    };
+    expect(mergedSettings.permissions.allow).toEqual(["Read"]);
+    expect(mergedSettings.hooks.PreToolUse).toEqual(
+      expect.arrayContaining([expect.objectContaining({ matcher: "AskUserQuestion" })]),
+    );
+
+    first.stdout.write(JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [{
+          type: "tool_use",
+          id: "tool-question",
+          name: "AskUserQuestion",
+          input: {},
+        }],
+      },
+    }) + "\n");
+    first.stdout.write(JSON.stringify({
+      type: "result",
+      subtype: "success",
+      stop_reason: "tool_deferred",
+      session_id: "session-question",
+      deferred_tool_use: {
+        id: "tool-question",
+        name: "AskUserQuestion",
+        input: {
+          questions: [
+            {
+              question: " Which framework? ",
+              header: "Framework",
+              options: [
+                { label: "React", description: "Component-based UI" },
+                { label: "Vue", description: "   " },
+              ],
+              multiSelect: false,
+            },
+            {
+              question: "What should be included?",
+              header: "Scope",
+              options: [
+                { label: "TypeScript", description: "Use strict types" },
+                { label: "Tests" },
+              ],
+              multiSelect: true,
+            },
+          ],
+        },
+      },
+    }) + "\n");
+    finish(first);
+
+    await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(3));
+    expect(onUserInputRequest).toHaveBeenCalledWith({
+      requestId: "tool-question",
+      questions: [
+        {
+          id: "tool-question:0",
+          header: "Framework",
+          question: "Which framework?",
+          options: [
+            { label: "React", description: "Component-based UI" },
+            { label: "Vue" },
+          ],
+          multiSelect: false,
+          allowOther: true,
+          secret: false,
+        },
+        {
+          id: "tool-question:1",
+          header: "Scope",
+          question: "What should be included?",
+          options: [
+            { label: "TypeScript", description: "Use strict types" },
+            { label: "Tests" },
+          ],
+          multiSelect: true,
+          allowOther: true,
+          secret: false,
+        },
+      ],
+    });
+    expect(onToolUse).not.toHaveBeenCalled();
+
+    const questionHook = mergedSettings.hooks.PreToolUse.find(
+      ({ matcher }) => matcher === "AskUserQuestion",
+    );
+    const statePath = /'([^']*)'$/.exec(questionHook?.hooks[0]?.command ?? "")?.[1];
+    expect(statePath).toBeDefined();
+    expect(JSON.parse(readFileSync(statePath!, "utf8"))).toEqual({
+      mode: "answer",
+      toolUseId: "tool-question",
+      updatedInput: {
+        questions: [
+          {
+            question: " Which framework? ",
+            header: "Framework",
+            options: [
+              { label: "React", description: "Component-based UI" },
+              { label: "Vue", description: "   " },
+            ],
+            multiSelect: false,
+          },
+          {
+            question: "What should be included?",
+            header: "Scope",
+            options: [
+              { label: "TypeScript", description: "Use strict types" },
+              { label: "Tests" },
+            ],
+            multiSelect: true,
+          },
+        ],
+        answers: {
+          " Which framework? ": "React",
+          "What should be included?": "TypeScript, Tests",
+        },
+      },
+    });
+
+    const resumedArgs = spawnFn.mock.calls[2]![1] as string[];
+    expect(resumedArgs).toContain("--resume");
+    expect(resumedArgs[resumedArgs.indexOf("--resume") + 1]).toBe("session-question");
+    resumed.stdout.write(JSON.stringify({
+      type: "result",
+      result: "Implemented",
+      session_id: "session-question",
+    }) + "\n");
+    finish(resumed);
+
+    await expect(promise).resolves.toMatchObject({
+      text: "Implemented",
+      exitCode: 0,
+      sessionId: "session-question",
+    });
+  });
+
+  it("bounds repeated question deferrals even when no wall-clock timeout is configured", async () => {
+    const version = makeFakeChild();
+    const turns = Array.from({ length: 65 }, () => makeFakeChild());
+    const spawnFn = vi.fn().mockReturnValueOnce(version);
+    for (const turn of turns) spawnFn.mockReturnValueOnce(turn);
+    const onUserInputRequest = vi.fn(async (request: { questions: Array<{ id: string }> }) => ({
+      answers: { [request.questions[0]!.id]: ["A"] },
+    }));
+    const promise = runClaude({
+      prompt: "keep asking",
+      cwd: "/tmp",
+      spawnFn: spawnFn as never,
+      onUserInputRequest,
+    });
+    version.stdout.write("2.1.89 (Claude Code)\n");
+    finish(version);
+
+    for (const [index, turn] of turns.entries()) {
+      await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(index + 2));
+      turn.stdout.write(JSON.stringify({
+        type: "result",
+        stop_reason: "tool_deferred",
+        session_id: "session-loop",
+        deferred_tool_use: {
+          id: `tool-question-${index}`,
+          name: "AskUserQuestion",
+          input: {
+            questions: [{
+              question: `Question ${index}?`,
+              header: "Question",
+              options: [{ label: "A" }],
+              multiSelect: false,
+            }],
+          },
+        },
+      }) + "\n");
+      finish(turn);
+    }
+
+    await expect(promise).rejects.toThrow("exceeded 64 deferred questions");
+    expect(onUserInputRequest).toHaveBeenCalledTimes(64);
+  });
+
+  it("rejects native questions with an actionable error on older Claude Code", async () => {
+    const version = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(version);
+    const promise = runClaude({
+      prompt: "build it",
+      cwd: "/tmp",
+      spawnFn: spawnFn as never,
+      onUserInputRequest: async () => ({ answers: {} }),
+    });
+    version.stdout.write("2.1.88 (Claude Code)\n");
+    finish(version);
+    await expect(promise).rejects.toThrow(
+      "Native AskUserQuestion requires Claude Code 2.1.89 or newer; found 2.1.88",
+    );
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects duplicate and malformed deferred Claude questions before the callback", async () => {
+    async function runWithQuestions(questions: unknown[]): Promise<unknown> {
+      const version = makeFakeChild();
+      const first = makeFakeChild();
+      const spawnFn = vi.fn()
+        .mockReturnValueOnce(version)
+        .mockReturnValueOnce(first);
+      const promise = runClaude({
+        prompt: "build it",
+        cwd: "/tmp",
+        spawnFn: spawnFn as never,
+        onUserInputRequest: async () => ({ answers: {} }),
+      });
+      version.stdout.write("2.1.89 (Claude Code)\n");
+      finish(version);
+      await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(2));
+      first.stdout.write(JSON.stringify({
+        type: "result",
+        subtype: "success",
+        stop_reason: "tool_deferred",
+        session_id: "session-invalid-question",
+        deferred_tool_use: {
+          id: "tool-invalid-question",
+          name: "AskUserQuestion",
+          input: { questions },
+        },
+      }) + "\n");
+      finish(first);
+      return promise;
+    }
+
+    await expect(runWithQuestions([
+      { question: "Same?", header: "First", options: [], multiSelect: false },
+      { question: " Same? ", header: "Second", options: [], multiSelect: false },
+    ])).rejects.toThrow("Claude AskUserQuestion contains duplicate question text");
+    await expect(runWithQuestions([{
+      question: "Choose?",
+      header: "Choice",
+      options: [{ label: "A", description: 7 }],
+      multiSelect: "yes",
+    }])).rejects.toThrow("Malformed Claude AskUserQuestion option description");
+    await expect(runWithQuestions([{
+      question: "Choose?",
+      header: "Choice",
+      options: [{ label: "A" }],
+      multiSelect: "yes",
+    }])).rejects.toThrow("Malformed Claude AskUserQuestion multiSelect");
   });
 
   it("passes --permission-mode alongside --resume on follow-up turns", async () => {

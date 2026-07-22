@@ -73,6 +73,7 @@ interface RunResult {
 | `spawnFn` | Injectable spawn primitive for tests. |
 | `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onBackgroundAgentUpdate`, `onUsage`, `onStderr` | Streaming callbacks. Tool uses and results share a provider call ID. Codex app-server items are mapped to shared names (`commandExecution` → `Bash`, `fileChange` → `Edit`, web page operations → `WebFetch`) and plan notifications become normalized `TodoWrite` snapshots. Background subagents emit replace-in-place snapshots keyed by child thread id. Usage snapshots describe the latest request's context occupancy, never cumulative turn totals. |
 | `onAssistantTextDelta` | Assistant prose as the model produces it. Opt-in: supplying it adds Claude's `--include-partial-messages` (roughly doubling CLI output) and subscribes to Codex's `item/agentMessage/delta`. Fragments exclude extended thinking, streamed tool input, and background-subagent prose, and concatenate to the next `onAssistantText` message — treat them as scratch state that the completed message supersedes. Not emitted by isolated Codex runs. |
+| `onUserInputRequest` | Async callback for provider-native questions. Return answers keyed by normalized question id; the current turn resumes in place. Option descriptions are preserved when providers supply them. |
 
 ### Claude-specific
 
@@ -80,13 +81,15 @@ interface RunResult {
 
 `isolated: true` is for non-persistent one-shot metadata requests. It requires Claude Code 2.1.169 or newer because it enables `--safe-mode`; it also disables built-in tools and MCP servers and prevents session persistence. It cannot resume a session.
 
+Native `AskUserQuestion` support keeps the `claude -p` subprocess architecture. When `onUserInputRequest` is supplied, the runner installs a temporary `PreToolUse` hook, defers the tool, waits for the callback, and resumes the same session. This requires Claude Code 2.1.89 or newer; the runner checks the installed version before starting a question-enabled turn. Multi-select labels are encoded as Claude's comma-separated answer string. Hook settings and answers use restricted temporary files and are removed when the logical turn ends.
+
 ### Codex-specific
 
 Regular Codex turns use the app-server V2 `thread/*` and `turn/*` flow. Options include `developerInstructions`, `resumeSessionId`, `imagePaths`, `model`, `reasoningEffort`, `dangerouslyBypassApprovalsAndSandbox`, `appServerClient`, `appServerSession`, and `isolated`. Images become `localImage` inputs, reasoning effort is sent on `turn/start`, usage streams from `thread/tokenUsage/updated`, and cancellation uses `turn/interrupt`.
 
 `dangerouslyBypassApprovalsAndSandbox` is **off by default**. Enabling it maps to app-server's `approvalPolicy: "never"` and `sandbox: "danger-full-access"`; use it only for trusted prompts in environments you accept the agent can modify.
 
-By default each regular `runCodex` call owns one app-server process. For a thread-bound long-running process, create a `CodexAppServerSession` with `createCodexAppServerSession(...)`; it initializes and starts or resumes the thread once, then its `runTurn(...)` method reuses that thread until the owner calls and awaits `session.close()`. Lower-level hosts can instead create a reusable connection with `createCodexAppServerClient(...)` and pass it as `appServerClient`; a shared client can route concurrent turns by thread and turn id. Native in-turn question and approval requests are not enabled; unsupported server requests receive a JSON-RPC method-not-found response.
+By default each regular `runCodex` call owns one app-server process. For a thread-bound long-running process, create a `CodexAppServerSession` with `createCodexAppServerSession(...)`; it initializes and starts or resumes the thread once, then its `runTurn(...)` method reuses that thread until the owner calls and awaits `session.close()`. Lower-level hosts can instead create a reusable connection with `createCodexAppServerClient(...)` and pass it as `appServerClient`; a shared client can route concurrent turns by thread and turn id. Native `item/tool/requestUserInput` requests use `onUserInputRequest`; other unsupported server requests receive a JSON-RPC method-not-found response.
 
 For new threads, the runner opts into Codex raw response items so hosted web page operations can retain their resolved URL even when the public `webSearch` completion reports only `action: "other"`. It correlates only a single unambiguous `web__run` invocation, extracts the page-header URL, and discards the raw payload. Ambiguous calls fall back to the ordinary completed item without inventing details. Resumed threads created without raw events still receive correct search/fetch classification and any URL or find pattern present in their completed items.
 
