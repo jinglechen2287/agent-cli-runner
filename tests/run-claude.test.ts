@@ -1,8 +1,12 @@
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runClaude } from "../src/index.js";
+
+const tempDirs: string[] = [];
 
 interface FakeChild extends EventEmitter {
   stdin: PassThrough;
@@ -39,6 +43,9 @@ function finish(child: FakeChild, code: number | null = 0): void {
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.useRealTimers();
+  for (const directory of tempDirs.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 describe("runClaude", () => {
@@ -317,6 +324,7 @@ describe("runClaude", () => {
       .mockReturnValueOnce(first)
       .mockReturnValueOnce(resumed);
     const onToolUse = vi.fn();
+    const onStderr = vi.fn();
     const onUserInputRequest = vi.fn(async () => ({
       answers: {
         "tool-question:0": ["React"],
@@ -326,9 +334,18 @@ describe("runClaude", () => {
     const promise = runClaude({
       prompt: "build it",
       cwd: "/tmp",
-      settings: JSON.stringify({ permissions: { allow: ["Read"] } }),
+      settings: JSON.stringify({
+        permissions: { allow: ["Read"] },
+        hooks: {
+          PreToolUse: [{
+            matcher: "Bash",
+            hooks: [{ type: "command", command: "existing-hook" }],
+          }],
+        },
+      }),
       spawnFn: spawnFn as never,
       onToolUse,
+      onStderr,
       onUserInputRequest,
     });
 
@@ -345,6 +362,7 @@ describe("runClaude", () => {
       hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
     };
     expect(mergedSettings.permissions.allow).toEqual(["Read"]);
+    expect(mergedSettings.hooks.PreToolUse[0]).toMatchObject({ matcher: "Bash" });
     expect(mergedSettings.hooks.PreToolUse).toEqual(
       expect.arrayContaining([expect.objectContaining({ matcher: "AskUserQuestion" })]),
     );
@@ -431,6 +449,11 @@ describe("runClaude", () => {
     );
     const statePath = /'([^']*)'$/.exec(questionHook?.hooks[0]?.command ?? "")?.[1];
     expect(statePath).toBeDefined();
+    if (process.platform !== "win32") {
+      expect(statSync(dirname(statePath!)).mode & 0o777).toBe(0o700);
+      expect(statSync(statePath!).mode & 0o777).toBe(0o600);
+      expect(statSync(settingsPath).mode & 0o777).toBe(0o600);
+    }
     expect(JSON.parse(readFileSync(statePath!, "utf8"))).toEqual({
       mode: "answer",
       toolUseId: "tool-question",
@@ -465,6 +488,10 @@ describe("runClaude", () => {
     const resumedArgs = spawnFn.mock.calls[2]![1] as string[];
     expect(resumedArgs).toContain("--resume");
     expect(resumedArgs[resumedArgs.indexOf("--resume") + 1]).toBe("session-question");
+    expect(JSON.stringify(resumedArgs)).not.toContain("React");
+    expect(JSON.stringify(resumedArgs)).not.toContain("TypeScript");
+    expect(JSON.stringify(spawnFn.mock.calls[2]![2].env)).not.toContain("React");
+    expect(JSON.stringify(spawnFn.mock.calls[2]![2].env)).not.toContain("TypeScript");
     resumed.stdout.write(JSON.stringify({
       type: "result",
       result: "Implemented",
@@ -477,6 +504,9 @@ describe("runClaude", () => {
       exitCode: 0,
       sessionId: "session-question",
     });
+    expect(() => readFileSync(settingsPath, "utf8")).toThrow();
+    expect(() => readFileSync(statePath!, "utf8")).toThrow();
+    expect(onStderr).not.toHaveBeenCalled();
   });
 
   it("bounds repeated question deferrals even when no wall-clock timeout is configured", async () => {
@@ -520,6 +550,183 @@ describe("runClaude", () => {
 
     await expect(promise).rejects.toThrow("exceeded 64 deferred questions");
     expect(onUserInputRequest).toHaveBeenCalledTimes(64);
+    for (const call of spawnFn.mock.calls.slice(2)) {
+      const args = call[1] as string[];
+      expect(args[args.indexOf("--resume") + 1]).toBe("session-loop");
+    }
+  });
+
+  it("loads file-based settings, preserves their hooks, and removes only merged files", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-cli-runner-settings-test-"));
+    tempDirs.push(directory);
+    const callerSettingsPath = join(directory, "caller-settings.json");
+    writeFileSync(callerSettingsPath, JSON.stringify({
+      permissions: { deny: ["Write"] },
+      hooks: {
+        PostToolUse: [{ matcher: "Read", hooks: [{ type: "command", command: "after-read" }] }],
+      },
+    }));
+    const version = makeFakeChild();
+    const turn = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValueOnce(version).mockReturnValueOnce(turn);
+    const promise = runClaude({
+      prompt: "inspect",
+      cwd: directory,
+      settings: "caller-settings.json",
+      spawnFn: spawnFn as never,
+      onUserInputRequest: async () => ({ answers: {} }),
+    });
+    version.stdout.write("2.1.89 (Claude Code)\n");
+    finish(version);
+    await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(2));
+
+    const args = spawnFn.mock.calls[1]![1] as string[];
+    const mergedSettingsPath = args[args.indexOf("--settings") + 1] as string;
+    expect(mergedSettingsPath).not.toBe(callerSettingsPath);
+    const merged = JSON.parse(readFileSync(mergedSettingsPath, "utf8")) as {
+      permissions: { deny: string[] };
+      hooks: {
+        PostToolUse: Array<{ matcher: string }>;
+        PreToolUse: Array<{ matcher: string }>;
+      };
+    };
+    expect(merged.permissions.deny).toEqual(["Write"]);
+    expect(merged.hooks.PostToolUse).toEqual([expect.objectContaining({ matcher: "Read" })]);
+    expect(merged.hooks.PreToolUse).toEqual([
+      expect.objectContaining({ matcher: "AskUserQuestion" }),
+    ]);
+    turn.stdout.write(JSON.stringify({ type: "result", result: "Done" }) + "\n");
+    finish(turn);
+    await expect(promise).resolves.toMatchObject({ text: "Done", exitCode: 0 });
+    expect(readFileSync(callerSettingsPath, "utf8")).toContain('"Write"');
+    expect(() => readFileSync(mergedSettingsPath, "utf8")).toThrow();
+  });
+
+  it("rejects malformed inline settings and unreadable settings files clearly", async () => {
+    for (const settings of ["{not-json", "missing-settings.json"]) {
+      const version = makeFakeChild();
+      const spawnFn = vi.fn().mockReturnValueOnce(version);
+      const promise = runClaude({
+        prompt: "inspect",
+        cwd: "/tmp",
+        settings,
+        spawnFn: spawnFn as never,
+        onUserInputRequest: async () => ({ answers: {} }),
+      });
+      version.stdout.write("2.1.89 (Claude Code)\n");
+      finish(version);
+      await expect(promise).rejects.toThrow("Unable to read Claude settings:");
+      expect(spawnFn).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("cancels while awaiting an answer and removes the hook state", async () => {
+    const version = makeFakeChild();
+    const first = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValueOnce(version).mockReturnValueOnce(first);
+    const abort = new AbortController();
+    const onUserInputRequest = vi.fn(() => new Promise<never>(() => {}));
+    const promise = runClaude({
+      prompt: "ask",
+      cwd: "/tmp",
+      spawnFn: spawnFn as never,
+      signal: abort.signal,
+      onUserInputRequest,
+    });
+    version.stdout.write("2.1.89 (Claude Code)\n");
+    finish(version);
+    await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(2));
+    const args = spawnFn.mock.calls[1]![1] as string[];
+    const settingsPath = args[args.indexOf("--settings") + 1] as string;
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+      hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
+    };
+    const hook = settings.hooks.PreToolUse.find(({ matcher }) => matcher === "AskUserQuestion");
+    const statePath = /'([^']*)'$/.exec(hook?.hooks[0]?.command ?? "")?.[1];
+    first.stdout.write(JSON.stringify({
+      type: "result",
+      stop_reason: "tool_deferred",
+      session_id: "session-cancel",
+      deferred_tool_use: {
+        id: "tool-cancel",
+        name: "AskUserQuestion",
+        input: {
+          questions: [{
+            question: "Continue?",
+            header: "Continue",
+            options: [{ label: "Yes" }],
+            multiSelect: false,
+          }],
+        },
+      },
+    }) + "\n");
+    finish(first);
+    await vi.waitFor(() => expect(onUserInputRequest).toHaveBeenCalledTimes(1));
+    abort.abort();
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+    expect(() => readFileSync(settingsPath, "utf8")).toThrow();
+    expect(() => readFileSync(statePath!, "utf8")).toThrow();
+  });
+
+  it("preserves special Claude question-text keys in updatedInput", async () => {
+    const version = makeFakeChild();
+    const first = makeFakeChild();
+    const resumed = makeFakeChild();
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(version)
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(resumed);
+    const promise = runClaude({
+      prompt: "ask",
+      cwd: "/tmp",
+      spawnFn: spawnFn as never,
+      onUserInputRequest: async (request) => ({
+        answers: { [request.questions[0]!.id]: ["Safe"] },
+      }),
+    });
+    version.stdout.write("2.1.89 (Claude Code)\n");
+    finish(version);
+    await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(2));
+    first.stdout.write(JSON.stringify({
+      type: "result",
+      stop_reason: "tool_deferred",
+      session_id: "session-special",
+      deferred_tool_use: {
+        id: "tool-special",
+        name: "AskUserQuestion",
+        input: {
+          questions: [{
+            question: "__proto__",
+            header: "Special",
+            options: [{ label: "Safe" }],
+            multiSelect: false,
+          }],
+        },
+      },
+    }) + "\n");
+    finish(first);
+    await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(3));
+
+    const resumedArgs = spawnFn.mock.calls[2]![1] as string[];
+    const settingsPath = resumedArgs[resumedArgs.indexOf("--settings") + 1] as string;
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+      hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
+    };
+    const hook = settings.hooks.PreToolUse.find(({ matcher }) => matcher === "AskUserQuestion");
+    const statePath = /'([^']*)'$/.exec(hook?.hooks[0]?.command ?? "")?.[1];
+    const state = JSON.parse(readFileSync(statePath!, "utf8")) as {
+      updatedInput: { answers: Record<string, string> };
+    };
+    expect(Object.hasOwn(state.updatedInput.answers, "__proto__")).toBe(true);
+    expect(state.updatedInput.answers["__proto__"]).toBe("Safe");
+
+    resumed.stdout.write(JSON.stringify({
+      type: "result",
+      result: "Done",
+      session_id: "session-special",
+    }) + "\n");
+    finish(resumed);
+    await expect(promise).resolves.toMatchObject({ text: "Done", exitCode: 0 });
   });
 
   it("rejects native questions with an actionable error on older Claude Code", async () => {

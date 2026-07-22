@@ -375,7 +375,12 @@ function claudeQuestionContext(deferred) {
         if (!question.multiSelect && values.length !== 1) {
           throw new Error(`Claude question ${question.id} accepts one answer`);
         }
-        answers[answerKeys[index]] = question.multiSelect ? values.join(", ") : values[0];
+        Object.defineProperty(answers, answerKeys[index], {
+          value: question.multiSelect ? values.join(", ") : values[0],
+          enumerable: true,
+          configurable: true,
+          writable: true
+        });
       }
       return { ...deferred.input, questions: rawQuestions, answers };
     }
