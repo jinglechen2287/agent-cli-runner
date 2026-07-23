@@ -927,7 +927,12 @@ async function createCodexAppServerClient(options) {
   const spawnFn = options.spawnFn ?? nodeSpawn3;
   let child;
   try {
-    child = spawnFn(options.executablePath ?? "codex", ["app-server", "--stdio"], {
+    const args = [
+      "app-server",
+      "--stdio",
+      ...options.enableDefaultModeUserInput ? ["--enable", "default_mode_request_user_input"] : []
+    ];
+    child = spawnFn(options.executablePath ?? "codex", args, {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]),
@@ -1852,7 +1857,8 @@ async function createCodexAppServerSession(options) {
     ...options.executablePath ? { executablePath: options.executablePath } : {},
     ...options.env ? { env: options.env } : {},
     ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
-    ...options.requestTimeoutMs !== void 0 ? { requestTimeoutMs: options.requestTimeoutMs } : {}
+    ...options.requestTimeoutMs !== void 0 ? { requestTimeoutMs: options.requestTimeoutMs } : {},
+    ...options.enableDefaultModeUserInput ? { enableDefaultModeUserInput: true } : {}
   });
   let opened;
   try {
@@ -1917,7 +1923,8 @@ async function runCodexAppServer(opts) {
     cwd: opts.cwd,
     ...opts.executablePath ? { executablePath: opts.executablePath } : {},
     ...opts.env ? { env: opts.env } : {},
-    ...opts.spawnFn ? { spawnFn: opts.spawnFn } : {}
+    ...opts.spawnFn ? { spawnFn: opts.spawnFn } : {},
+    ...opts.onUserInputRequest ? { enableDefaultModeUserInput: true } : {}
   });
   return runCodexAppServerTurn(opts, client, void 0, ownedClient);
 }

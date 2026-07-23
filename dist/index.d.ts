@@ -271,6 +271,8 @@ interface CreateCodexAppServerClientOptions {
     env?: NodeJS.ProcessEnv;
     spawnFn?: RunCodexOptions["spawnFn"];
     requestTimeoutMs?: number;
+    /** Expose Codex's native request_user_input tool outside Plan mode. */
+    enableDefaultModeUserInput?: boolean;
 }
 type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "spawnFn">;
 interface CodexAppServerSession {
@@ -291,6 +293,8 @@ interface CreateCodexAppServerSessionOptions {
     model?: string;
     developerInstructions?: string;
     dangerouslyBypassApprovalsAndSandbox?: boolean;
+    /** Expose Codex's native request_user_input tool outside Plan mode. */
+    enableDefaultModeUserInput?: boolean;
 }
 declare function createCodexAppServerClient(options: CreateCodexAppServerClientOptions): Promise<CodexAppServerClient>;
 declare function createCodexAppServerSession(options: CreateCodexAppServerSessionOptions): Promise<CodexAppServerSession>;
