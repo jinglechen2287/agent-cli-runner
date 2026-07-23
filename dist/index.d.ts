@@ -49,8 +49,9 @@ declare const KNOWN_CONTEXT_WINDOWS: Readonly<Record<string, number>>;
 /**
  * Best-effort context window (in tokens) for a model id, or `undefined` when it
  * can't be determined. Consults {@link KNOWN_CONTEXT_WINDOWS} first, then
- * falls back to family rules: Anthropic models get 200k (1M for the `[1m]`
- * beta variants), and Codex `gpt-5.6*` / other `gpt-5*` models get 372k / 272k.
+ * falls back to family rules: Anthropic models get 200k (1M for the `[1m]` beta
+ * variants and for the natively-1M Fable/Mythos family), and Codex `gpt-5.6*` /
+ * other `gpt-5*` models get 372k / 272k.
  */
 declare function contextWindowForModel(model: string | undefined): number | undefined;
 
