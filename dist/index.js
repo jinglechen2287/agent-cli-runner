@@ -42,6 +42,9 @@ var CodexTurnError = class extends Error {
 import { spawn as nodeSpawn } from "child_process";
 import { StringDecoder } from "string_decoder";
 var SIGTERM_GRACE_MS = 2e3;
+function isUserInputPause(result) {
+  return "action" in result && result.action === "pause";
+}
 function normalizeSummary(value) {
   if (typeof value !== "string") return void 0;
   const summary = value.replace(/\s+/g, " ").trim();
@@ -882,6 +885,15 @@ async function runClaude(opts) {
         opts.signal,
         timeoutForInput
       );
+      if (isUserInputPause(answer)) {
+        return {
+          text: result.text,
+          exitCode: 0,
+          sessionId,
+          stopReason: "user_input",
+          ...result.usage ? { usage: result.usage } : {}
+        };
+      }
       writeFileSync(hookFiles.statePath, JSON.stringify({
         mode: "answer",
         toolUseId: result.deferredToolUse.id,
@@ -1487,6 +1499,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
   let finalText = "";
   let latestUsage;
   let settled = false;
+  let userInputPaused = false;
   let interruption;
   let timeout;
   const emittedTools = /* @__PURE__ */ new Set();
@@ -1501,6 +1514,10 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     rejectCompletion = reject;
   });
   void completion.catch(() => {
+  });
+  let resolveUserInputPause;
+  const userInputPause = new Promise((resolve) => {
+    resolveUserInputPause = resolve;
   });
   let rejectLifecycle;
   let lifecycleFailed = false;
@@ -1697,6 +1714,11 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (turnId && normalized.turnId !== turnId) return void 0;
     turnId ??= normalized.turnId;
     const response = await raceLifecycle(opts.onUserInputRequest(normalized.request));
+    if (isUserInputPause(response)) {
+      userInputPaused = true;
+      setImmediate(resolveUserInputPause);
+      return { answers: {} };
+    }
     const questionIds = new Set(normalized.request.questions.map(({ id }) => id));
     const answers = {};
     for (const [questionId, values] of Object.entries(response.answers)) {
@@ -1833,7 +1855,18 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     turnId = turnIdFrom(turnResult) ?? turnId;
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
     if (interruption) requestInterrupt();
-    await raceLifecycle(completion);
+    await raceLifecycle(Promise.race([completion, userInputPause]));
+    if (userInputPaused) {
+      settled = true;
+      client.close();
+      return {
+        text: finalText.trim(),
+        exitCode: 0,
+        sessionId: threadId,
+        stopReason: "user_input",
+        ...latestUsage ? { usage: latestUsage } : {}
+      };
+    }
     const status = turnStatus(turnResult);
     return {
       text: finalText.trim(),

@@ -14,6 +14,7 @@ import {
   createLineSplitter,
   filterEnv,
   isMissingExecutable,
+  isUserInputPause,
   normalizeSummary,
   toContextWindow,
   toTokenCount,
@@ -28,6 +29,7 @@ import type {
   ToolPlanItem,
   UserInputQuestion,
   UserInputRequest,
+  UserInputCallbackResult,
   UserInputResponse,
 } from "./types.js";
 import { contextWindowForModel, type TokenUsage } from "./usage.js";
@@ -488,10 +490,10 @@ function createClaudeHookFiles(opts: RunClaudeOptions): ClaudeHookFiles {
 }
 
 function waitForUserInput(
-  callback: Promise<UserInputResponse>,
+  callback: Promise<UserInputCallbackResult>,
   signal: AbortSignal | undefined,
   timeoutMs: number | undefined,
-): Promise<UserInputResponse> {
+): Promise<UserInputCallbackResult> {
   if (signal?.aborted) {
     void callback.catch(() => {});
     return Promise.reject(new AbortError("claude run aborted"));
@@ -1025,6 +1027,15 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
         opts.signal,
         timeoutForInput,
       );
+      if (isUserInputPause(answer)) {
+        return {
+          text: result.text,
+          exitCode: 0,
+          sessionId,
+          stopReason: "user_input",
+          ...(result.usage ? { usage: result.usage } : {}),
+        };
+      }
       writeFileSync(hookFiles.statePath, JSON.stringify({
         mode: "answer",
         toolUseId: result.deferredToolUse.id,

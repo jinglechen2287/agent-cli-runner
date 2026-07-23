@@ -65,6 +65,17 @@ export interface UserInputResponse {
   answers: Record<string, string[]>;
 }
 
+/** End the current provider invocation at the question boundary. The host can
+ * present the request after the run returns and resume the same conversation
+ * with an ordinary user message in a later invocation. */
+export interface UserInputPause {
+  action: "pause";
+}
+
+/** Backward-compatible callback result: existing hosts answer in place, while
+ * hosts that own turn boundaries can pause and resume with a later message. */
+export type UserInputCallbackResult = UserInputResponse | UserInputPause;
+
 /** One provider-normalized item from a Codex plan/todo snapshot. */
 export interface ToolPlanItem {
   text: string;
@@ -125,7 +136,7 @@ export interface AgentCallbacks {
   /** Fired when the provider reports the result for a tool invocation. */
   onToolResult?: (info: ToolResultInfo) => void;
   /** Fired when the provider pauses the current turn for structured user input. */
-  onUserInputRequest?: (request: UserInputRequest) => Promise<UserInputResponse>;
+  onUserInputRequest?: (request: UserInputRequest) => Promise<UserInputCallbackResult>;
   /** Fired whenever a background subagent starts, progresses, or finishes.
    * Repeated calls with the same id are replace-in-place snapshots. */
   onBackgroundAgentUpdate?: (info: BackgroundAgentInfo) => void;
@@ -162,6 +173,8 @@ export interface RunResult {
   exitCode: number;
   /** Claude session id / Codex thread id, when the CLI reported one. */
   sessionId?: string;
+  /** Present when the host asked the runner to end at a native question. */
+  stopReason?: "user_input";
   /** The latest context-usage snapshot of the turn, when the CLI reported any
    * token counts. Matches the final {@link AgentCallbacks.onUsage} value. */
   usage?: TokenUsage;

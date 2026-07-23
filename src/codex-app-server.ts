@@ -4,6 +4,7 @@ import {
   createLineSplitter,
   filterEnv,
   isMissingExecutable,
+  isUserInputPause,
   normalizeSummary,
   SIGTERM_GRACE_MS,
   signalProcessTree,
@@ -828,6 +829,7 @@ async function runCodexAppServerTurn(
   let finalText = "";
   let latestUsage: TokenUsage | undefined;
   let settled = false;
+  let userInputPaused = false;
   let interruption: AbortError | TimeoutError | undefined;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const emittedTools = new Set<string>();
@@ -846,6 +848,10 @@ async function runCodexAppServerTurn(
   // processed. Attach a handler immediately, then await the original promise
   // below so Node never treats that legitimate ordering as unhandled.
   void completion.catch(() => {});
+  let resolveUserInputPause!: () => void;
+  const userInputPause = new Promise<void>((resolve) => {
+    resolveUserInputPause = resolve;
+  });
 
   let rejectLifecycle!: (error: AbortError | TimeoutError) => void;
   let lifecycleFailed = false;
@@ -1074,6 +1080,11 @@ async function runCodexAppServerTurn(
         if (turnId && normalized.turnId !== turnId) return undefined;
         turnId ??= normalized.turnId;
         const response = await raceLifecycle(opts.onUserInputRequest!(normalized.request));
+        if (isUserInputPause(response)) {
+          userInputPaused = true;
+          setImmediate(resolveUserInputPause);
+          return { answers: {} };
+        }
         const questionIds = new Set(normalized.request.questions.map(({ id }) => id));
         const answers: Record<string, { answers: string[] }> = {};
         for (const [questionId, values] of Object.entries(response.answers)) {
@@ -1227,7 +1238,19 @@ async function runCodexAppServerTurn(
     turnId = turnIdFrom(turnResult) ?? turnId;
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
     if (interruption) requestInterrupt();
-    await raceLifecycle(completion);
+    await raceLifecycle(Promise.race([completion, userInputPause]));
+
+    if (userInputPaused) {
+      settled = true;
+      client.close();
+      return {
+        text: finalText.trim(),
+        exitCode: 0,
+        sessionId: threadId as string,
+        stopReason: "user_input",
+        ...(latestUsage ? { usage: latestUsage } : {}),
+      };
+    }
 
     const status = turnStatus(turnResult);
     return {

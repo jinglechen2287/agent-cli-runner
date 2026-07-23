@@ -949,6 +949,70 @@ describe("Codex app-server runner", () => {
     expect(Object.getPrototypeOf(response.answers)).toBe(Object.prototype);
   });
 
+  it("ends and closes a Codex invocation when the host pauses for user input", async () => {
+    const child = makeFakeChild();
+    const onUserInputRequest = vi.fn(async () => ({ action: "pause" as const }));
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, {
+          id: message.id,
+          result: { thread: { id: "thread-paused" }, model: "gpt-test" },
+        });
+      } else if (message.method === "turn/start") {
+        send(child, {
+          id: message.id,
+          result: { turn: completedTurn("turn-paused", "inProgress") },
+        });
+        send(child, {
+          id: 99,
+          method: "item/tool/requestUserInput",
+          params: {
+            threadId: "thread-paused",
+            turnId: "turn-paused",
+            itemId: "question-paused",
+            questions: [{
+              id: "choice",
+              header: "Choice",
+              question: "Pick one",
+              options: [{ label: "A" }],
+            }],
+          },
+        });
+      }
+    });
+
+    await expect(runCodex({
+      prompt: "ask first",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onUserInputRequest,
+    })).resolves.toMatchObject({
+      text: "",
+      exitCode: 0,
+      sessionId: "thread-paused",
+      stopReason: "user_input",
+    });
+    expect(onUserInputRequest).toHaveBeenCalledWith({
+      requestId: "question-paused",
+      questions: [{
+        id: "choice",
+        header: "Choice",
+        question: "Pick one",
+        options: [{ label: "A" }],
+        multiSelect: false,
+        allowOther: false,
+        secret: false,
+      }],
+    });
+    await vi.waitFor(() => expect(requests).toContainEqual({
+      id: 99,
+      result: { answers: {} },
+    }));
+    expect(child.kill).toHaveBeenCalled();
+  });
+
   it("rejects malformed native questions and does not consume another turn's request", async () => {
     const child = makeFakeChild();
     const onUserInputRequest = vi.fn(async () => ({ answers: {} }));

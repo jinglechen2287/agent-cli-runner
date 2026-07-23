@@ -565,6 +565,67 @@ describe("runClaude", () => {
     }
   });
 
+  it("ends at a deferred question without resuming when the host pauses", async () => {
+    const version = makeFakeChild();
+    const first = makeFakeChild();
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(version)
+      .mockReturnValueOnce(first);
+    const onUserInputRequest = vi.fn(async () => ({ action: "pause" as const }));
+    const promise = runClaude({
+      prompt: "ask first",
+      cwd: "/tmp",
+      spawnFn: spawnFn as never,
+      onUserInputRequest,
+    });
+
+    version.stdout.write("2.1.89 (Claude Code)\n");
+    finish(version);
+    await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(2));
+    const args = spawnFn.mock.calls[1]![1] as string[];
+    const settingsPath = args[args.indexOf("--settings") + 1] as string;
+
+    first.stdout.write(JSON.stringify({
+      type: "result",
+      stop_reason: "tool_deferred",
+      session_id: "session-paused",
+      deferred_tool_use: {
+        id: "tool-paused",
+        name: "AskUserQuestion",
+        input: {
+          questions: [{
+            question: "Continue?",
+            header: "Continue",
+            options: [{ label: "Yes", description: "Resume in a new turn." }],
+            multiSelect: false,
+          }],
+        },
+      },
+    }) + "\n");
+    finish(first);
+
+    await expect(promise).resolves.toMatchObject({
+      text: "",
+      exitCode: 0,
+      sessionId: "session-paused",
+      stopReason: "user_input",
+    });
+    expect(onUserInputRequest).toHaveBeenCalledWith({
+      requestId: "tool-paused",
+      questions: [{
+        id: "tool-paused:0",
+        header: "Continue",
+        question: "Continue?",
+        options: [{ label: "Yes", description: "Resume in a new turn." }],
+        multiSelect: false,
+        allowOther: true,
+        secret: false,
+      }],
+    });
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+    expect(() => readFileSync(settingsPath, "utf8")).toThrow();
+  });
+
   it("loads file-based settings, preserves their hooks, and removes only merged files", async () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-cli-runner-settings-test-"));
     tempDirs.push(directory);

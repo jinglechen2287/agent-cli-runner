@@ -73,7 +73,7 @@ interface RunResult {
 | `spawnFn` | Injectable spawn primitive for tests. |
 | `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onBackgroundAgentUpdate`, `onUsage`, `onStderr` | Streaming callbacks. Tool uses and results share a provider call ID. Codex app-server items are mapped to shared names (`commandExecution` → `Bash`, `fileChange` → `Edit`, web page operations → `WebFetch`) and plan notifications become normalized `TodoWrite` snapshots. Background subagents emit replace-in-place snapshots keyed by child thread id. Usage snapshots describe the latest request's context occupancy, never cumulative turn totals. |
 | `onAssistantTextDelta` | Assistant prose as the model produces it. Opt-in: supplying it adds Claude's `--include-partial-messages` (roughly doubling CLI output) and subscribes to Codex's `item/agentMessage/delta`. Fragments exclude extended thinking, streamed tool input, and background-subagent prose, and concatenate to the next `onAssistantText` message — treat them as scratch state that the completed message supersedes. Not emitted by isolated Codex runs. |
-| `onUserInputRequest` | Async callback for provider-native questions. Return answers keyed by normalized question id; the current turn resumes in place. Option descriptions are preserved when providers supply them. |
+| `onUserInputRequest` | Async callback for provider-native questions. Return `{ answers }` to resume the current turn in place, or `{ action: "pause" }` to end this invocation and resume the same conversation later with an ordinary user message. A paused run returns `stopReason: "user_input"`. Option descriptions are preserved when providers supply them. |
 
 ### Claude-specific
 
