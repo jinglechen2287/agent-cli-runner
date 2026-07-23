@@ -26,6 +26,13 @@ describe("contextWindowForModel", () => {
     expect(contextWindowForModel("claude-opus-4-8[1m]")).toBe(1_000_000);
   });
 
+  it("gives Fable and Mythos a native 1M window without a [1m] marker", () => {
+    expect(contextWindowForModel("claude-fable-5")).toBe(1_000_000);
+    expect(contextWindowForModel("Claude-Fable-5")).toBe(1_000_000);
+    expect(contextWindowForModel("claude-mythos-5")).toBe(1_000_000);
+    expect(contextWindowForModel("claude-mythos-preview")).toBe(1_000_000);
+  });
+
   it("returns undefined for unrecognized models", () => {
     expect(contextWindowForModel("llama-3")).toBeUndefined();
   });

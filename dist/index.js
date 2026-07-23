@@ -179,6 +179,7 @@ function contextWindowForModel(model) {
     return KNOWN_CONTEXT_WINDOWS[id];
   }
   if (id.includes("claude")) {
+    if (/fable|mythos/.test(id)) return CLAUDE_1M_CONTEXT_WINDOW;
     return /\[1m\]|[-_]1m\b/.test(id) ? CLAUDE_1M_CONTEXT_WINDOW : CLAUDE_DEFAULT_CONTEXT_WINDOW;
   }
   if (id.startsWith("gpt-5.6")) return 372e3;

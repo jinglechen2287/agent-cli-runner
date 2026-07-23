@@ -62,8 +62,9 @@ const CLAUDE_1M_CONTEXT_WINDOW = 1_000_000;
 /**
  * Best-effort context window (in tokens) for a model id, or `undefined` when it
  * can't be determined. Consults {@link KNOWN_CONTEXT_WINDOWS} first, then
- * falls back to family rules: Anthropic models get 200k (1M for the `[1m]`
- * beta variants), and Codex `gpt-5.6*` / other `gpt-5*` models get 372k / 272k.
+ * falls back to family rules: Anthropic models get 200k (1M for the `[1m]` beta
+ * variants and for the natively-1M Fable/Mythos family), and Codex `gpt-5.6*` /
+ * other `gpt-5*` models get 372k / 272k.
  */
 export function contextWindowForModel(model: string | undefined): number | undefined {
   if (!model) return undefined;
@@ -73,6 +74,10 @@ export function contextWindowForModel(model: string | undefined): number | undef
     return KNOWN_CONTEXT_WINDOWS[id];
   }
   if (id.includes("claude")) {
+    // Fable and Mythos ship a 1M window as the default and maximum — there is
+    // no 200k mode and no `[1m]` variant to opt into, unlike Opus/Sonnet whose
+    // 1M window in Claude Code is gated behind the `[1m]` model id.
+    if (/fable|mythos/.test(id)) return CLAUDE_1M_CONTEXT_WINDOW;
     return /\[1m\]|[-_]1m\b/.test(id)
       ? CLAUDE_1M_CONTEXT_WINDOW
       : CLAUDE_DEFAULT_CONTEXT_WINDOW;
