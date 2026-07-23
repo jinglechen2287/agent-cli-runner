@@ -77,7 +77,6 @@ describe("Codex app-server runner", () => {
     const onToolUse = vi.fn();
     const onToolResult = vi.fn();
     const onUsage = vi.fn();
-    const onUserInputRequest = vi.fn(async () => ({ answers: {} }));
     const requests = captureRequests(child, (message) => {
       if (message.method === "initialize") {
         send(child, { id: message.id, result: { userAgent: "codex-test" } });
@@ -165,17 +164,11 @@ describe("Codex app-server runner", () => {
       onToolUse,
       onToolResult,
       onUsage,
-      onUserInputRequest,
     });
 
     expect(spawnFn).toHaveBeenCalledWith(
       "codex",
-      [
-        "app-server",
-        "--stdio",
-        "--enable",
-        "default_mode_request_user_input",
-      ],
+      ["app-server", "--stdio"],
       expect.objectContaining({ cwd: "/tmp/project", detached: process.platform !== "win32" }),
     );
     expect(requests[0]).toMatchObject({
@@ -823,337 +816,9 @@ describe("Codex app-server runner", () => {
     });
   });
 
-  it("answers native question requests through the normalized callback", async () => {
-    const child = makeFakeChild();
-    const callbackAnswers = Object.defineProperty({
-        framework: ["React"],
-        notes: ["Keep it small"],
-    }, "__proto__", {
-      value: ["safe"],
-      enumerable: true,
-    }) as Record<string, string[]>;
-    const onUserInputRequest = vi.fn(async () => ({ answers: callbackAnswers }));
-    const requests = captureRequests(child, (message) => {
-      if (message.method === "initialize") {
-        send(child, { id: message.id, result: {} });
-      } else if (message.method === "thread/start") {
-        send(child, {
-          id: message.id,
-          result: { thread: { id: "thread-question" }, model: "gpt-test" },
-        });
-      } else if (message.method === "turn/start") {
-        send(child, {
-          id: message.id,
-          result: { turn: completedTurn("turn-question", "inProgress") },
-        });
-        send(child, {
-          id: 99,
-          method: "item/tool/requestUserInput",
-          params: {
-            threadId: "thread-question",
-            turnId: "turn-question",
-            itemId: "question-1",
-            autoResolutionMs: 30_000,
-            questions: [
-              {
-                id: "framework",
-                header: "Framework",
-                question: "Which framework?",
-                isOther: true,
-                isSecret: false,
-                options: [
-                  { label: "React", description: "Use React components" },
-                  { label: "Vue", description: "   " },
-                ],
-              },
-              {
-                id: "notes",
-                header: "Notes",
-                question: "Anything else?",
-                isOther: false,
-                isSecret: true,
-                options: null,
-              },
-              {
-                id: "__proto__",
-                header: "Special",
-                question: "Preserve this ID?",
-                isOther: false,
-                isSecret: false,
-                options: [{ label: "safe" }],
-              },
-            ],
-          },
-        });
-      } else if (message.id === 99 && message.result !== undefined) {
-        send(child, {
-          method: "turn/completed",
-          params: {
-            threadId: "thread-question",
-            turn: completedTurn("turn-question"),
-          },
-        });
-      }
-    });
-
-    await runCodex({
-      prompt: "x",
-      cwd: "/tmp",
-      spawnFn: (() => child) as never,
-      onUserInputRequest,
-    });
-
-    expect(onUserInputRequest).toHaveBeenCalledWith({
-      requestId: "question-1",
-      autoResolutionMs: 30_000,
-      questions: [
-        {
-          id: "framework",
-          header: "Framework",
-          question: "Which framework?",
-          multiSelect: false,
-          allowOther: true,
-          secret: false,
-          options: [
-            { label: "React", description: "Use React components" },
-            { label: "Vue" },
-          ],
-        },
-        {
-          id: "notes",
-          header: "Notes",
-          question: "Anything else?",
-          multiSelect: false,
-          allowOther: false,
-          secret: true,
-          options: [],
-        },
-        {
-          id: "__proto__",
-          header: "Special",
-          question: "Preserve this ID?",
-          multiSelect: false,
-          allowOther: false,
-          secret: false,
-          options: [{ label: "safe" }],
-        },
-      ],
-    });
-    const response = requests.find(({ id, result }) => id === 99 && result !== undefined)?.result as {
-      answers: Record<string, { answers: string[] }>;
-    };
-    expect(response.answers.framework).toEqual({ answers: ["React"] });
-    expect(response.answers.notes).toEqual({ answers: ["Keep it small"] });
-    expect(Object.hasOwn(response.answers, "__proto__")).toBe(true);
-    expect(response.answers["__proto__"]).toEqual({ answers: ["safe"] });
-    expect(Object.getPrototypeOf(response.answers)).toBe(Object.prototype);
-  });
-
-  it("ends and closes a Codex invocation when the host pauses for user input", async () => {
-    const child = makeFakeChild();
-    const onUserInputRequest = vi.fn(async () => ({ action: "pause" as const }));
-    const requests = captureRequests(child, (message) => {
-      if (message.method === "initialize") {
-        send(child, { id: message.id, result: {} });
-      } else if (message.method === "thread/start") {
-        send(child, {
-          id: message.id,
-          result: { thread: { id: "thread-paused" }, model: "gpt-test" },
-        });
-      } else if (message.method === "turn/start") {
-        send(child, {
-          id: message.id,
-          result: { turn: completedTurn("turn-paused", "inProgress") },
-        });
-        send(child, {
-          id: 99,
-          method: "item/tool/requestUserInput",
-          params: {
-            threadId: "thread-paused",
-            turnId: "turn-paused",
-            itemId: "question-paused",
-            questions: [{
-              id: "choice",
-              header: "Choice",
-              question: "Pick one",
-              options: [{ label: "A" }],
-            }],
-          },
-        });
-      }
-    });
-
-    await expect(runCodex({
-      prompt: "ask first",
-      cwd: "/tmp",
-      spawnFn: (() => child) as never,
-      onUserInputRequest,
-    })).resolves.toMatchObject({
-      text: "",
-      exitCode: 0,
-      sessionId: "thread-paused",
-      stopReason: "user_input",
-    });
-    expect(onUserInputRequest).toHaveBeenCalledWith({
-      requestId: "question-paused",
-      questions: [{
-        id: "choice",
-        header: "Choice",
-        question: "Pick one",
-        options: [{ label: "A" }],
-        multiSelect: false,
-        allowOther: false,
-        secret: false,
-      }],
-    });
-    await vi.waitFor(() => expect(requests).toContainEqual({
-      id: 99,
-      result: { answers: {} },
-    }));
-    expect(child.kill).toHaveBeenCalled();
-  });
-
-  it("rejects malformed native questions and does not consume another turn's request", async () => {
-    const child = makeFakeChild();
-    const onUserInputRequest = vi.fn(async () => ({ answers: {} }));
-    const requests = captureRequests(child, (message) => {
-      if (message.method === "initialize") {
-        send(child, { id: message.id, result: {} });
-      } else if (message.method === "thread/start") {
-        send(child, {
-          id: message.id,
-          result: { thread: { id: "thread-native-validation" }, model: "gpt-test" },
-        });
-      } else if (message.method === "turn/start") {
-        send(child, {
-          id: message.id,
-          result: { turn: completedTurn("turn-native-validation", "inProgress") },
-        });
-        send(child, {
-          id: 99,
-          method: "item/tool/requestUserInput",
-          params: {
-            threadId: "thread-native-validation",
-            turnId: "turn-native-validation",
-            itemId: "question-malformed",
-            autoResolutionMs: Number.MAX_SAFE_INTEGER + 1,
-            questions: [{
-              id: "choice",
-              header: "Choice",
-              question: "Choose",
-              options: null,
-            }],
-          },
-        });
-      } else if (message.id === 99 && message.error !== undefined) {
-        send(child, {
-          id: 101,
-          method: "item/tool/requestUserInput",
-          params: {
-            threadId: "thread-native-validation",
-            turnId: "turn-native-validation",
-            itemId: "question-invalid-flag",
-            questions: [{
-              id: "choice",
-              header: "Choice",
-              question: "Choose",
-              isOther: "yes",
-              options: null,
-            }],
-          },
-        });
-      } else if (message.id === 101 && message.error !== undefined) {
-        send(child, {
-          id: 102,
-          method: "item/tool/requestUserInput",
-          params: {
-            threadId: "thread-native-validation",
-            turnId: "turn-native-validation",
-            itemId: "question-duplicate",
-            questions: [
-              { id: "choice", header: "First", question: "First?", options: null },
-              { id: "choice", header: "Second", question: "Second?", options: null },
-            ],
-          },
-        });
-      } else if (message.id === 102 && message.error !== undefined) {
-        send(child, {
-          id: 100,
-          method: "item/tool/requestUserInput",
-          params: {
-            threadId: "another-thread",
-            turnId: "another-turn",
-            itemId: "question-other",
-            questions: [{
-              id: "choice",
-              header: "Choice",
-              question: "Choose",
-              options: null,
-            }],
-          },
-        });
-      } else if (message.id === 100 && message.error !== undefined) {
-        send(child, {
-          method: "item/completed",
-          params: {
-            threadId: "thread-native-validation",
-            turnId: "turn-native-validation",
-            item: { type: "agentMessage", id: "message-native-validation", text: "Done" },
-          },
-        });
-        send(child, {
-          method: "turn/completed",
-          params: {
-            threadId: "thread-native-validation",
-            turn: completedTurn("turn-native-validation"),
-          },
-        });
-      }
-    });
-
-    await expect(runCodex({
-      prompt: "x",
-      cwd: "/tmp",
-      spawnFn: (() => child) as never,
-      onUserInputRequest,
-    })).resolves.toMatchObject({ text: "Done", exitCode: 0 });
-
-    expect(onUserInputRequest).not.toHaveBeenCalled();
-    expect(requests).toContainEqual({
-      id: 99,
-      error: {
-        code: -32603,
-        message: "Malformed Codex user-input auto-resolution timeout",
-      },
-    });
-    expect(requests).toContainEqual({
-      id: 101,
-      error: {
-        code: -32603,
-        message: "Malformed Codex isOther for question choice",
-      },
-    });
-    expect(requests).toContainEqual({
-      id: 102,
-      error: {
-        code: -32603,
-        message: "Codex user-input request has duplicate question IDs",
-      },
-    });
-    expect(requests).toContainEqual({
-      id: 100,
-      error: {
-        code: -32601,
-        message: "Unsupported server request: item/tool/requestUserInput",
-      },
-    });
-  });
-
   it("routes concurrent turns over a reusable client and leaves its lifecycle to the owner", async () => {
     const child = makeFakeChild();
     let threadNumber = 0;
-    const onFirstQuestion = vi.fn(async () => ({ answers: { choice: ["One"] } }));
-    const onSecondQuestion = vi.fn(async () => ({ answers: { choice: ["Two"] } }));
     captureRequests(child, (message) => {
       if (message.method === "initialize") {
         send(child, { id: message.id, result: {} });
@@ -1167,24 +832,6 @@ describe("Codex app-server runner", () => {
         const threadId = String(message.params?.threadId);
         const turnId = threadId.replace("thread", "turn");
         send(child, { id: message.id, result: { turn: completedTurn(turnId, "inProgress") } });
-        send(child, {
-          id: threadId === "thread-1" ? 101 : 102,
-          method: "item/tool/requestUserInput",
-          params: {
-            threadId,
-            turnId,
-            itemId: `${turnId}-question`,
-            questions: [{
-              id: "choice",
-              header: "Choice",
-              question: `Choose for ${threadId}`,
-              options: [{ label: "One", description: "First" }],
-            }],
-          },
-        });
-      } else if ((message.id === 101 || message.id === 102) && message.result !== undefined) {
-        const threadId = message.id === 101 ? "thread-1" : "thread-2";
-        const turnId = threadId.replace("thread", "turn");
         send(child, {
           method: "item/completed",
           params: {
@@ -1206,57 +853,15 @@ describe("Codex app-server runner", () => {
     });
 
     const [first, second] = await Promise.all([
-      runCodex({
-        prompt: "one",
-        cwd: "/tmp/one",
-        appServerClient: client,
-        onUserInputRequest: onFirstQuestion,
-      }),
-      runCodex({
-        prompt: "two",
-        cwd: "/tmp/two",
-        appServerClient: client,
-        onUserInputRequest: onSecondQuestion,
-      }),
+      runCodex({ prompt: "one", cwd: "/tmp/one", appServerClient: client }),
+      runCodex({ prompt: "two", cwd: "/tmp/two", appServerClient: client }),
     ]);
 
     expect(first).toMatchObject({ text: "Done thread-1", sessionId: "thread-1" });
     expect(second).toMatchObject({ text: "Done thread-2", sessionId: "thread-2" });
-    expect(onFirstQuestion).toHaveBeenCalledWith(expect.objectContaining({
-      requestId: "turn-1-question",
-    }));
-    expect(onSecondQuestion).toHaveBeenCalledWith(expect.objectContaining({
-      requestId: "turn-2-question",
-    }));
     expect(child.kill).not.toHaveBeenCalled();
     client.close();
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
-  });
-
-  it("returns method-not-found when every matching server-request handler defers", async () => {
-    const child = makeFakeChild();
-    const requests = captureRequests(child, (message) => {
-      if (message.method === "initialize") send(child, { id: message.id, result: {} });
-    });
-    const client = await createCodexAppServerClient({
-      cwd: "/tmp",
-      spawnFn: (() => child) as never,
-    });
-    client.onServerRequest("item/tool/requestUserInput", () => undefined);
-    client.onServerRequest("item/tool/requestUserInput", () => undefined);
-    send(child, {
-      id: 99,
-      method: "item/tool/requestUserInput",
-      params: {},
-    });
-    await vi.waitFor(() => expect(requests).toContainEqual({
-      id: 99,
-      error: {
-        code: -32601,
-        message: "Unsupported server request: item/tool/requestUserInput",
-      },
-    }));
-    client.close();
   });
 
   it("forwards a per-turn sandboxPolicy override in turn/start", async () => {

@@ -1,15 +1,8 @@
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { AbortError, TimeoutError } from "./errors.js";
-import type { UserInputCallbackResult, UserInputPause } from "./types.js";
 
 export const SIGTERM_GRACE_MS = 2000;
-
-export function isUserInputPause(
-  result: UserInputCallbackResult,
-): result is UserInputPause {
-  return "action" in result && result.action === "pause";
-}
 
 /** Collapse a raw tool field into the one-line, non-empty form promised by a
  * tool-use summary. Runs of whitespace (including newlines in a multiline

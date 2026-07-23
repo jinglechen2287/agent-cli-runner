@@ -32,12 +32,6 @@ export type {
   ToolResultInfo,
   ToolPlanItem,
   ToolUseInfo,
-  UserInputCallbackResult,
-  UserInputOption,
-  UserInputPause,
-  UserInputQuestion,
-  UserInputRequest,
-  UserInputResponse,
 } from "./types.js";
 export {
   contextWindowForModel,

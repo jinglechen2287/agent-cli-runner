@@ -81,41 +81,6 @@ interface ToolResultInfo {
     content: unknown;
     isError?: boolean;
 }
-/** One selectable answer supplied by a provider-native question tool. */
-interface UserInputOption {
-    label: string;
-    /** Explanatory copy shown next to the label when the provider supplies it. */
-    description?: string;
-}
-/** One provider-native question normalized for a host UI. */
-interface UserInputQuestion {
-    id: string;
-    header: string;
-    question: string;
-    options: UserInputOption[];
-    multiSelect: boolean;
-    allowOther: boolean;
-    secret: boolean;
-}
-/** A question-tool invocation that pauses the current provider turn. */
-interface UserInputRequest {
-    requestId: string;
-    questions: UserInputQuestion[];
-    autoResolutionMs?: number;
-}
-/** Answers keyed by normalized question id. */
-interface UserInputResponse {
-    answers: Record<string, string[]>;
-}
-/** End the current provider invocation at the question boundary. The host can
- * present the request after the run returns and resume the same conversation
- * with an ordinary user message in a later invocation. */
-interface UserInputPause {
-    action: "pause";
-}
-/** Backward-compatible callback result: existing hosts answer in place, while
- * hosts that own turn boundaries can pause and resume with a later message. */
-type UserInputCallbackResult = UserInputResponse | UserInputPause;
 /** One provider-normalized item from a Codex plan/todo snapshot. */
 interface ToolPlanItem {
     text: string;
@@ -166,8 +131,6 @@ interface AgentCallbacks {
     onToolUse?: (info: ToolUseInfo) => void;
     /** Fired when the provider reports the result for a tool invocation. */
     onToolResult?: (info: ToolResultInfo) => void;
-    /** Fired when the provider pauses the current turn for structured user input. */
-    onUserInputRequest?: (request: UserInputRequest) => Promise<UserInputCallbackResult>;
     /** Fired whenever a background subagent starts, progresses, or finishes.
      * Repeated calls with the same id are replace-in-place snapshots. */
     onBackgroundAgentUpdate?: (info: BackgroundAgentInfo) => void;
@@ -202,8 +165,6 @@ interface RunResult {
     exitCode: number;
     /** Claude session id / Codex thread id, when the CLI reported one. */
     sessionId?: string;
-    /** Present when the host asked the runner to end at a native question. */
-    stopReason?: "user_input";
     /** The latest context-usage snapshot of the turn, when the CLI reported any
      * token counts. Matches the final {@link AgentCallbacks.onUsage} value. */
     usage?: TokenUsage;
@@ -254,8 +215,8 @@ interface RunClaudeOptions extends CommonRunOptions {
      * disabled. Intended for small metadata tasks such as chat titles. */
     isolated?: boolean;
 }
-/** Run one logical Claude turn. Native questions may stop and resume several
- * `claude -p` processes, but hosts see one callback stream and one result. */
+/** Spawn a non-interactive Claude Code CLI turn (`claude -p` with stream-json
+ * output) and translate its JSONL stream into callbacks plus a final result. */
 declare function runClaude(opts: RunClaudeOptions): Promise<RunResult>;
 
 interface CodexServerRequest {
@@ -268,10 +229,7 @@ interface CodexAppServerClient {
     request(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
     notify(method: string, params?: unknown): void;
     onNotification(handler: (method: string, params: unknown) => void): () => void;
-    /** Register a handler for one server-initiated RPC method. Returning
-     * undefined leaves the request available to another handler (used when one
-     * client multiplexes several threads). */
-    onServerRequest(method: string, handler: CodexServerRequestHandler): () => void;
+    onServerRequest(handler: CodexServerRequestHandler): () => void;
     onStderr(handler: (chunk: string) => void): () => void;
     onClose(handler: (error: Error) => void): () => void;
     close(): void;
@@ -282,8 +240,6 @@ interface CreateCodexAppServerClientOptions {
     env?: NodeJS.ProcessEnv;
     spawnFn?: RunCodexOptions["spawnFn"];
     requestTimeoutMs?: number;
-    /** Expose Codex's native request_user_input tool outside Plan mode. */
-    enableDefaultModeUserInput?: boolean;
 }
 type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "spawnFn">;
 interface CodexAppServerSession {
@@ -304,8 +260,6 @@ interface CreateCodexAppServerSessionOptions {
     model?: string;
     developerInstructions?: string;
     dangerouslyBypassApprovalsAndSandbox?: boolean;
-    /** Expose Codex's native request_user_input tool outside Plan mode. */
-    enableDefaultModeUserInput?: boolean;
 }
 declare function createCodexAppServerClient(options: CreateCodexAppServerClientOptions): Promise<CodexAppServerClient>;
 declare function createCodexAppServerSession(options: CreateCodexAppServerSessionOptions): Promise<CodexAppServerSession>;
@@ -387,4 +341,4 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, type UserInputCallbackResult, type UserInputOption, type UserInputPause, type UserInputQuestion, type UserInputRequest, type UserInputResponse, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, runClaude, runCodex };

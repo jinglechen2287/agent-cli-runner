@@ -17,7 +17,6 @@
   ],
   "scripts": {
     "build": "tsup",
-    "pretest": "pnpm build",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
