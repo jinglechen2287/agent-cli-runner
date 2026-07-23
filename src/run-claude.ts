@@ -541,6 +541,12 @@ async function runClaudeProcess(opts: RunClaudeOptions): Promise<ClaudeProcessRe
 
   const spawnFn = opts.spawnFn ?? nodeSpawn;
   const args: string[] = ["-p", "--output-format", "stream-json", "--verbose"];
+  // Claude Code hides AskUserQuestion from plain headless sessions even when
+  // --tools names it. The stdio permission bridge makes the interactive tool
+  // available; our PreToolUse hook still defers it before any stdio prompt.
+  if (opts.onUserInputRequest) {
+    args.push("--permission-prompt-tool", "stdio");
+  }
   if (opts.isolated) {
     args.push(
       "--safe-mode",

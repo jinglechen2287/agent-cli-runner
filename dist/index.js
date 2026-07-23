@@ -488,6 +488,9 @@ async function runClaudeProcess(opts) {
   }
   const spawnFn = opts.spawnFn ?? nodeSpawn2;
   const args = ["-p", "--output-format", "stream-json", "--verbose"];
+  if (opts.onUserInputRequest) {
+    args.push("--permission-prompt-tool", "stdio");
+  }
   if (opts.isolated) {
     args.push(
       "--safe-mode",

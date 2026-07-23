@@ -311,6 +311,7 @@ describe("runClaude", () => {
     const args = spawnFn.mock.calls[0]![1];
     expect(args).not.toContain("--setting-sources");
     expect(args).not.toContain("--settings");
+    expect(args).not.toContain("--permission-prompt-tool");
     finish(child);
     await promise;
   });
@@ -355,6 +356,10 @@ describe("runClaude", () => {
     finish(version);
     await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(2));
     const initialArgs = spawnFn.mock.calls[1]![1] as string[];
+    expect(initialArgs.filter((arg) => arg === "--permission-prompt-tool"))
+      .toHaveLength(1);
+    expect(initialArgs[initialArgs.indexOf("--permission-prompt-tool") + 1])
+      .toBe("stdio");
     const settingsIndex = initialArgs.indexOf("--settings");
     const settingsPath = initialArgs[settingsIndex + 1] as string;
     const mergedSettings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
@@ -488,6 +493,10 @@ describe("runClaude", () => {
     const resumedArgs = spawnFn.mock.calls[2]![1] as string[];
     expect(resumedArgs).toContain("--resume");
     expect(resumedArgs[resumedArgs.indexOf("--resume") + 1]).toBe("session-question");
+    expect(resumedArgs.filter((arg) => arg === "--permission-prompt-tool"))
+      .toHaveLength(1);
+    expect(resumedArgs[resumedArgs.indexOf("--permission-prompt-tool") + 1])
+      .toBe("stdio");
     expect(JSON.stringify(resumedArgs)).not.toContain("React");
     expect(JSON.stringify(resumedArgs)).not.toContain("TypeScript");
     expect(JSON.stringify(spawnFn.mock.calls[2]![2].env)).not.toContain("React");
