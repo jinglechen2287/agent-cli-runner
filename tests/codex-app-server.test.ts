@@ -77,6 +77,7 @@ describe("Codex app-server runner", () => {
     const onToolUse = vi.fn();
     const onToolResult = vi.fn();
     const onUsage = vi.fn();
+    const onUserInputRequest = vi.fn(async () => ({ answers: {} }));
     const requests = captureRequests(child, (message) => {
       if (message.method === "initialize") {
         send(child, { id: message.id, result: { userAgent: "codex-test" } });
@@ -164,11 +165,17 @@ describe("Codex app-server runner", () => {
       onToolUse,
       onToolResult,
       onUsage,
+      onUserInputRequest,
     });
 
     expect(spawnFn).toHaveBeenCalledWith(
       "codex",
-      ["app-server", "--stdio"],
+      [
+        "app-server",
+        "--stdio",
+        "--enable",
+        "default_mode_request_user_input",
+      ],
       expect.objectContaining({ cwd: "/tmp/project", detached: process.platform !== "win32" }),
     );
     expect(requests[0]).toMatchObject({

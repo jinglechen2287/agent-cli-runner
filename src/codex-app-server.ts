@@ -69,6 +69,8 @@ export interface CreateCodexAppServerClientOptions {
   env?: NodeJS.ProcessEnv;
   spawnFn?: RunCodexOptions["spawnFn"];
   requestTimeoutMs?: number;
+  /** Expose Codex's native request_user_input tool outside Plan mode. */
+  enableDefaultModeUserInput?: boolean;
 }
 
 export type CodexAppServerTurnOptions = Omit<
@@ -104,6 +106,8 @@ export interface CreateCodexAppServerSessionOptions {
   model?: string;
   developerInstructions?: string;
   dangerouslyBypassApprovalsAndSandbox?: boolean;
+  /** Expose Codex's native request_user_input tool outside Plan mode. */
+  enableDefaultModeUserInput?: boolean;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -145,7 +149,14 @@ export async function createCodexAppServerClient(
   const spawnFn = options.spawnFn ?? nodeSpawn;
   let child: ChildProcess;
   try {
-    child = spawnFn(options.executablePath ?? "codex", ["app-server", "--stdio"], {
+    const args = [
+      "app-server",
+      "--stdio",
+      ...(options.enableDefaultModeUserInput
+        ? ["--enable", "default_mode_request_user_input"]
+        : []),
+    ];
+    child = spawnFn(options.executablePath ?? "codex", args, {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]),
@@ -1250,6 +1261,9 @@ export async function createCodexAppServerSession(
     ...(options.requestTimeoutMs !== undefined
       ? { requestTimeoutMs: options.requestTimeoutMs }
       : {}),
+    ...(options.enableDefaultModeUserInput
+      ? { enableDefaultModeUserInput: true }
+      : {}),
   });
 
   let opened: OpenedCodexThread;
@@ -1324,6 +1338,7 @@ export async function runCodexAppServer(opts: RunCodexOptions): Promise<RunResul
     ...(opts.executablePath ? { executablePath: opts.executablePath } : {}),
     ...(opts.env ? { env: opts.env } : {}),
     ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
+    ...(opts.onUserInputRequest ? { enableDefaultModeUserInput: true } : {}),
   });
   return runCodexAppServerTurn(opts, client, undefined, ownedClient);
 }
