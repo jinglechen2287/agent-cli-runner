@@ -174,6 +174,50 @@ describe("runClaude", () => {
     await promise;
   });
 
+  it("passes --model with the given model", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "make it round",
+      cwd: "/tmp",
+      model: "opus",
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    const flagIndex = args.indexOf("--model");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe("opus");
+    finish(child);
+    await promise;
+  });
+
+  it("passes --effort with the given level", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "think hard",
+      cwd: "/tmp",
+      effort: "xhigh",
+      spawnFn: spawnFn as never,
+    });
+    const [, args] = spawnFn.mock.calls[0]!;
+    const flagIndex = args.indexOf("--effort");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe("xhigh");
+    finish(child);
+    await promise;
+  });
+
+  it("omits --model and --effort by default", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({ prompt: "x", cwd: "/tmp", spawnFn: spawnFn as never });
+    expect(spawnFn.mock.calls[0]![1]).not.toContain("--model");
+    expect(spawnFn.mock.calls[0]![1]).not.toContain("--effort");
+    finish(child);
+    await promise;
+  });
+
   it("passes --disallowed-tools with the given tool names", async () => {
     const child = makeFakeChild();
     const spawnFn = vi.fn().mockReturnValue(child);

@@ -180,6 +180,13 @@ declare const CLAUDE_STRIPPED_ENV_VARS: readonly ["CLAUDECODE", "CLAUDE_CODE_ENT
  * resumed turns too — a session does not remember it. */
 type ClaudePermissionMode = "acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan";
 interface RunClaudeOptions extends CommonRunOptions {
+    /** Model passed via --model: an alias for the latest of a family
+     * ("fable", "opus", "sonnet", "haiku") or a full id ("claude-fable-5").
+     * Omitted = the CLI's configured default. */
+    model?: string;
+    /** Effort level passed via --effort ("low" | "medium" | "high" | "xhigh" |
+     * "max"). Omitted = the CLI's default for the session's model. */
+    effort?: string;
     /** Text passed via --append-system-prompt. The CLI rebuilds the system
      * prompt from flags on each run, so this must be supplied on resumed turns
      * too, not just the first spawn. */

@@ -40,6 +40,13 @@ export type ClaudePermissionMode =
   | "plan";
 
 export interface RunClaudeOptions extends CommonRunOptions {
+  /** Model passed via --model: an alias for the latest of a family
+   * ("fable", "opus", "sonnet", "haiku") or a full id ("claude-fable-5").
+   * Omitted = the CLI's configured default. */
+  model?: string;
+  /** Effort level passed via --effort ("low" | "medium" | "high" | "xhigh" |
+   * "max"). Omitted = the CLI's default for the session's model. */
+  effort?: string;
   /** Text passed via --append-system-prompt. The CLI rebuilds the system
    * prompt from flags on each run, so this must be supplied on resumed turns
    * too, not just the first spawn. */
@@ -322,6 +329,12 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
   // when the host is actually rendering the fragments.
   if (opts.onAssistantTextDelta) {
     args.push("--include-partial-messages");
+  }
+  if (opts.model) {
+    args.push("--model", opts.model);
+  }
+  if (opts.effort) {
+    args.push("--effort", opts.effort);
   }
   if (opts.appendSystemPrompt) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
