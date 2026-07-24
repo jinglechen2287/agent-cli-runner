@@ -280,6 +280,11 @@ function toClaudeUsage(usage, model, contextWindow) {
 function baseModelId(model) {
   return model.replace(/\[[^\]]*\]$/, "");
 }
+function qualifyModel(model, sessionModel) {
+  if (!model) return sessionModel;
+  if (!sessionModel) return model;
+  return baseModelId(sessionModel) === baseModelId(model) ? sessionModel : model;
+}
 function pickPrimaryModel(modelUsage, preferred) {
   if (!modelUsage) return void 0;
   const entries = Object.entries(modelUsage);
@@ -368,6 +373,7 @@ async function runClaude(opts) {
     let lastAssistantText;
     let resultText;
     let lastAssistantModel;
+    let sessionModel;
     let lastMessageUsage;
     let lastUsage;
     const agentToolCallIds = /* @__PURE__ */ new Set();
@@ -417,8 +423,9 @@ async function runClaude(opts) {
         }
         return;
       }
-      if (parsed.type === "system" && parsed.subtype === "init" && parsed.session_id) {
-        emitSessionId(parsed.session_id);
+      if (parsed.type === "system" && parsed.subtype === "init") {
+        if (typeof parsed.model === "string" && parsed.model) sessionModel = parsed.model;
+        if (parsed.session_id) emitSessionId(parsed.session_id);
         return;
       }
       if (parsed.type === "system" && parsed.subtype === "task_started" && typeof parsed.task_id === "string") {
@@ -502,7 +509,8 @@ async function runClaude(opts) {
           lastAssistantText = text2;
           opts.onAssistantText?.(text2);
         }
-        const model = parsed.message.model;
+        if (parsed.parent_tool_use_id) return;
+        const model = qualifyModel(parsed.message.model, sessionModel);
         if (model) lastAssistantModel = model;
         if (parsed.message.usage) {
           lastMessageUsage = parsed.message.usage;

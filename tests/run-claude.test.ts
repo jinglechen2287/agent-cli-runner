@@ -1401,6 +1401,148 @@ describe("runClaude", () => {
     });
   });
 
+  it("re-attaches the init line's variant marker to live per-message usage", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+    // Claude Code names the qualified model once, on the init line, and strips
+    // the marker on every assistant message. Guessing the window from the
+    // stripped id reads a 1M session as 200k for the whole turn.
+    child.stdout.write(
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess-1",
+        model: "claude-opus-4-8[1m]",
+      }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-opus-4-8",
+          content: [{ type: "text", text: "hi" }],
+          usage: { input_tokens: 2, cache_read_input_tokens: 15099, output_tokens: 6 },
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onUsage).toHaveBeenCalledWith({
+      contextTokens: 2 + 15099,
+      inputTokens: 2,
+      cachedInputTokens: 15099,
+      outputTokens: 6,
+      model: "claude-opus-4-8[1m]",
+      contextWindow: 1_000_000,
+    });
+  });
+
+  it("keeps a different model's own id rather than the session model's marker", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess-1",
+        model: "claude-opus-4-8[1m]",
+      }) + "\n",
+    );
+    // A turn that switched models: the marker belongs to the session model, not
+    // to whatever else answered.
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-haiku-4-5-20251001",
+          content: [{ type: "text", text: "hi" }],
+          usage: { input_tokens: 2, output_tokens: 6 },
+        },
+      }) + "\n",
+    );
+    finish(child);
+    await promise;
+    expect(onUsage).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        model: "claude-haiku-4-5-20251001",
+        contextWindow: 200_000,
+      }),
+    );
+  });
+
+  it("ignores a subagent's usage — it occupies its own context, not the turn's", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-opus-4-8[1m]",
+          content: [{ type: "text", text: "parent" }],
+          usage: { input_tokens: 10, cache_read_input_tokens: 90, output_tokens: 6 },
+        },
+      }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        parent_tool_use_id: "toolu_1",
+        message: {
+          model: "claude-haiku-4-5-20251001",
+          content: [{ type: "text", text: "subagent" }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      }) + "\n",
+    );
+    child.stdout.write(
+      JSON.stringify({
+        type: "result",
+        result: "done",
+        session_id: "s1",
+        usage: { input_tokens: 11, cache_read_input_tokens: 90, output_tokens: 7 },
+        modelUsage: {
+          "claude-haiku-4-5-20251001": { contextWindow: 200_000 },
+          "claude-opus-4-8[1m]": { contextWindow: 1_000_000 },
+        },
+      }) + "\n",
+    );
+    finish(child);
+    const result = await promise;
+    expect(onUsage).toHaveBeenCalledWith({
+      contextTokens: 100,
+      inputTokens: 10,
+      cachedInputTokens: 90,
+      outputTokens: 6,
+      model: "claude-opus-4-8[1m]",
+      contextWindow: 1_000_000,
+    });
+    // The subagent answered last, but it must not become the model the result
+    // event attributes the turn's occupancy to.
+    expect(result.usage).toMatchObject({
+      contextTokens: 100,
+      model: "claude-opus-4-8[1m]",
+      contextWindow: 1_000_000,
+    });
+  });
+
   it("corrects the window from the result event's authoritative modelUsage and returns it", async () => {
     const child = makeFakeChild();
     const onUsage = vi.fn();

@@ -209,6 +209,8 @@ interface StreamLine {
   type?: string;
   subtype?: string;
   session_id?: string;
+  /** On the `init` line: the session's model, variant marker included. */
+  model?: string;
   event?: ClaudeStreamEvent;
   /** Set on lines produced by a background subagent, naming the tool call that
    * spawned it. Null/absent on the parent turn's own output. */
@@ -270,6 +272,22 @@ function toClaudeUsage(
  * an assistant message) matches `claude-opus-4-8[1m]` (a modelUsage key). */
 function baseModelId(model: string): string {
   return model.replace(/\[[^\]]*\]$/, "");
+}
+
+/** Restore the variant marker an assistant message dropped. Claude Code names
+ * the qualified model (`claude-opus-4-8[1m]`) once, on the init line, and
+ * reports the bare id on every assistant message — and that marker is the only
+ * thing that tells a 1M session apart from the 200k default, so guessing the
+ * live window from the bare id reads a 1M turn as 200k until the result event
+ * corrects it. Only the same base model inherits the marker: a sub-agent or a
+ * mid-turn switch keeps its own id. */
+function qualifyModel(
+  model: string | undefined,
+  sessionModel: string | undefined,
+): string | undefined {
+  if (!model) return sessionModel;
+  if (!sessionModel) return model;
+  return baseModelId(sessionModel) === baseModelId(model) ? sessionModel : model;
 }
 
 /** Pick the turn's main model from the `result` event's per-model rollup: the
@@ -378,6 +396,8 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     let lastAssistantText: string | undefined;
     let resultText: string | undefined;
     let lastAssistantModel: string | undefined;
+    /** The init line's fully-qualified model id, variant marker included. */
+    let sessionModel: string | undefined;
     let lastMessageUsage: ClaudeUsage | undefined;
     let lastUsage: TokenUsage | undefined;
     const agentToolCallIds = new Set<string>();
@@ -440,8 +460,9 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
         }
         return;
       }
-      if (parsed.type === "system" && parsed.subtype === "init" && parsed.session_id) {
-        emitSessionId(parsed.session_id);
+      if (parsed.type === "system" && parsed.subtype === "init") {
+        if (typeof parsed.model === "string" && parsed.model) sessionModel = parsed.model;
+        if (parsed.session_id) emitSessionId(parsed.session_id);
         return;
       }
       if (
@@ -561,7 +582,11 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
           lastAssistantText = text;
           opts.onAssistantText?.(text);
         }
-        const model = parsed.message.model;
+        // A subagent runs on its own context window; its usage says nothing
+        // about how full this turn's is. Its tool calls and prose above still
+        // belong in the parent transcript — only the occupancy doesn't.
+        if (parsed.parent_tool_use_id) return;
+        const model = qualifyModel(parsed.message.model, sessionModel);
         // Track the responding model even on messages without usage, so the
         // result event can attribute usage to it rather than the largest-window
         // model in a multi-model turn.
