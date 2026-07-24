@@ -38,3 +38,22 @@ export {
   KNOWN_CONTEXT_WINDOWS,
   type TokenUsage,
 } from "./usage.js";
+export {
+  collectCodexModels,
+  createModelCatalogService,
+  parseClaudeCliHelp,
+} from "./model-catalog.js";
+export type {
+  ClaudeCliCapabilities,
+  CodexModelDescriptor,
+  ModelCatalog,
+  ModelCatalogConfig,
+  ModelCatalogDeps,
+  ModelCatalogProvider,
+  ModelCatalogService,
+  ModelEffortOption,
+  ModelOption,
+  ModelSelection,
+  ModelSelectionInput,
+  ModelServiceTierOption,
+} from "./model-catalog.js";

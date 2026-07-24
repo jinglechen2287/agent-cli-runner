@@ -349,4 +349,101 @@ declare class CodexTurnError extends Error {
     exitCode?: number;
 }
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, runClaude, runCodex };
+/**
+ * Live model discovery for both providers, shared by hosts that let users
+ * pick a model/effort: Codex models come from the app-server's `model/list`
+ * API (with per-model reasoning efforts and service tiers); Claude aliases
+ * and effort levels are parsed from the installed CLI's `--help`, with
+ * static fallbacks when discovery is unavailable.
+ *
+ * Policy stays with the host: `config.defaultEffort` names the effort a host
+ * sends when a thread has none saved (advertised as each model's
+ * `defaultEffort` so UIs match the runs). Hosts that omit it get the
+ * provider-reported default, or null — meaning "omit the option and let the
+ * CLI/config decide".
+ */
+type ModelCatalogProvider = "claude" | "codex";
+interface ModelEffortOption {
+    id: string;
+    label: string;
+}
+interface ModelServiceTierOption {
+    id: string;
+    name: string;
+    description: string;
+}
+interface ModelOption {
+    id: string;
+    label: string;
+    description?: string;
+    efforts: ModelEffortOption[];
+    serviceTiers: ModelServiceTierOption[];
+    defaultEffort: string | null;
+    isDefault: boolean;
+}
+interface ModelCatalog {
+    provider: ModelCatalogProvider;
+    source: "codex-app-server" | "codex-config" | "claude-cli" | "claude-fallback";
+    fetchedAt: string;
+    supportsCustomModel: boolean;
+    models: ModelOption[];
+}
+interface ModelSelectionInput {
+    model: string | null;
+    effort?: string | null;
+    serviceTier?: string | null;
+}
+interface ModelSelection {
+    model: string | null;
+    effort: string | null;
+    serviceTier: string | null;
+}
+interface CodexModelDescriptor {
+    model: string;
+    displayName?: string;
+    description?: string;
+    hidden?: boolean;
+    isDefault?: boolean;
+    defaultReasoningEffort?: string | null;
+    supportedReasoningEfforts?: Array<{
+        reasoningEffort: string;
+    }>;
+    serviceTiers?: ModelServiceTierOption[];
+}
+interface CodexModelListResponse {
+    data?: CodexModelDescriptor[];
+    nextCursor?: string | null;
+}
+declare function collectCodexModels(requestPage: (cursor?: string) => Promise<CodexModelListResponse>): Promise<CodexModelDescriptor[]>;
+interface ModelCatalogService {
+    getCatalog(provider: ModelCatalogProvider, cwd: string): Promise<ModelCatalog>;
+    validateSelection(catalog: ModelCatalog, input: ModelSelectionInput): ModelSelection;
+}
+interface ModelCatalogConfig {
+    /** Codex binary for `model/list` discovery. Defaults to "codex" on PATH. */
+    codexPath?: string;
+    /** Claude binary for `--help` discovery. Defaults to "claude" on PATH. */
+    claudePath?: string;
+    /** A host-configured Codex model: always present in the catalog (marked
+     * default), and the discovery fallback when the app-server is unreachable. */
+    codexModel?: string;
+    /** The effort the host sends when a thread has none saved, advertised as
+     * every model's `defaultEffort`. Omitted = the provider-reported default,
+     * or null ("omit the option; the CLI/config decides"). */
+    defaultEffort?: string;
+    /** Description shown on the synthetic configured-model entry. */
+    configuredModelDescription?: string;
+}
+interface ModelCatalogDeps {
+    listCodexModels?: (executablePath: string, cwd: string) => Promise<CodexModelDescriptor[]>;
+    getClaudeCapabilities?: (executablePath: string, cwd: string) => Promise<ClaudeCliCapabilities>;
+    now?: () => Date;
+}
+interface ClaudeCliCapabilities {
+    aliases: string[];
+    efforts: string[];
+}
+declare function parseClaudeCliHelp(help: string): ClaudeCliCapabilities;
+declare function createModelCatalogService(config?: ModelCatalogConfig, deps?: ModelCatalogDeps): ModelCatalogService;
+
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, parseClaudeCliHelp, runClaude, runCodex };

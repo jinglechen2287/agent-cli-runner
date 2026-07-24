@@ -1713,6 +1713,204 @@ async function runCodex(opts) {
   }
   return runIsolatedCodex(opts);
 }
+
+// src/model-catalog.ts
+import { execFile } from "child_process";
+var MAX_CODEX_MODEL_PAGES = 50;
+async function collectCodexModels(requestPage) {
+  const models = [];
+  let cursor;
+  for (let page = 0; page < MAX_CODEX_MODEL_PAGES; page += 1) {
+    const response = await requestPage(cursor ?? void 0);
+    if (Array.isArray(response.data)) models.push(...response.data);
+    cursor = response.nextCursor;
+    if (!cursor) break;
+  }
+  return models;
+}
+var CLAUDE_FALLBACK_ALIASES = ["opus", "sonnet", "haiku"];
+var CLAUDE_FALLBACK_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+function effortLabel(value) {
+  if (value === "xhigh") return "Extra High";
+  return value.length === 0 ? value : value[0].toUpperCase() + value.slice(1);
+}
+function optionBlock(help, option) {
+  const start = help.indexOf(option);
+  if (start < 0) return "";
+  const remainder = help.slice(start);
+  const nextOption = remainder.slice(option.length).search(/\n\s{2}--[a-z]/i);
+  return nextOption < 0 ? remainder : remainder.slice(0, option.length + nextOption);
+}
+function uniqueValues(values) {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+}
+function parseClaudeCliHelp(help) {
+  const modelHelp = optionBlock(help, "--model <model>");
+  const aliasHelp = modelHelp.split(/\bor\s+a\s+model(?:'s)?\b/i)[0] ?? "";
+  const aliases = uniqueValues(
+    [...aliasHelp.matchAll(/'([^']+)'/g)].map((match) => match[1] ?? "")
+  ).filter((alias) => /^[a-z0-9][a-z0-9._[\]-]*$/i.test(alias));
+  const effortHelp = optionBlock(help, "--effort <level>");
+  const effortList = effortHelp.match(/\(([^)]+)\)/)?.[1] ?? "";
+  const efforts = uniqueValues(effortList.split(","));
+  return { aliases, efforts };
+}
+function readClaudeCliCapabilities(executablePath, cwd) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      executablePath,
+      ["--help"],
+      { cwd, timeout: 5e3, maxBuffer: 1e6 },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(parseClaudeCliHelp(`${stdout}
+${stderr}`));
+      }
+    );
+  });
+}
+function claudeModels(capabilities, defaultEffort) {
+  const aliases = capabilities.aliases.length > 0 ? capabilities.aliases : CLAUDE_FALLBACK_ALIASES;
+  const discoveredEfforts = capabilities.efforts.length > 0 ? capabilities.efforts : CLAUDE_FALLBACK_EFFORTS;
+  const efforts = uniqueValues([...discoveredEfforts, ...defaultEffort ? [defaultEffort] : []]).map((effort) => ({ id: effort, label: effortLabel(effort) }));
+  return [
+    {
+      id: "default",
+      label: "Default",
+      description: "Use the model selected by Claude Code and your account",
+      efforts,
+      serviceTiers: [],
+      defaultEffort: defaultEffort ?? null,
+      isDefault: true
+    },
+    ...aliases.filter((alias) => alias !== "default").map((alias) => ({
+      id: alias,
+      label: effortLabel(alias),
+      description: `Latest model exposed by Claude Code's ${alias} alias`,
+      efforts,
+      serviceTiers: [],
+      defaultEffort: defaultEffort ?? null,
+      isDefault: false
+    }))
+  ];
+}
+async function listCodexModels(executablePath, cwd) {
+  const client = await createCodexAppServerClient({ executablePath, cwd });
+  try {
+    return await collectCodexModels(
+      async (cursor) => client.request("model/list", cursor ? { cursor } : {})
+    );
+  } finally {
+    client.close();
+  }
+}
+function createModelCatalogService(config = {}, deps = {}) {
+  const discoverCodex = deps.listCodexModels ?? listCodexModels;
+  const discoverClaude = deps.getClaudeCapabilities ?? readClaudeCliCapabilities;
+  const now = deps.now ?? (() => /* @__PURE__ */ new Date());
+  const hostDefaultEffort = config.defaultEffort?.trim() || void 0;
+  return {
+    async getCatalog(provider, cwd) {
+      if (provider === "claude") {
+        let capabilities;
+        let source2 = "claude-cli";
+        try {
+          capabilities = await discoverClaude(config.claudePath ?? "claude", cwd);
+        } catch {
+          source2 = "claude-fallback";
+          capabilities = {
+            aliases: [...CLAUDE_FALLBACK_ALIASES],
+            efforts: [...CLAUDE_FALLBACK_EFFORTS]
+          };
+        }
+        const models = claudeModels(capabilities, hostDefaultEffort);
+        return {
+          provider,
+          source: source2,
+          fetchedAt: now().toISOString(),
+          supportsCustomModel: true,
+          models: models.map((model) => ({
+            ...model,
+            efforts: model.efforts.map((effort) => ({ ...effort }))
+          }))
+        };
+      }
+      const configuredModel = config.codexModel?.trim() || void 0;
+      let source = "codex-app-server";
+      let discovered;
+      try {
+        discovered = await discoverCodex(config.codexPath ?? "codex", cwd);
+      } catch (error) {
+        if (!configuredModel) throw error;
+        source = "codex-config";
+        discovered = [];
+      }
+      const visible = discovered.filter((model) => typeof model.model === "string").map((model) => ({ ...model, model: model.model.trim() })).filter((model) => !model.hidden && model.model);
+      if (configuredModel && !visible.some((model) => model.model === configuredModel)) {
+        visible.unshift({
+          model: configuredModel,
+          displayName: configuredModel,
+          description: config.configuredModelDescription ?? "Configured model",
+          isDefault: true,
+          ...hostDefaultEffort ? {
+            defaultReasoningEffort: hostDefaultEffort,
+            supportedReasoningEfforts: [{ reasoningEffort: hostDefaultEffort }]
+          } : {}
+        });
+      }
+      return {
+        provider,
+        source,
+        fetchedAt: now().toISOString(),
+        supportsCustomModel: false,
+        models: visible.map((model) => {
+          const providerDefaultEffort = model.defaultReasoningEffort?.trim() || void 0;
+          const defaultEffort = hostDefaultEffort ?? providerDefaultEffort ?? null;
+          const efforts = uniqueValues([
+            ...(model.supportedReasoningEfforts ?? []).map(({ reasoningEffort }) => reasoningEffort),
+            ...providerDefaultEffort ? [providerDefaultEffort] : [],
+            ...defaultEffort ? [defaultEffort] : []
+          ]).map((reasoningEffort) => ({
+            id: reasoningEffort,
+            label: effortLabel(reasoningEffort)
+          }));
+          return {
+            id: model.model,
+            label: model.displayName?.trim() || model.model,
+            ...model.description?.trim() ? { description: model.description.trim() } : {},
+            efforts,
+            serviceTiers: (model.serviceTiers ?? []).map((tier) => ({ ...tier })),
+            defaultEffort,
+            isDefault: configuredModel ? model.model === configuredModel : model.isDefault === true
+          };
+        })
+      };
+    },
+    validateSelection(catalog, input) {
+      const model = input.model?.trim() || null;
+      const option = model ? catalog.models.find((candidate) => candidate.id === model) : catalog.models.find((candidate) => candidate.isDefault) ?? catalog.models[0];
+      if (model && !option && !catalog.supportsCustomModel) {
+        throw new Error(`Model is not available: ${model}`);
+      }
+      const requestedEffort = input.effort === void 0 ? option?.defaultEffort ?? null : input.effort?.trim() || null;
+      const supportedEfforts = option?.efforts.map((candidate) => candidate.id) ?? catalog.models.find((candidate) => candidate.isDefault)?.efforts.map((candidate) => candidate.id) ?? CLAUDE_FALLBACK_EFFORTS;
+      if (requestedEffort && supportedEfforts.length > 0 && !new Set(supportedEfforts).has(requestedEffort)) {
+        throw new Error(`${model ?? "Default model"} does not support effort ${requestedEffort}`);
+      }
+      const requestedServiceTier = input.serviceTier?.trim() || null;
+      const supportedServiceTiers = option?.serviceTiers.map((candidate) => candidate.id) ?? [];
+      if (requestedServiceTier && !new Set(supportedServiceTiers).has(requestedServiceTier)) {
+        throw new Error(
+          `${model ?? "Default model"} does not support service tier ${requestedServiceTier}`
+        );
+      }
+      return { model, effort: requestedEffort, serviceTier: requestedServiceTier };
+    }
+  };
+}
 export {
   AbortError,
   CLAUDE_STRIPPED_ENV_VARS,
@@ -1721,9 +1919,12 @@ export {
   KNOWN_CONTEXT_WINDOWS,
   MissingCliError,
   TimeoutError,
+  collectCodexModels,
   contextWindowForModel,
   createCodexAppServerClient,
   createCodexAppServerSession,
+  createModelCatalogService,
+  parseClaudeCliHelp,
   runClaude,
   runCodex
 };
