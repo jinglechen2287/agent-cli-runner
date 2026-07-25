@@ -74,6 +74,28 @@ interface RunResult {
 | `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onBackgroundAgentUpdate`, `onUsage`, `onStderr` | Streaming callbacks. Tool uses and results share a provider call ID. Codex app-server items are mapped to shared names (`commandExecution` → `Bash`, `fileChange` → `Edit`, web page operations → `WebFetch`) and plan notifications become normalized `TodoWrite` snapshots. Background subagents emit replace-in-place snapshots keyed by child thread id. Usage snapshots describe the latest request's context occupancy, never cumulative turn totals. |
 | `onAssistantTextDelta` | Assistant prose as the model produces it. Opt-in: supplying it adds Claude's `--include-partial-messages` (roughly doubling CLI output) and subscribes to Codex's `item/agentMessage/delta`. Fragments exclude extended thinking, streamed tool input, and background-subagent prose, and concatenate to the next `onAssistantText` message — treat them as scratch state that the completed message supersedes. Not emitted by isolated Codex runs. |
 
+### Provider update checks
+
+`createProviderUpdateService` performs read-only update checks using each CLI's native release metadata:
+
+```ts
+import { createProviderUpdateService } from "agent-cli-runner";
+
+const updates = createProviderUpdateService({
+  claudePath: "/path/to/claude", // defaults to "claude"
+  codexPath: "/path/to/codex",   // defaults to "codex"
+});
+
+const claude = await updates.check("claude");
+const all = await updates.checkAll(); // Claude and Codex concurrently
+```
+
+Every check reports `current`, `update_available`, `not_installed`, or `unknown`, together with the installed/latest versions and a stable reason when detection is unavailable. Expected command, parsing, and network failures are returned as status data rather than thrown.
+
+Claude detection is intentionally definitive only for native installations. It reads the installation method and `stable` / `latest` channel from `claude doctor`, then compares against that channel at `downloads.claude.ai`; package-manager installations return `unknown` instead of risking a cross-channel false positive. Codex reads the latest version from `codex doctor --json` and accepts its JSON even when unrelated diagnostics make the command exit nonzero. Older Codex versions without update metadata return `unknown`; there is no npm fallback.
+
+Checks use five-second command and network timeouts and strip the same provider nesting-guard environment variables as agent runs. They never invoke `claude update`, `codex update`, or a package manager, and they do not cache results.
+
 ### Claude-specific
 
 `appendSystemPrompt` (passed on every turn — the CLI rebuilds the system prompt from flags each run), `newSessionId` / `resumeSessionId` (mutually exclusive), and `isolated`.

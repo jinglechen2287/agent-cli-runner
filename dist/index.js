@@ -1919,6 +1919,272 @@ function createModelCatalogService(config = {}, deps = {}) {
     }
   };
 }
+
+// src/provider-updates.ts
+import { execFile as execFile2 } from "child_process";
+var CHECK_TIMEOUT_MS = 5e3;
+var CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases";
+function defaultRunCommand(executable, args, options) {
+  return new Promise((resolve, reject) => {
+    execFile2(
+      executable,
+      [...args],
+      {
+        env: options.env,
+        timeout: options.timeoutMs,
+        maxBuffer: 1e6,
+        encoding: "utf8"
+      },
+      (error, stdout, stderr) => {
+        if (!error) {
+          resolve({ stdout, stderr, exitCode: 0 });
+          return;
+        }
+        if (typeof error.code === "number") {
+          resolve({ stdout, stderr, exitCode: error.code });
+          return;
+        }
+        reject(error);
+      }
+    );
+  });
+}
+async function defaultFetchText(url, options) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: "text/plain" }
+    });
+    if (!response.ok) {
+      throw new Error(`Provider update check returned HTTP ${response.status}`);
+    }
+    return await response.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+function parseVersion(value) {
+  const match = value.match(
+    /(?:^|[^\d])v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?(?=$|[^0-9A-Za-z.+-])/
+  );
+  if (!match) return null;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (![major, minor, patch].every(Number.isSafeInteger)) return null;
+  const prerelease = match[4]?.split(".") ?? [];
+  return {
+    major,
+    minor,
+    patch,
+    prerelease,
+    version: `${major}.${minor}.${patch}${prerelease.length > 0 ? `-${prerelease.join(".")}` : ""}`
+  };
+}
+function comparePrerelease(left, right) {
+  if (left.length === 0 && right.length === 0) return 0;
+  if (left.length === 0) return 1;
+  if (right.length === 0) return -1;
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = left[index];
+    const rightPart = right[index];
+    if (leftPart === void 0) return -1;
+    if (rightPart === void 0) return 1;
+    if (leftPart === rightPart) continue;
+    const leftIsNumber = /^\d+$/.test(leftPart);
+    const rightIsNumber = /^\d+$/.test(rightPart);
+    if (leftIsNumber && rightIsNumber) {
+      const normalizedLeft = leftPart.replace(/^0+(?=\d)/, "");
+      const normalizedRight = rightPart.replace(/^0+(?=\d)/, "");
+      if (normalizedLeft.length !== normalizedRight.length) {
+        return normalizedLeft.length < normalizedRight.length ? -1 : 1;
+      }
+      return normalizedLeft < normalizedRight ? -1 : 1;
+    }
+    if (leftIsNumber) return -1;
+    if (rightIsNumber) return 1;
+    return leftPart < rightPart ? -1 : 1;
+  }
+  return 0;
+}
+function compareVersions(left, right) {
+  for (const key of ["major", "minor", "patch"]) {
+    if (left[key] !== right[key]) return left[key] < right[key] ? -1 : 1;
+  }
+  return comparePrerelease(left.prerelease, right.prerelease);
+}
+function isMissingExecutable2(error) {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+function isRecord3(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function unknownStatus(provider, checkedAt, reason, installedVersion = null) {
+  return {
+    provider,
+    state: "unknown",
+    installedVersion,
+    latestVersion: null,
+    channel: null,
+    checkedAt,
+    reason
+  };
+}
+function statusFromVersions(input) {
+  return {
+    provider: input.provider,
+    state: compareVersions(input.installed, input.latest) < 0 ? "update_available" : "current",
+    installedVersion: input.installed.version,
+    latestVersion: input.latest.version,
+    channel: input.channel,
+    checkedAt: input.checkedAt,
+    reason: null
+  };
+}
+function parseClaudeDoctor(output) {
+  const installMethod = output.match(/^Config install method:\s*(\S+)\s*$/im)?.[1]?.toLowerCase();
+  if (!installMethod) return null;
+  const rawChannel = output.match(/^Auto-update channel:\s*(\S+)\s*$/im)?.[1]?.toLowerCase();
+  const channel = rawChannel === "stable" || rawChannel === "latest" ? rawChannel : null;
+  return { installMethod, channel };
+}
+function parseCodexLatestVersion(output) {
+  let parsed;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    return null;
+  }
+  if (!isRecord3(parsed) || !isRecord3(parsed.checks)) return null;
+  const updateCheck = parsed.checks["updates.status"];
+  if (!isRecord3(updateCheck) || !isRecord3(updateCheck.details)) return null;
+  const latest = updateCheck.details["latest version"];
+  return typeof latest === "string" ? parseVersion(latest) : null;
+}
+function createProviderUpdateService(config = {}, deps = {}) {
+  const runCommand = deps.runCommand ?? defaultRunCommand;
+  const fetchText = deps.fetchText ?? defaultFetchText;
+  const now = deps.now ?? (() => /* @__PURE__ */ new Date());
+  const baseEnv = config.env ?? process.env;
+  async function installedVersion(provider, executable, env, checkedAt) {
+    let command;
+    try {
+      command = await runCommand(executable, ["--version"], {
+        env,
+        timeoutMs: CHECK_TIMEOUT_MS
+      });
+    } catch (error) {
+      if (isMissingExecutable2(error)) {
+        return {
+          provider,
+          state: "not_installed",
+          installedVersion: null,
+          latestVersion: null,
+          channel: null,
+          checkedAt,
+          reason: "cli_not_found"
+        };
+      }
+      return unknownStatus(provider, checkedAt, "check_failed");
+    }
+    return parseVersion(`${command.stdout}
+${command.stderr}`) ?? unknownStatus(provider, checkedAt, "version_unavailable");
+  }
+  async function checkClaude(checkedAt) {
+    const executable = config.claudePath ?? "claude";
+    const env = filterEnv(baseEnv, CLAUDE_STRIPPED_ENV_VARS);
+    const installed = await installedVersion("claude", executable, env, checkedAt);
+    if ("state" in installed) return installed;
+    let doctor;
+    try {
+      doctor = await runCommand(executable, ["doctor"], {
+        env,
+        timeoutMs: CHECK_TIMEOUT_MS
+      });
+    } catch {
+      return unknownStatus("claude", checkedAt, "check_failed", installed.version);
+    }
+    const metadata = parseClaudeDoctor(`${doctor.stdout}
+${doctor.stderr}`);
+    if (!metadata) {
+      return unknownStatus("claude", checkedAt, "check_failed", installed.version);
+    }
+    if (metadata.installMethod !== "native") {
+      return unknownStatus(
+        "claude",
+        checkedAt,
+        "unsupported_installation",
+        installed.version
+      );
+    }
+    if (!metadata.channel) {
+      return unknownStatus("claude", checkedAt, "version_unavailable", installed.version);
+    }
+    let latest;
+    try {
+      const response = await fetchText(
+        `${CLAUDE_RELEASE_BASE_URL}/${metadata.channel}`,
+        { timeoutMs: CHECK_TIMEOUT_MS }
+      );
+      latest = parseVersion(response);
+    } catch {
+      latest = null;
+    }
+    if (!latest) {
+      return {
+        ...unknownStatus("claude", checkedAt, "version_unavailable", installed.version),
+        channel: metadata.channel
+      };
+    }
+    return statusFromVersions({
+      provider: "claude",
+      installed,
+      latest,
+      channel: metadata.channel,
+      checkedAt
+    });
+  }
+  async function checkCodex(checkedAt) {
+    const executable = config.codexPath ?? "codex";
+    const env = filterEnv(baseEnv, CODEX_STRIPPED_ENV_VARS);
+    const installed = await installedVersion("codex", executable, env, checkedAt);
+    if ("state" in installed) return installed;
+    let doctor;
+    try {
+      doctor = await runCommand(executable, ["doctor", "--json"], {
+        env,
+        timeoutMs: CHECK_TIMEOUT_MS
+      });
+    } catch {
+      return unknownStatus("codex", checkedAt, "check_failed", installed.version);
+    }
+    const latest = parseCodexLatestVersion(doctor.stdout);
+    if (!latest) {
+      return unknownStatus("codex", checkedAt, "version_unavailable", installed.version);
+    }
+    return statusFromVersions({
+      provider: "codex",
+      installed,
+      latest,
+      channel: null,
+      checkedAt
+    });
+  }
+  const check = async (provider) => {
+    const checkedAt = now().toISOString();
+    return provider === "claude" ? checkClaude(checkedAt) : checkCodex(checkedAt);
+  };
+  return {
+    check,
+    checkAll: () => Promise.all([
+      check("claude"),
+      check("codex")
+    ])
+  };
+}
 export {
   AbortError,
   CLAUDE_STRIPPED_ENV_VARS,
@@ -1932,6 +2198,7 @@ export {
   createCodexAppServerClient,
   createCodexAppServerSession,
   createModelCatalogService,
+  createProviderUpdateService,
   parseClaudeCliHelp,
   runClaude,
   runCodex

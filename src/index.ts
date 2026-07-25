@@ -57,3 +57,16 @@ export type {
   ModelSelectionInput,
   ModelServiceTierOption,
 } from "./model-catalog.js";
+export { createProviderUpdateService } from "./provider-updates.js";
+export type {
+  ProviderUpdateCommandOptions,
+  ProviderUpdateCommandResult,
+  ProviderUpdateFetchOptions,
+  ProviderUpdateProvider,
+  ProviderUpdateReason,
+  ProviderUpdateService,
+  ProviderUpdateServiceConfig,
+  ProviderUpdateServiceDeps,
+  ProviderUpdateState,
+  ProviderUpdateStatus,
+} from "./provider-updates.js";
