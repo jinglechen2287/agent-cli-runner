@@ -710,6 +710,11 @@ async function runCodexAppServerTurn(
   openedThread?: OpenedCodexThread,
   ownedClient = false,
   continuity?: TurnContinuity,
+  /** Whether this runner may retire the app-server process when a turn/start
+   * ack is lost. True for per-turn and session-owned clients; false for a
+   * borrowed shared client, whose lifecycle belongs to its owner and which
+   * may be running other threads' turns. */
+  retireClientOnUnackedStart = ownedClient,
 ): Promise<RunResult> {
   if (opts.signal?.aborted) throw new AbortError("codex run aborted");
 
@@ -772,8 +777,9 @@ async function runCodexAppServerTurn(
     if (interruption || settled) return;
     interruption = error;
     // Without a turn ID there is nothing to interrupt gracefully — fail the
-    // lifecycle right away; the turn/start error path retires the process,
-    // which terminates any turn the server may have started meanwhile.
+    // lifecycle right away; the turn/start error path then retires an owned
+    // process, which terminates any turn the server may have started
+    // meanwhile (a borrowed client is left to its owner).
     if (threadId && turnId) requestInterrupt();
     else failLifecycle(error);
   };
@@ -1079,15 +1085,17 @@ async function runCodexAppServerTurn(
       }, turnStartTimeoutMs));
     } catch (error) {
       // The turn may have started server-side despite the lost ack, and an
-      // unacked start cannot be trusted to unwind before the session is
+      // unacked start cannot be trusted to unwind before the thread is
       // reused: best-effort interrupt when the turn is identifiable, then
-      // retire the whole app-server process either way. A pooled session
-      // recreates and resumes the thread on its next turn.
+      // retire the app-server process when this runner or its session owns
+      // it (the session reports `closed`; its host starts a fresh one). A
+      // borrowed shared client stays up — other threads may be mid-turn on
+      // it — so its owner decides whether to retire it.
       if ((error instanceof TimeoutError || error instanceof AbortError) && threadId) {
         if (turnId && !interruption) {
           void client.request("turn/interrupt", { threadId, turnId }).catch(() => {});
         }
-        client.close();
+        if (retireClientOnUnackedStart) client.close();
       }
       throw error;
     }
@@ -1176,7 +1184,7 @@ export async function createCodexAppServerSession(
           onTurnId: (turnId) => {
             previousTurnIds.add(turnId);
           },
-        });
+        }, true);
       } finally {
         running = false;
       }

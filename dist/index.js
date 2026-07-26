@@ -363,7 +363,10 @@ async function runClaude(opts) {
   const child = spawnFn(opts.executablePath ?? "claude", args, {
     cwd: opts.cwd,
     stdio: ["pipe", "pipe", "pipe"],
-    env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS)
+    env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
+    // Process-group leader (POSIX), so the SIGKILL escalation reaches tool
+    // children (a running Bash) that the CLI can no longer reap itself.
+    detached: process.platform !== "win32"
   });
   writePrompt(child, opts.prompt);
   return new Promise((resolve, reject) => {
@@ -393,12 +396,7 @@ async function runClaude(opts) {
       cli: "claude",
       signal: opts.signal,
       timeoutMs: opts.timeoutMs,
-      kill: (signal) => {
-        try {
-          child.kill(signal);
-        } catch {
-        }
-      }
+      kill: (signal) => signalProcessTree(child, signal)
     });
     const emitSessionId = (id) => {
       sessionId = id;
@@ -504,7 +502,7 @@ async function runClaude(opts) {
             });
           }
         }
-        if (texts.length > 0) {
+        if (texts.length > 0 && !parsed.parent_tool_use_id) {
           const text2 = texts.join("");
           lastAssistantText = text2;
           opts.onAssistantText?.(text2);
@@ -1074,7 +1072,7 @@ function openedCodexThread(value, fallbackModel) {
   const model = text(record(value)?.model) ?? fallbackModel;
   return { threadId, ...model ? { model } : {} };
 }
-async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false, continuity) {
+async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false, continuity, retireClientOnUnackedStart = ownedClient) {
   if (opts.signal?.aborted) throw new AbortError("codex run aborted");
   const isPreviousTurn = (turnId2) => continuity?.previousTurnIds?.has(turnId2) ?? false;
   let threadId = openedThread?.threadId ?? opts.resumeSessionId;
@@ -1398,7 +1396,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
           void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
           });
         }
-        client.close();
+        if (retireClientOnUnackedStart) client.close();
       }
       throw error;
     }
@@ -1473,7 +1471,7 @@ async function createCodexAppServerSession(options) {
           onTurnId: (turnId) => {
             previousTurnIds.add(turnId);
           }
-        });
+        }, true);
       } finally {
         running = false;
       }
@@ -1520,6 +1518,9 @@ function buildIsolatedArgs(opts) {
   if (opts.model !== void 0) args.push("--model", opts.model);
   if (opts.developerInstructions !== void 0) {
     args.push("-c", `developer_instructions=${JSON.stringify(opts.developerInstructions)}`);
+  }
+  if (opts.reasoningEffort !== void 0) {
+    args.push("-c", `model_reasoning_effort=${JSON.stringify(opts.reasoningEffort)}`);
   }
   for (const path of opts.imagePaths ?? []) args.push("-i", path);
   args.push("-");
@@ -1586,6 +1587,21 @@ function execToolSummary(item, planItems2) {
   }
   return void 0;
 }
+function execUsage(usage, opts) {
+  const input = toTokenCount(usage.input_tokens);
+  const cached = toTokenCount(usage.cached_input_tokens);
+  const output = toTokenCount(usage.output_tokens);
+  if (input + output <= 0) return void 0;
+  const contextWindow = opts.contextWindow ?? contextWindowForModel(opts.model);
+  return {
+    contextTokens: input + output,
+    inputTokens: Math.max(0, input - cached),
+    cachedInputTokens: cached,
+    outputTokens: output,
+    ...opts.model ? { model: opts.model } : {},
+    ...contextWindow !== void 0 ? { contextWindow } : {}
+  };
+}
 function execFatalError(event) {
   if (event.type !== "error" && event.type !== "turn.failed") return void 0;
   const detail = typeof event.message === "string" ? event.message : typeof event.error === "string" ? event.error : isRecord2(event.error) && typeof event.error.message === "string" ? event.error.message : void 0;
@@ -1609,6 +1625,7 @@ async function runIsolatedCodex(opts) {
     let settled = false;
     let sessionId;
     let finalText = "";
+    let latestUsage;
     let fatalError;
     const emittedTools = /* @__PURE__ */ new Set();
     const lifecycle = watchLifecycle({
@@ -1633,6 +1650,14 @@ async function runIsolatedCodex(opts) {
       if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
         finalText = event.item.text;
         opts.onAssistantText?.(event.item.text);
+        return;
+      }
+      if (event.type === "turn.completed") {
+        const usage = isRecord2(event.usage) ? execUsage(event.usage, opts) : void 0;
+        if (usage) {
+          latestUsage = usage;
+          opts.onUsage?.(usage);
+        }
         return;
       }
       if (event.type !== "item.started" && event.type !== "item.completed") return;
@@ -1684,7 +1709,8 @@ async function runIsolatedCodex(opts) {
       resolve({
         text: finalText.trim(),
         exitCode: code ?? -1,
-        ...sessionId ? { sessionId } : {}
+        ...sessionId ? { sessionId } : {},
+        ...latestUsage ? { usage: latestUsage } : {}
       });
     });
     writePrompt(child, opts.prompt);
@@ -1718,6 +1744,9 @@ async function runCodex(opts) {
   }
   if (opts.sandboxPolicy) {
     throw new Error("isolated Codex runs cannot override the sandbox policy");
+  }
+  if (opts.serviceTier !== void 0) {
+    throw new Error("isolated Codex runs cannot set a service tier \u2014 codex exec has no equivalent");
   }
   return runIsolatedCodex(opts);
 }

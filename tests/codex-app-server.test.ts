@@ -864,6 +864,52 @@ describe("Codex app-server runner", () => {
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
   });
 
+  it("leaves a borrowed shared client running when turn/start goes unacked", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeFakeChild();
+      captureRequests(child, (message) => {
+        if (message.method === "initialize") {
+          send(child, { id: message.id, result: {} });
+        } else if (message.method === "thread/start") {
+          send(child, { id: message.id, result: { thread: { id: "thread-shared" } } });
+        }
+        // turn/start never gets an ack: the runner must not retire a client
+        // it borrowed — other threads may be mid-turn on it.
+      });
+      const client = await createCodexAppServerClient({
+        cwd: "/tmp",
+        spawnFn: (() => child) as never,
+      });
+
+      let settled: { status: string; error?: Error } | undefined;
+      void runCodex({
+        prompt: "x",
+        cwd: "/tmp",
+        appServerClient: client,
+        timeoutMs: 1_000,
+      }).then(
+        () => {
+          settled = { status: "resolved" };
+        },
+        (error: Error) => {
+          settled = { status: "rejected", error };
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(settled).toMatchObject({
+        status: "rejected",
+        error: expect.objectContaining({ name: "TimeoutError" }),
+      });
+      expect(child.kill).not.toHaveBeenCalled();
+      client.close();
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("forwards a per-turn sandboxPolicy override in turn/start", async () => {
     const child = makeFakeChild();
     let turnNumber = 0;

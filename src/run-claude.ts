@@ -5,6 +5,7 @@ import {
   filterEnv,
   isMissingExecutable,
   normalizeSummary,
+  signalProcessTree,
   toContextWindow,
   toTokenCount,
   watchLifecycle,
@@ -386,6 +387,9 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     cwd: opts.cwd,
     stdio: ["pipe", "pipe", "pipe"],
     env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
+    // Process-group leader (POSIX), so the SIGKILL escalation reaches tool
+    // children (a running Bash) that the CLI can no longer reap itself.
+    detached: process.platform !== "win32",
   });
   writePrompt(child, opts.prompt);
 
@@ -421,13 +425,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
       cli: "claude",
       signal: opts.signal,
       timeoutMs: opts.timeoutMs,
-      kill: (signal) => {
-        try {
-          child.kill(signal);
-        } catch {
-          // The process may already have exited.
-        }
-      },
+      kill: (signal) => signalProcessTree(child, signal),
     });
 
     const emitSessionId = (id: string): void => {
@@ -577,14 +575,17 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
             });
           }
         }
-        if (texts.length > 0) {
+        // Subagent prose belongs to the subagent, not this transcript —
+        // matching the delta stream, which drops subagent fragments, so
+        // fragments always concatenate to the next completed message. Its
+        // tool calls above still belong in the parent transcript.
+        if (texts.length > 0 && !parsed.parent_tool_use_id) {
           const text = texts.join("");
           lastAssistantText = text;
           opts.onAssistantText?.(text);
         }
-        // A subagent runs on its own context window; its usage says nothing
-        // about how full this turn's is. Its tool calls and prose above still
-        // belong in the parent transcript — only the occupancy doesn't.
+        // A subagent also runs on its own context window; its usage says
+        // nothing about how full this turn's is.
         if (parsed.parent_tool_use_id) return;
         const model = qualifyModel(parsed.message.model, sessionModel);
         // Track the responding model even on messages without usage, so the

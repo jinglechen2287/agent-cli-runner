@@ -11,10 +11,12 @@ import {
   isMissingExecutable,
   normalizeSummary,
   signalProcessTree,
+  toTokenCount,
   watchLifecycle,
   writePrompt,
 } from "./internal.js";
 import type { CommonRunOptions, RunResult, ToolPlanItem } from "./types.js";
+import { contextWindowForModel, type TokenUsage } from "./usage.js";
 
 /** Stripped so a Codex turn spawned from within another Codex session does
  * not inherit the parent's thread. */
@@ -52,10 +54,12 @@ export interface RunCodexOptions extends CommonRunOptions {
   model?: string;
   /** Explicit context-window fallback when app-server omits one. */
   contextWindow?: number;
-  /** Reasoning effort passed directly to app-server's `turn/start`. */
+  /** Reasoning effort passed directly to app-server's `turn/start`, or as
+   * the `model_reasoning_effort` config override on isolated `codex exec`. */
   reasoningEffort?: string;
   /** Service tier passed directly to app-server's `turn/start`.
-   * Null explicitly clears a tier retained by the thread. */
+   * Null explicitly clears a tier retained by the thread. Rejected on
+   * isolated runs — `codex exec` has no equivalent. */
   serviceTier?: string | null;
   /** Reuse an initialized app-server connection. When omitted, regular runs
    * create and close a connection for this turn. */
@@ -74,6 +78,7 @@ interface CodexExecEvent {
   message?: string;
   error?: unknown;
   item?: Record<string, unknown>;
+  usage?: unknown;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -94,6 +99,9 @@ function buildIsolatedArgs(opts: RunCodexOptions): string[] {
   if (opts.model !== undefined) args.push("--model", opts.model);
   if (opts.developerInstructions !== undefined) {
     args.push("-c", `developer_instructions=${JSON.stringify(opts.developerInstructions)}`);
+  }
+  if (opts.reasoningEffort !== undefined) {
+    args.push("-c", `model_reasoning_effort=${JSON.stringify(opts.reasoningEffort)}`);
   }
   for (const path of opts.imagePaths ?? []) args.push("-i", path);
   args.push("-");
@@ -172,6 +180,30 @@ function execToolSummary(
   return undefined;
 }
 
+/** Normalize the `turn.completed` usage summary from `codex exec`. The counts
+ * are cumulative for the turn, so — like Claude's `result` usage — they double
+ * as a context-occupancy snapshot only for the single-request turns this
+ * isolated metadata path is built for. `input_tokens` includes the cached
+ * subset, matching app-server's convention. */
+function execUsage(
+  usage: Record<string, unknown>,
+  opts: RunCodexOptions,
+): TokenUsage | undefined {
+  const input = toTokenCount(usage.input_tokens);
+  const cached = toTokenCount(usage.cached_input_tokens);
+  const output = toTokenCount(usage.output_tokens);
+  if (input + output <= 0) return undefined;
+  const contextWindow = opts.contextWindow ?? contextWindowForModel(opts.model);
+  return {
+    contextTokens: input + output,
+    inputTokens: Math.max(0, input - cached),
+    cachedInputTokens: cached,
+    outputTokens: output,
+    ...(opts.model ? { model: opts.model } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
+}
+
 function execFatalError(event: CodexExecEvent): CodexTurnError | undefined {
   if (event.type !== "error" && event.type !== "turn.failed") return undefined;
   const detail = typeof event.message === "string"
@@ -203,6 +235,7 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
     let settled = false;
     let sessionId: string | undefined;
     let finalText = "";
+    let latestUsage: TokenUsage | undefined;
     let fatalError: CodexTurnError | undefined;
     const emittedTools = new Set<string>();
     const lifecycle = watchLifecycle({
@@ -232,6 +265,14 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
       ) {
         finalText = event.item.text;
         opts.onAssistantText?.(event.item.text);
+        return;
+      }
+      if (event.type === "turn.completed") {
+        const usage = isRecord(event.usage) ? execUsage(event.usage, opts) : undefined;
+        if (usage) {
+          latestUsage = usage;
+          opts.onUsage?.(usage);
+        }
         return;
       }
       if (event.type !== "item.started" && event.type !== "item.completed") return;
@@ -285,6 +326,7 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
         text: finalText.trim(),
         exitCode: code ?? -1,
         ...(sessionId ? { sessionId } : {}),
+        ...(latestUsage ? { usage: latestUsage } : {}),
       });
     });
     writePrompt(child, opts.prompt);
@@ -327,6 +369,9 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
   }
   if (opts.sandboxPolicy) {
     throw new Error("isolated Codex runs cannot override the sandbox policy");
+  }
+  if (opts.serviceTier !== undefined) {
+    throw new Error("isolated Codex runs cannot set a service tier — codex exec has no equivalent");
   }
   return runIsolatedCodex(opts);
 }

@@ -50,7 +50,7 @@ describe("runCodex isolated mode", () => {
       cwd: "/tmp",
       isolated: true,
       model: "gpt-test",
-      serviceTier: "priority",
+      reasoningEffort: "high",
       developerInstructions: "Return a title",
       spawnFn: spawnFn as never,
     });
@@ -69,9 +69,10 @@ describe("runCodex isolated mode", () => {
       "gpt-test",
       "-c",
       'developer_instructions="Return a title"',
+      "-c",
+      'model_reasoning_effort="high"',
     ]));
     expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
-    expect(args.join(" ")).not.toContain("service_tier");
     expect(options).toMatchObject({ cwd: "/tmp" });
 
     child.stdout.write(`${JSON.stringify({
@@ -105,6 +106,53 @@ describe("runCodex isolated mode", () => {
       isolated: true,
       dangerouslyBypassApprovalsAndSandbox: true,
     })).rejects.toThrow(/cannot bypass/i);
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      isolated: true,
+      serviceTier: "priority",
+    })).rejects.toThrow(/service tier/i);
+  });
+
+  it("reports isolated usage from the exec turn summary", async () => {
+    const child = makeFakeChild();
+    const onUsage = vi.fn();
+    const run = runCodex({
+      prompt: "title this thread",
+      cwd: "/tmp",
+      isolated: true,
+      model: "gpt-5.2",
+      spawnFn: (() => child) as never,
+      onUsage,
+    });
+
+    child.stdout.write(`${JSON.stringify({
+      type: "thread.started",
+      thread_id: "ephemeral-thread",
+    })}\n`);
+    child.stdout.write(`${JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", id: "message", text: "A short title" },
+    })}\n`);
+    child.stdout.write(`${JSON.stringify({
+      type: "turn.completed",
+      usage: { input_tokens: 1_200, cached_input_tokens: 200, output_tokens: 40 },
+    })}\n`);
+    finish(child);
+
+    const expectedUsage = {
+      contextTokens: 1_240,
+      inputTokens: 1_000,
+      cachedInputTokens: 200,
+      outputTokens: 40,
+      model: "gpt-5.2",
+      contextWindow: 272_000,
+    };
+    await expect(run).resolves.toMatchObject({
+      text: "A short title",
+      usage: expectedUsage,
+    });
+    expect(onUsage).toHaveBeenCalledWith(expectedUsage);
   });
 
   it("propagates stderr and missing executable failures", async () => {

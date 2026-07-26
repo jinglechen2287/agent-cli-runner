@@ -115,7 +115,11 @@ interface BackgroundAgentInfo {
 interface AgentCallbacks {
     /** Fired once with the CLI's session/thread id as soon as it is known. */
     onSessionId?: (id: string) => void;
-    /** Fired for each completed assistant message. */
+    /** Fired for each completed assistant message of the parent turn.
+     * Background-subagent prose is excluded — mirroring
+     * {@link onAssistantTextDelta} — so a subagent's answer never masquerades
+     * as the turn's transcript; its state streams through
+     * {@link onBackgroundAgentUpdate} instead. */
     onAssistantText?: (text: string) => void;
     /** Fired with each fragment of assistant prose as the model produces it,
      * before the completed message arrives via {@link onAssistantText}. Supplying
@@ -140,8 +144,9 @@ interface AgentCallbacks {
     /** Fired with a normalized context-usage snapshot whenever the CLI reports
      * token counts. Claude fires it per assistant message (live) and once more
      * at the end with the authoritative window merged into the last snapshot;
-     * Codex fires it once after completion using app-server's authoritative last
-     * request and model context window. Each call supersedes the last. */
+     * regular Codex fires it once after completion using app-server's
+     * authoritative last request and model context window, and isolated Codex
+     * once from the exec turn summary. Each call supersedes the last. */
     onUsage?: (usage: TokenUsage) => void;
 }
 interface CommonRunOptions extends AgentCallbacks {
@@ -310,10 +315,12 @@ interface RunCodexOptions extends CommonRunOptions {
     model?: string;
     /** Explicit context-window fallback when app-server omits one. */
     contextWindow?: number;
-    /** Reasoning effort passed directly to app-server's `turn/start`. */
+    /** Reasoning effort passed directly to app-server's `turn/start`, or as
+     * the `model_reasoning_effort` config override on isolated `codex exec`. */
     reasoningEffort?: string;
     /** Service tier passed directly to app-server's `turn/start`.
-     * Null explicitly clears a tier retained by the thread. */
+     * Null explicitly clears a tier retained by the thread. Rejected on
+     * isolated runs — `codex exec` has no equivalent. */
     serviceTier?: string | null;
     /** Reuse an initialized app-server connection. When omitted, regular runs
      * create and close a connection for this turn. */

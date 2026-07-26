@@ -68,6 +68,22 @@ describe("runClaude", () => {
     await expect(stdinData).resolves.toBe("make it round");
   });
 
+  it("spawns claude as a detached process-group leader on POSIX", async () => {
+    const child = makeFakeChild();
+    const spawnFn = vi.fn().mockReturnValue(child);
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: spawnFn as never,
+    });
+
+    const [, , opts] = spawnFn.mock.calls[0]!;
+    expect(opts).toMatchObject({ detached: process.platform !== "win32" });
+
+    finish(child);
+    await promise;
+  });
+
   it("spawns a custom executable path when given", async () => {
     const child = makeFakeChild();
     const spawnFn = vi.fn().mockReturnValue(child);
@@ -639,6 +655,49 @@ describe("runClaude", () => {
     finish(child);
     await promise;
     expect(onAssistantTextDelta.mock.calls.map(([chunk]) => chunk)).toEqual(["main prose"]);
+  });
+
+  it("keeps subagent prose out of onAssistantText and the final text fallback", async () => {
+    const child = makeFakeChild();
+    const onAssistantText = vi.fn();
+    const onToolUse = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onAssistantText,
+      onToolUse,
+    });
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "parent" }] },
+      }) + "\n",
+    );
+    // The subagent's completed message arrives after the parent's; its tool
+    // calls still belong in the parent transcript, but its prose does not.
+    child.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        parent_tool_use_id: "toolu_1",
+        message: {
+          content: [
+            { type: "text", text: "subagent prose" },
+            { type: "tool_use", id: "toolu_sub", name: "Read", input: { file_path: "/tmp/a" } },
+          ],
+        },
+      }) + "\n",
+    );
+    // No `result` string on the result event: the fallback must be the
+    // parent's last message, not the subagent's.
+    child.stdout.write(
+      JSON.stringify({ type: "result", session_id: "s1" }) + "\n",
+    );
+    finish(child);
+    const result = await promise;
+    expect(onAssistantText.mock.calls.map(([message]) => message)).toEqual(["parent"]);
+    expect(onToolUse).toHaveBeenCalledWith(expect.objectContaining({ callId: "toolu_sub" }));
+    expect(result.text).toBe("parent");
   });
 
   it("emits full lifecycle snapshots for background subagents", async () => {
