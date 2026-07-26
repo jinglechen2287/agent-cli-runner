@@ -1594,7 +1594,9 @@ function execUsage(usage, opts) {
   if (input + output <= 0) return void 0;
   const contextWindow = opts.contextWindow ?? contextWindowForModel(opts.model);
   return {
-    contextTokens: input + output,
+    // Input side only (cached included), per the TokenUsage contract — not
+    // app-server's totalTokens, which also counts output.
+    contextTokens: input,
     inputTokens: Math.max(0, input - cached),
     cachedInputTokens: cached,
     outputTokens: output,

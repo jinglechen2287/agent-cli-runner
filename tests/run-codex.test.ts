@@ -141,7 +141,7 @@ describe("runCodex isolated mode", () => {
     finish(child);
 
     const expectedUsage = {
-      contextTokens: 1_240,
+      contextTokens: 1_200,
       inputTokens: 1_000,
       cachedInputTokens: 200,
       outputTokens: 40,
