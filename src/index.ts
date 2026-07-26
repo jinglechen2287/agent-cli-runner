@@ -59,6 +59,8 @@ export type {
 } from "./model-catalog.js";
 export { createProviderUpdateService } from "./provider-updates.js";
 export type {
+  ProviderUpdateApplyReason,
+  ProviderUpdateApplyResult,
   ProviderUpdateCommandOptions,
   ProviderUpdateCommandResult,
   ProviderUpdateFetchOptions,

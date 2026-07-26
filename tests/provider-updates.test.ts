@@ -304,6 +304,198 @@ describe("provider update service", () => {
     });
   });
 
+  it("applies a Codex update with the long installer timeout", async () => {
+    const deps = makeDeps({
+      "codex update": result("Updated codex to 0.145.1", { stderr: "downloading" }),
+    });
+    const service = createProviderUpdateService({}, deps);
+
+    await expect(service.apply("codex")).resolves.toEqual({
+      provider: "codex",
+      ok: true,
+      exitCode: 0,
+      output: "Updated codex to 0.145.1\ndownloading",
+      error: null,
+      reason: null,
+    });
+    expect(deps.runCommand).toHaveBeenCalledWith("codex", ["update"], {
+      timeoutMs: 600_000,
+      env: expect.anything(),
+    });
+  });
+
+  it("applies a Claude update only after doctor confirms a native install", async () => {
+    const deps = makeDeps({
+      "claude doctor": claudeDoctor("native", "latest"),
+      "claude update": result("Updated to 2.1.220"),
+    });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("claude"),
+    ).resolves.toMatchObject({ ok: true, exitCode: 0, reason: null });
+    expect(deps.runCommand).toHaveBeenCalledWith("claude", ["doctor"], {
+      timeoutMs: 5_000,
+      env: expect.anything(),
+    });
+  });
+
+  it.each(["homebrew", "npm-global"])(
+    "refuses to run the installer for a %s Claude install",
+    async (installMethod) => {
+      const deps = makeDeps({ "claude doctor": claudeDoctor(installMethod) });
+
+      await expect(
+        createProviderUpdateService({}, deps).apply("claude"),
+      ).resolves.toMatchObject({
+        provider: "claude",
+        ok: false,
+        exitCode: null,
+        reason: "unsupported_installation",
+        // Naming the manager is the whole point: it tells the user where to go.
+        error: `Claude Code was installed with ${installMethod}; update it with that package manager.`,
+      });
+      expect(deps.runCommand).not.toHaveBeenCalledWith(
+        "claude",
+        ["update"],
+        expect.anything(),
+      );
+    },
+  );
+
+  it("refuses without claiming a package manager when doctor cannot be parsed", async () => {
+    const deps = makeDeps({ "claude doctor": result("Claude Code doctor") });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("claude"),
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: "install_method_unknown",
+      error: "Could not read how Claude Code was installed, so the updater was not run.",
+    });
+    expect(deps.runCommand).not.toHaveBeenCalledWith(
+      "claude",
+      ["update"],
+      expect.anything(),
+    );
+  });
+
+  it("preserves a nonzero installer exit without treating it as a refusal", async () => {
+    const deps = makeDeps({
+      "codex update": result("", { stderr: "network unreachable", exitCode: 1 }),
+    });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("codex"),
+    ).resolves.toEqual({
+      provider: "codex",
+      ok: false,
+      exitCode: 1,
+      output: "\nnetwork unreachable",
+      error: null,
+      reason: null,
+    });
+  });
+
+  it("reports a missing CLI rather than a failed install", async () => {
+    const deps = makeDeps({
+      "codex update": Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }),
+    });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("codex"),
+    ).resolves.toMatchObject({
+      ok: false,
+      exitCode: null,
+      reason: "cli_not_found",
+      error: "codex was not found.",
+    });
+  });
+
+  it("reports an installer killed by the timeout", async () => {
+    const deps = makeDeps({
+      "codex update": Object.assign(new Error("Command failed"), {
+        killed: true,
+        signal: "SIGTERM",
+      }),
+    });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("codex"),
+    ).resolves.toMatchObject({
+      ok: false,
+      exitCode: null,
+      reason: "timed_out",
+      error: "codex update timed out after 10 minutes.",
+    });
+  });
+
+  it("does not mistake a maxBuffer overflow for a timeout", async () => {
+    const deps = makeDeps({
+      "codex update": Object.assign(new Error("stdout maxBuffer length exceeded"), {
+        killed: true,
+        code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      }),
+    });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("codex"),
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: null,
+      error: "stdout maxBuffer length exceeded",
+    });
+  });
+
+  it("reports the doctor probe's own deadline, not the installer's", async () => {
+    const deps = makeDeps({
+      "claude doctor": Object.assign(new Error("Command failed"), {
+        killed: true,
+        signal: "SIGTERM",
+      }),
+    });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("claude"),
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: "timed_out",
+      error: "claude doctor timed out after 5 seconds.",
+    });
+  });
+
+  it("honours configured executable paths when applying updates", async () => {
+    const deps = makeDeps({
+      "/opt/codex update": result("done"),
+      "custom-claude doctor": claudeDoctor("native"),
+      "custom-claude update": result("done"),
+    });
+    const service = createProviderUpdateService(
+      { claudePath: "custom-claude", codexPath: "/opt/codex" },
+      deps,
+    );
+
+    await expect(service.apply("codex")).resolves.toMatchObject({ ok: true });
+    await expect(service.apply("claude")).resolves.toMatchObject({ ok: true });
+  });
+
+  it("strips provider nesting guards from the installer environment", async () => {
+    const deps = makeDeps({ "codex update": result("done") });
+    const service = createProviderUpdateService({
+      env: {
+        PATH: "/usr/bin",
+        CODEX_THREAD_ID: "parent-thread",
+        CLAUDECODE: "1",
+      },
+    }, deps);
+
+    await service.apply("codex");
+
+    expect(deps.runCommand).toHaveBeenCalledWith("codex", ["update"], {
+      timeoutMs: 600_000,
+      env: { PATH: "/usr/bin", CLAUDECODE: "1" },
+    });
+  });
+
   it("uses five-second checks and strips provider nesting guards", async () => {
     const deps = makeDeps({
       "claude --version": result("2.1.219 (Claude Code)"),

@@ -465,9 +465,32 @@ interface ProviderUpdateStatus {
     checkedAt: string;
     reason: ProviderUpdateReason;
 }
+/** Why an update never reached the installer, or died before reporting.
+ * `null` only means "no category applies" — it does not imply the installer
+ * ran, since an unclassified spawn failure lands here too. Use
+ * `exitCode !== null` to tell whether the installer actually decided. */
+type ProviderUpdateApplyReason = "cli_not_found" | "unsupported_installation"
+/** The install method could not be read, so it was not safe to assume the
+ * updater owns this binary — distinct from knowing it does not. */
+ | "install_method_unknown" | "timed_out" | null;
+interface ProviderUpdateApplyResult {
+    provider: ProviderUpdateProvider;
+    ok: boolean;
+    /** null when no process produced one — a refusal, a spawn failure, or a kill. */
+    exitCode: number | null;
+    /** Combined stdout + stderr, untrimmed; the caller decides how much to keep. */
+    output: string;
+    /** Set for refusals and spawn/timeout failures; null for a plain nonzero exit,
+     * where `output` already carries the installer's own explanation. */
+    error: string | null;
+    reason: ProviderUpdateApplyReason;
+}
 interface ProviderUpdateService {
     check(provider: ProviderUpdateProvider): Promise<ProviderUpdateStatus>;
     checkAll(): Promise<ProviderUpdateStatus[]>;
+    /** Run the provider's own updater. Never throws: every failure mode comes
+     * back as a result so a host can render it. */
+    apply(provider: ProviderUpdateProvider): Promise<ProviderUpdateApplyResult>;
 }
 interface ProviderUpdateServiceConfig {
     claudePath?: string;
@@ -493,4 +516,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };

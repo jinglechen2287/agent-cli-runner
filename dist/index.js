@@ -1954,6 +1954,7 @@ function createModelCatalogService(config = {}, deps = {}) {
 // src/provider-updates.ts
 import { execFile as execFile2 } from "child_process";
 var CHECK_TIMEOUT_MS = 5e3;
+var APPLY_TIMEOUT_MS = 10 * 60 * 1e3;
 var CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases";
 function defaultRunCommand(executable, args, options) {
   return new Promise((resolve, reject) => {
@@ -2049,6 +2050,20 @@ function compareVersions(left, right) {
 }
 function isMissingExecutable2(error) {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+function formatTimeout(timeoutMs) {
+  if (timeoutMs % 6e4 === 0) {
+    const minutes = timeoutMs / 6e4;
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  const seconds = timeoutMs / 1e3;
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
+function isTimeoutError(error) {
+  if (!(error instanceof Error)) return false;
+  const candidate = error;
+  if (candidate.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return false;
+  return candidate.killed === true || candidate.code === "ETIMEDOUT";
 }
 function isRecord3(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -2208,12 +2223,104 @@ ${doctor.stderr}`);
     const checkedAt = now().toISOString();
     return provider === "claude" ? checkClaude(checkedAt) : checkCodex(checkedAt);
   };
+  function executableFor(provider) {
+    return provider === "claude" ? config.claudePath ?? "claude" : config.codexPath ?? "codex";
+  }
+  function refusal(provider, reason, error) {
+    return { provider, ok: false, exitCode: null, output: "", error, reason };
+  }
+  function failureFromError(provider, executable, step, error) {
+    if (isMissingExecutable2(error)) {
+      return refusal(provider, "cli_not_found", `${executable} was not found.`);
+    }
+    if (isTimeoutError(error)) {
+      return refusal(
+        provider,
+        "timed_out",
+        `${executable} ${step.args} timed out after ${formatTimeout(step.timeoutMs)}.`
+      );
+    }
+    return {
+      provider,
+      ok: false,
+      exitCode: null,
+      output: "",
+      error: error instanceof Error ? error.message : String(error),
+      reason: null
+    };
+  }
+  async function claudeInstallMethod(executable, env) {
+    const doctor = await runCommand(executable, ["doctor"], {
+      env,
+      timeoutMs: CHECK_TIMEOUT_MS
+    });
+    return parseClaudeDoctor(`${doctor.stdout}
+${doctor.stderr}`)?.installMethod ?? null;
+  }
+  const apply = async (provider) => {
+    const executable = executableFor(provider);
+    const env = filterEnv(
+      baseEnv,
+      provider === "claude" ? CLAUDE_STRIPPED_ENV_VARS : CODEX_STRIPPED_ENV_VARS
+    );
+    if (provider === "claude") {
+      let installMethod;
+      try {
+        installMethod = await claudeInstallMethod(executable, env);
+      } catch (error) {
+        return failureFromError(
+          provider,
+          executable,
+          { args: "doctor", timeoutMs: CHECK_TIMEOUT_MS },
+          error
+        );
+      }
+      if (installMethod === null) {
+        return refusal(
+          provider,
+          "install_method_unknown",
+          "Could not read how Claude Code was installed, so the updater was not run."
+        );
+      }
+      if (installMethod !== "native") {
+        return refusal(
+          provider,
+          "unsupported_installation",
+          `Claude Code was installed with ${installMethod}; update it with that package manager.`
+        );
+      }
+    }
+    let command;
+    try {
+      command = await runCommand(executable, ["update"], {
+        env,
+        timeoutMs: APPLY_TIMEOUT_MS
+      });
+    } catch (error) {
+      return failureFromError(
+        provider,
+        executable,
+        { args: "update", timeoutMs: APPLY_TIMEOUT_MS },
+        error
+      );
+    }
+    return {
+      provider,
+      ok: command.exitCode === 0,
+      exitCode: command.exitCode,
+      output: command.stderr ? `${command.stdout}
+${command.stderr}` : command.stdout,
+      error: null,
+      reason: null
+    };
+  };
   return {
     check,
     checkAll: () => Promise.all([
       check("claude"),
       check("codex")
-    ])
+    ]),
+    apply
   };
 }
 export {

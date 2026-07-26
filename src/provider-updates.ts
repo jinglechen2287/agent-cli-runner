@@ -4,6 +4,10 @@ import { CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 import { CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
 
 const CHECK_TIMEOUT_MS = 5_000;
+/** Installers download and unpack a whole release, so they need far longer than
+ * the read-only checks — but still a ceiling, so a wedged installer cannot pin
+ * a host's update state to "running" forever. */
+const APPLY_TIMEOUT_MS = 10 * 60 * 1_000;
 const CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases";
 
 export type ProviderUpdateProvider = "claude" | "codex";
@@ -31,9 +35,38 @@ export interface ProviderUpdateStatus {
   reason: ProviderUpdateReason;
 }
 
+/** Why an update never reached the installer, or died before reporting.
+ * `null` only means "no category applies" — it does not imply the installer
+ * ran, since an unclassified spawn failure lands here too. Use
+ * `exitCode !== null` to tell whether the installer actually decided. */
+export type ProviderUpdateApplyReason =
+  | "cli_not_found"
+  | "unsupported_installation"
+  /** The install method could not be read, so it was not safe to assume the
+   * updater owns this binary — distinct from knowing it does not. */
+  | "install_method_unknown"
+  | "timed_out"
+  | null;
+
+export interface ProviderUpdateApplyResult {
+  provider: ProviderUpdateProvider;
+  ok: boolean;
+  /** null when no process produced one — a refusal, a spawn failure, or a kill. */
+  exitCode: number | null;
+  /** Combined stdout + stderr, untrimmed; the caller decides how much to keep. */
+  output: string;
+  /** Set for refusals and spawn/timeout failures; null for a plain nonzero exit,
+   * where `output` already carries the installer's own explanation. */
+  error: string | null;
+  reason: ProviderUpdateApplyReason;
+}
+
 export interface ProviderUpdateService {
   check(provider: ProviderUpdateProvider): Promise<ProviderUpdateStatus>;
   checkAll(): Promise<ProviderUpdateStatus[]>;
+  /** Run the provider's own updater. Never throws: every failure mode comes
+   * back as a result so a host can render it. */
+  apply(provider: ProviderUpdateProvider): Promise<ProviderUpdateApplyResult>;
 }
 
 export interface ProviderUpdateServiceConfig {
@@ -183,6 +216,27 @@ function isMissingExecutable(error: unknown): boolean {
   return error instanceof Error
     && "code" in error
     && (error as Error & { code?: unknown }).code === "ENOENT";
+}
+
+function formatTimeout(timeoutMs: number): string {
+  if (timeoutMs % 60_000 === 0) {
+    const minutes = timeoutMs / 60_000;
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  const seconds = timeoutMs / 1_000;
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
+
+/** `execFile` reports a timeout by killing the child, which leaves `code`
+ * undefined and `killed` true — so it rejects rather than resolving with an
+ * exit status. Some platforms surface ETIMEDOUT instead. Exceeding `maxBuffer`
+ * also kills the child, so that case has to be excluded explicitly or a chatty
+ * installer gets reported as having run out of time. */
+function isTimeoutError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const candidate = error as Error & { killed?: unknown; code?: unknown };
+  if (candidate.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return false;
+  return candidate.killed === true || candidate.code === "ETIMEDOUT";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -378,11 +432,133 @@ export function createProviderUpdateService(
     return provider === "claude" ? checkClaude(checkedAt) : checkCodex(checkedAt);
   };
 
+  function executableFor(provider: ProviderUpdateProvider): string {
+    return provider === "claude"
+      ? config.claudePath ?? "claude"
+      : config.codexPath ?? "codex";
+  }
+
+  function refusal(
+    provider: ProviderUpdateProvider,
+    reason: Exclude<ProviderUpdateApplyReason, null>,
+    error: string,
+  ): ProviderUpdateApplyResult {
+    return { provider, ok: false, exitCode: null, output: "", error, reason };
+  }
+
+  function failureFromError(
+    provider: ProviderUpdateProvider,
+    executable: string,
+    /** The step that failed, so a timeout reports the deadline it actually
+     * blew — the doctor probe and the installer run on very different clocks. */
+    step: { args: string; timeoutMs: number },
+    error: unknown,
+  ): ProviderUpdateApplyResult {
+    if (isMissingExecutable(error)) {
+      return refusal(provider, "cli_not_found", `${executable} was not found.`);
+    }
+    if (isTimeoutError(error)) {
+      return refusal(
+        provider,
+        "timed_out",
+        `${executable} ${step.args} timed out after ${formatTimeout(step.timeoutMs)}.`,
+      );
+    }
+    return {
+      provider,
+      ok: false,
+      exitCode: null,
+      output: "",
+      error: error instanceof Error ? error.message : String(error),
+      reason: null,
+    };
+  }
+
+  /** Read how Claude Code was installed. Only native installs own their own
+   * binary: a Homebrew or npm install belongs to that package manager and
+   * `claude update` cannot drive it, so `apply` refuses before spawning
+   * anything — mirroring what `check` already reports. */
+  async function claudeInstallMethod(
+    executable: string,
+    env: NodeJS.ProcessEnv,
+  ): Promise<string | null> {
+    const doctor = await runCommand(executable, ["doctor"], {
+      env,
+      timeoutMs: CHECK_TIMEOUT_MS,
+    });
+    return parseClaudeDoctor(`${doctor.stdout}\n${doctor.stderr}`)?.installMethod ?? null;
+  }
+
+  const apply = async (
+    provider: ProviderUpdateProvider,
+  ): Promise<ProviderUpdateApplyResult> => {
+    const executable = executableFor(provider);
+    const env = filterEnv(
+      baseEnv,
+      provider === "claude" ? CLAUDE_STRIPPED_ENV_VARS : CODEX_STRIPPED_ENV_VARS,
+    );
+
+    if (provider === "claude") {
+      let installMethod: string | null;
+      try {
+        installMethod = await claudeInstallMethod(executable, env);
+      } catch (error) {
+        return failureFromError(
+          provider,
+          executable,
+          { args: "doctor", timeoutMs: CHECK_TIMEOUT_MS },
+          error,
+        );
+      }
+      // Both cases refuse, but only one of them is a fact about the install:
+      // claiming "not native" when doctor was simply unreadable would send the
+      // user off to a package manager that may not own this binary at all.
+      if (installMethod === null) {
+        return refusal(
+          provider,
+          "install_method_unknown",
+          "Could not read how Claude Code was installed, so the updater was not run.",
+        );
+      }
+      if (installMethod !== "native") {
+        return refusal(
+          provider,
+          "unsupported_installation",
+          `Claude Code was installed with ${installMethod}; update it with that package manager.`,
+        );
+      }
+    }
+
+    let command: ProviderUpdateCommandResult;
+    try {
+      command = await runCommand(executable, ["update"], {
+        env,
+        timeoutMs: APPLY_TIMEOUT_MS,
+      });
+    } catch (error) {
+      return failureFromError(
+        provider,
+        executable,
+        { args: "update", timeoutMs: APPLY_TIMEOUT_MS },
+        error,
+      );
+    }
+    return {
+      provider,
+      ok: command.exitCode === 0,
+      exitCode: command.exitCode,
+      output: command.stderr ? `${command.stdout}\n${command.stderr}` : command.stdout,
+      error: null,
+      reason: null,
+    };
+  };
+
   return {
     check,
     checkAll: () => Promise.all([
       check("claude"),
       check("codex"),
     ]),
+    apply,
   };
 }
