@@ -1976,7 +1976,7 @@ function defaultRunCommand(executable, args, options) {
           resolve({ stdout, stderr, exitCode: error.code });
           return;
         }
-        reject(error);
+        reject(Object.assign(error, { stdout, stderr }));
       }
     );
   });
@@ -2064,6 +2064,11 @@ function isTimeoutError(error) {
   const candidate = error;
   if (candidate.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return false;
   return candidate.killed === true || candidate.code === "ETIMEDOUT";
+}
+function partialOutput(error) {
+  if (!(error instanceof Error)) return "";
+  const { stdout, stderr } = error;
+  return [stdout, stderr].filter((stream) => typeof stream === "string" && stream !== "").join("\n");
 }
 function isRecord3(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -2226,25 +2231,27 @@ ${doctor.stderr}`);
   function executableFor(provider) {
     return provider === "claude" ? config.claudePath ?? "claude" : config.codexPath ?? "codex";
   }
-  function refusal(provider, reason, error) {
-    return { provider, ok: false, exitCode: null, output: "", error, reason };
+  function refusal(provider, reason, error, output = "") {
+    return { provider, ok: false, exitCode: null, output, error, reason };
   }
   function failureFromError(provider, executable, step, error) {
+    const output = partialOutput(error);
     if (isMissingExecutable2(error)) {
-      return refusal(provider, "cli_not_found", `${executable} was not found.`);
+      return refusal(provider, "cli_not_found", `${executable} was not found.`, output);
     }
     if (isTimeoutError(error)) {
       return refusal(
         provider,
         "timed_out",
-        `${executable} ${step.args} timed out after ${formatTimeout(step.timeoutMs)}.`
+        `${executable} ${step.args} timed out after ${formatTimeout(step.timeoutMs)}.`,
+        output
       );
     }
     return {
       provider,
       ok: false,
       exitCode: null,
-      output: "",
+      output,
       error: error instanceof Error ? error.message : String(error),
       reason: null
     };

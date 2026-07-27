@@ -132,7 +132,10 @@ function defaultRunCommand(
           resolve({ stdout, stderr, exitCode: error.code });
           return;
         }
-        reject(error);
+        // A kill (timeout, maxBuffer) leaves no exit status, but the callback
+        // still hands over what the child printed first. Carry it on the error
+        // so callers can report it rather than losing it here.
+        reject(Object.assign(error, { stdout, stderr }));
       },
     );
   });
@@ -237,6 +240,18 @@ function isTimeoutError(error: unknown): boolean {
   const candidate = error as Error & { killed?: unknown; code?: unknown };
   if (candidate.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return false;
   return candidate.killed === true || candidate.code === "ETIMEDOUT";
+}
+
+/** Whatever a child printed before it was killed. A hung installer's last
+ * lines are the most useful thing it produced — "downloading… 47%" explains a
+ * ten-minute timeout that the timeout message alone cannot — so `apply`
+ * recovers them instead of reporting an empty log. */
+function partialOutput(error: unknown): string {
+  if (!(error instanceof Error)) return "";
+  const { stdout, stderr } = error as Error & { stdout?: unknown; stderr?: unknown };
+  return [stdout, stderr]
+    .filter((stream): stream is string => typeof stream === "string" && stream !== "")
+    .join("\n");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -442,8 +457,9 @@ export function createProviderUpdateService(
     provider: ProviderUpdateProvider,
     reason: Exclude<ProviderUpdateApplyReason, null>,
     error: string,
+    output = "",
   ): ProviderUpdateApplyResult {
-    return { provider, ok: false, exitCode: null, output: "", error, reason };
+    return { provider, ok: false, exitCode: null, output, error, reason };
   }
 
   function failureFromError(
@@ -454,21 +470,26 @@ export function createProviderUpdateService(
     step: { args: string; timeoutMs: number },
     error: unknown,
   ): ProviderUpdateApplyResult {
+    // A killed child has no exit status, so this is the only place its output
+    // survives. Losing it here is what leaves a ten-minute timeout with nothing
+    // to show but the deadline it blew.
+    const output = partialOutput(error);
     if (isMissingExecutable(error)) {
-      return refusal(provider, "cli_not_found", `${executable} was not found.`);
+      return refusal(provider, "cli_not_found", `${executable} was not found.`, output);
     }
     if (isTimeoutError(error)) {
       return refusal(
         provider,
         "timed_out",
         `${executable} ${step.args} timed out after ${formatTimeout(step.timeoutMs)}.`,
+        output,
       );
     }
     return {
       provider,
       ok: false,
       exitCode: null,
-      output: "",
+      output,
       error: error instanceof Error ? error.message : String(error),
       reason: null,
     };

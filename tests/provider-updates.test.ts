@@ -446,6 +446,57 @@ describe("provider update service", () => {
     });
   });
 
+  it("keeps what a killed installer printed before it died", async () => {
+    // The deadline alone explains nothing; the last lines are the diagnosis.
+    const deps = makeDeps({
+      "codex update": Object.assign(new Error("Command failed"), {
+        killed: true,
+        signal: "SIGTERM",
+        stdout: "downloading 0.145.1... 47%",
+        stderr: "warning: slow mirror",
+      }),
+    });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("codex"),
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: "timed_out",
+      output: "downloading 0.145.1... 47%\nwarning: slow mirror",
+    });
+  });
+
+  it("keeps the output an overflowing installer produced", async () => {
+    const deps = makeDeps({
+      "codex update": Object.assign(new Error("stdout maxBuffer length exceeded"), {
+        code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        killed: true,
+        stdout: "installing...",
+        stderr: "",
+      }),
+    });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("codex"),
+    ).resolves.toMatchObject({
+      ok: false,
+      // The fixture is killed with a signal like a timeout is, so pinning the
+      // reason is the point: this must not be blamed on the deadline.
+      reason: null,
+      output: "installing...",
+    });
+  });
+
+  it("reports a missing CLI without inventing output", async () => {
+    const deps = makeDeps({
+      "codex update": Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }),
+    });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("codex"),
+    ).resolves.toMatchObject({ ok: false, reason: "cli_not_found", output: "" });
+  });
+
   it("reports the doctor probe's own deadline, not the installer's", async () => {
     const deps = makeDeps({
       "claude doctor": Object.assign(new Error("Command failed"), {
