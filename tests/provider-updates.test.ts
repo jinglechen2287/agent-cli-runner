@@ -584,3 +584,50 @@ describe("provider update service", () => {
     });
   });
 });
+
+describe("provider update service regressions", () => {
+  it("treats numerically-equal prerelease identifiers with leading zeros as equal", async () => {
+    const deps = makeDeps(
+      {
+        "claude --version": result("2.1.220-beta.01 (Claude Code)"),
+        "claude doctor": claudeDoctor("native", "latest"),
+      },
+      {
+        // beta.01 == beta.1, and the extra .5 identifier makes latest newer.
+        "https://downloads.claude.ai/claude-code-releases/latest": "2.1.220-beta.1.5\n",
+      },
+    );
+
+    await expect(
+      createProviderUpdateService({}, deps).check("claude"),
+    ).resolves.toMatchObject({
+      state: "update_available",
+      installedVersion: "2.1.220-beta.01",
+      latestVersion: "2.1.220-beta.1.5",
+    });
+  });
+
+  it("keeps the unparseable doctor transcript on an install_method_unknown refusal", async () => {
+    const deps = makeDeps({ "claude doctor": result("Claude Code doctor\nsomething new") });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("claude"),
+    ).resolves.toMatchObject({
+      reason: "install_method_unknown",
+      // The transcript that failed to parse is the one artifact that
+      // explains the refusal — it must not be dropped.
+      output: "Claude Code doctor\nsomething new",
+    });
+  });
+
+  it("keeps the doctor transcript on an unsupported_installation refusal", async () => {
+    const deps = makeDeps({ "claude doctor": claudeDoctor("brew") });
+
+    await expect(
+      createProviderUpdateService({}, deps).apply("claude"),
+    ).resolves.toMatchObject({
+      reason: "unsupported_installation",
+      output: expect.stringContaining("Config install method: brew"),
+    });
+  });
+});

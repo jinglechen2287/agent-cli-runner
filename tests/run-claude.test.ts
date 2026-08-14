@@ -1811,3 +1811,100 @@ describe("runClaude", () => {
     expect(result.usage).toBeUndefined();
   });
 });
+
+describe("runClaude robustness", () => {
+  it("contains a throwing host callback and still settles the run", async () => {
+    const child = makeFakeChild();
+    const onAssistantText = vi.fn(() => {
+      throw new Error("host bug");
+    });
+    const onToolUse = vi.fn(() => {
+      throw new Error("host bug");
+    });
+    // Async rejection must be contained too — Node turns an unhandled
+    // rejection into a process crash just like a synchronous throw.
+    const onUsage = vi.fn(async () => {
+      throw new Error("host bug");
+    });
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onAssistantText,
+      onToolUse,
+      onUsage,
+    });
+
+    child.stdout.write(JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", id: "tool-1", name: "Bash", input: { command: "ls" } },
+          { type: "text", text: "done" },
+        ],
+        usage: { input_tokens: 10 },
+      },
+    }) + "\n");
+    finish(child);
+
+    const result = await promise;
+    expect(onToolUse).toHaveBeenCalledTimes(1);
+    expect(onAssistantText).toHaveBeenCalledWith("done");
+    expect(onUsage).toHaveBeenCalledTimes(1);
+    expect(result.text).toBe("done");
+    expect(result.usage).toMatchObject({ inputTokens: 10 });
+  });
+
+  it("does not resurrect a finished background agent from a trailing progress rollup", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const child = makeFakeChild();
+    const onBackgroundAgentUpdate = vi.fn();
+    const promise = runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+      onBackgroundAgentUpdate,
+    });
+
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_started",
+      task_id: "task-1",
+      task_type: "local_agent",
+    }) + "\n");
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "task-1",
+      patch: { status: "completed", end_time: 900 },
+    }) + "\n");
+    child.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "task_progress",
+      task_id: "task-1",
+      usage: { total_tokens: 2_000 },
+    }) + "\n");
+    finish(child);
+    await promise;
+
+    const last = onBackgroundAgentUpdate.mock.calls.at(-1)?.[0];
+    expect(last).toMatchObject({
+      id: "task-1",
+      status: "completed",
+      endedAt: 900,
+      progress: { totalTokens: 2_000 },
+    });
+  });
+
+  it("maps a synchronously-thrown ENOENT from spawn to MissingCliError", async () => {
+    const spawnFn = vi.fn(() => {
+      throw Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" });
+    });
+    await expect(runClaude({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: spawnFn as never,
+    })).rejects.toMatchObject({ name: "MissingCliError", cli: "claude" });
+  });
+});

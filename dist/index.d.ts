@@ -242,6 +242,10 @@ interface CodexAppServerClient {
     request(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
     notify(method: string, params?: unknown): void;
     onNotification(handler: (method: string, params: unknown) => void): () => void;
+    /** Register the single handler that answers server-initiated requests.
+     * Only one registration may be active at a time: a second call throws
+     * while the first is live, and the slot reopens once the returned
+     * disposer runs. */
     onServerRequest(handler: CodexServerRequestHandler): () => void;
     onStderr(handler: (chunk: string) => void): () => void;
     onClose(handler: (error: Error) => void): () => void;

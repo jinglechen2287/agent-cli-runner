@@ -1,10 +1,15 @@
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { AbortError, CodexTurnError, MissingCliError, TimeoutError } from "./errors.js";
 import {
+  createChunkDecoder,
   createLineSplitter,
   filterEnv,
   isMissingExecutable,
+  isRecord,
+  normalizePlanStatus,
   normalizeSummary,
+  planCompletionSummary,
+  safeCallback,
   SIGTERM_GRACE_MS,
   signalProcessTree,
   toContextWindow,
@@ -52,6 +57,10 @@ export interface CodexAppServerClient {
   ): Promise<unknown>;
   notify(method: string, params?: unknown): void;
   onNotification(handler: (method: string, params: unknown) => void): () => void;
+  /** Register the single handler that answers server-initiated requests.
+   * Only one registration may be active at a time: a second call throws
+   * while the first is live, and the slot reopens once the returned
+   * disposer runs. */
   onServerRequest(handler: CodexServerRequestHandler): () => void;
   onStderr(handler: (chunk: string) => void): () => void;
   onClose(handler: (error: Error) => void): () => void;
@@ -106,16 +115,16 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
  * app-server can be slow to answer; give it far more headroom than plain
  * admin requests so a loaded host does not fail turns spuriously. */
 const TURN_START_TIMEOUT_MS = 60_000;
+/** Ceiling on events held in the turn/start send→ack window. In normal
+ * operation the ack lands within milliseconds and the buffer holds a handful
+ * of entries; a server that floods past this without acking is wedged. */
+const MAX_PRE_ACK_NOTIFICATIONS = 10_000;
 const CLIENT_INFO = {
   name: "agent_cli_runner",
   title: "Agent CLI Runner",
   version: "0.1.0",
 };
 const clientExitPromises = new WeakMap<CodexAppServerClient, Promise<void>>();
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 
 function rpcError(value: unknown, fallback: string): Error {
   if (!isRecord(value)) return new Error(fallback);
@@ -124,14 +133,6 @@ function rpcError(value: unknown, fallback: string): Error {
   if (value.code !== undefined) error.code = value.code;
   if (value.data !== undefined) error.data = value.data;
   return error;
-}
-
-function safeCallback(use: () => void): void {
-  try {
-    use();
-  } catch {
-    // Host callbacks must never corrupt the provider stream.
-  }
 }
 
 export async function createCodexAppServerClient(
@@ -153,7 +154,11 @@ export async function createCodexAppServerClient(
 
   const pending = new Map<number, PendingRequest>();
   const notificationHandlers = new Set<(method: string, params: unknown) => void>();
-  const serverRequestHandlers = new Set<CodexServerRequestHandler>();
+  // Exactly one handler can answer a server request; registering a second one
+  // while the first is live throws rather than silently ignoring it. Each
+  // registration gets its own token so a stale disposer (from a disposed
+  // registration of the same handler instance) can never clear a newer one.
+  let serverRequestRegistration: { handler: CodexServerRequestHandler } | undefined;
   const stderrHandlers = new Set<(chunk: string) => void>();
   const closeHandlers = new Set<(error: Error) => void>();
   const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -195,9 +200,7 @@ export async function createCodexAppServerClient(
     const id = message.id;
     const method = message.method;
     if ((typeof id !== "number" && typeof id !== "string") || typeof method !== "string") return;
-    const handler = serverRequestHandlers.values().next().value as
-      | CodexServerRequestHandler
-      | undefined;
+    const handler = serverRequestRegistration?.handler;
     if (!handler) {
       send({
         id,
@@ -251,11 +254,11 @@ export async function createCodexAppServerClient(
 
   const splitter = createLineSplitter(handleLine);
   child.stdout?.on("data", (chunk: Buffer | string) => splitter.push(chunk));
-  child.stderr?.on("data", (chunk: Buffer | string) => {
-    const text = chunk.toString();
+  const stderrDecoder = createChunkDecoder((text) => {
     stderr = (stderr + text).slice(-4_000);
     for (const handler of stderrHandlers) safeCallback(() => handler(text));
   });
+  child.stderr?.on("data", (chunk: Buffer | string) => stderrDecoder.push(chunk));
   child.stdin?.on("error", (error: Error) => fail(error));
   child.stdout?.on("error", (error: Error) => fail(error));
   child.stderr?.on("error", (error: Error) => fail(error));
@@ -268,6 +271,7 @@ export async function createCodexAppServerClient(
     if (killTimer) clearTimeout(killTimer);
     if (exitFallbackTimer) clearTimeout(exitFallbackTimer);
     splitter.flush();
+    stderrDecoder.flush();
     const detail = stderr.trim();
     fail(new Error(
       `Codex app-server exited${code === null ? "" : ` with code ${code}`}${detail ? `: ${detail}` : ""}`,
@@ -295,8 +299,16 @@ export async function createCodexAppServerClient(
       return () => notificationHandlers.delete(handler);
     },
     onServerRequest(handler) {
-      serverRequestHandlers.add(handler);
-      return () => serverRequestHandlers.delete(handler);
+      if (serverRequestRegistration) {
+        throw new Error(
+          "Codex app-server client already has a server request handler — remove it first",
+        );
+      }
+      const registration = { handler };
+      serverRequestRegistration = registration;
+      return () => {
+        if (serverRequestRegistration === registration) serverRequestRegistration = undefined;
+      };
     },
     onStderr(handler) {
       stderrHandlers.add(handler);
@@ -375,7 +387,9 @@ function webUrl(item: Record<string, unknown>): string | undefined {
   return text(webAction(item)?.url) ?? text(item.url);
 }
 
-function toolName(item: Record<string, unknown>): string | null {
+/** Shared by the app-server and `codex exec` paths (both item spellings are
+ * handled) so the two runners can never drift on tool naming. */
+export function toolName(item: Record<string, unknown>): string | null {
   switch (itemType(item)) {
     case "commandExecution":
     case "command_execution":
@@ -414,7 +428,7 @@ function webSearchQuery(item: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-function toolInput(item: Record<string, unknown>): Record<string, unknown> {
+export function toolInput(item: Record<string, unknown>): Record<string, unknown> {
   const type = itemType(item);
   if (type !== "webSearch" && type !== "web_search") return item;
   const action = webAction(item);
@@ -439,7 +453,7 @@ function toolInput(item: Record<string, unknown>): Record<string, unknown> {
   return query ? { ...item, query } : item;
 }
 
-function summarizeTool(item: Record<string, unknown>): string | undefined {
+export function summarizeTool(item: Record<string, unknown>): string | undefined {
   switch (itemType(item)) {
     case "commandExecution":
     case "command_execution":
@@ -538,12 +552,6 @@ function withWebUrl(item: Record<string, unknown>, url: string | undefined): Rec
   return { ...item, url };
 }
 
-function normalizePlanStatus(value: unknown): string | undefined {
-  const status = text(value);
-  if (!status) return undefined;
-  return status.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
-}
-
 function planItems(value: unknown): ToolPlanItem[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const items: ToolPlanItem[] = [];
@@ -560,11 +568,10 @@ function planItems(value: unknown): ToolPlanItem[] | undefined {
 function planToolInfo(params: Record<string, unknown>, turnId: string): ToolUseInfo | undefined {
   const items = planItems(params.plan);
   if (!items) return undefined;
-  const completed = items.filter(({ status }) => status === "completed").length;
   return {
     callId: `${turnId}:plan`,
     name: "TodoWrite",
-    summary: `${completed}/${items.length} steps completed`,
+    summary: planCompletionSummary(items),
     planItems: items,
     input: params,
   };
@@ -607,13 +614,15 @@ function toUsage(
   const tokenUsage = record(params.tokenUsage);
   const last = record(tokenUsage?.last);
   if (!last) return undefined;
-  const used = toTokenCount(last.totalTokens);
-  if (used <= 0) return undefined;
+  if (toTokenCount(last.totalTokens) <= 0) return undefined;
   const input = toTokenCount(last.inputTokens);
   const cached = toTokenCount(last.cachedInputTokens);
   const contextWindow = toContextWindow(tokenUsage?.modelContextWindow) ?? fallbackWindow;
   return {
-    contextTokens: used,
+    // Input side only (cached included), per the TokenUsage contract — not
+    // last.totalTokens, which also counts output. Matches the Claude and
+    // isolated-exec paths.
+    contextTokens: input,
     inputTokens: Math.max(0, input - cached),
     cachedInputTokens: cached,
     outputTokens: toTokenCount(last.outputTokens),
@@ -650,29 +659,22 @@ function requestCodexThread(
     | "resumeSessionId"
   >,
 ): Promise<unknown> {
+  // One shared params object so resumed threads can never silently diverge
+  // from fresh ones (e.g. losing raw events, and with them WebFetch URLs).
+  const params = {
+    cwd: opts.cwd,
+    experimentalRawEvents: true,
+    ...(opts.model ? { model: opts.model } : {}),
+    ...(opts.developerInstructions
+      ? { developerInstructions: opts.developerInstructions }
+      : {}),
+    ...(opts.dangerouslyBypassApprovalsAndSandbox
+      ? { approvalPolicy: "never", sandbox: "danger-full-access" }
+      : {}),
+  };
   return opts.resumeSessionId
-    ? client.request("thread/resume", {
-        threadId: opts.resumeSessionId,
-        cwd: opts.cwd,
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.developerInstructions
-          ? { developerInstructions: opts.developerInstructions }
-          : {}),
-        ...(opts.dangerouslyBypassApprovalsAndSandbox
-          ? { approvalPolicy: "never", sandbox: "danger-full-access" }
-          : {}),
-      })
-    : client.request("thread/start", {
-        cwd: opts.cwd,
-        experimentalRawEvents: true,
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.developerInstructions
-          ? { developerInstructions: opts.developerInstructions }
-          : {}),
-        ...(opts.dangerouslyBypassApprovalsAndSandbox
-          ? { approvalPolicy: "never", sandbox: "danger-full-access" }
-          : {}),
-      });
+    ? client.request("thread/resume", { threadId: opts.resumeSessionId, ...params })
+    : client.request("thread/start", params);
 }
 
 function openedCodexThread(value: unknown, fallbackModel?: string): OpenedCodexThread {
@@ -722,6 +724,47 @@ async function runCodexAppServerTurn(
     continuity?.previousTurnIds?.has(turnId) ?? false;
   let threadId = openedThread?.threadId ?? opts.resumeSessionId;
   let turnId: string | undefined;
+  /** Set immediately before turn/start is sent. Turn-scoped notifications
+   * arriving earlier cannot belong to this turn (the server cannot have
+   * started what was not yet requested), so they are dropped — closing the
+   * window where a trailing event from a prior turn on a reused thread could
+   * latch a stale turn id, even when no previousTurnIds set is available. */
+  let turnStartSent = false;
+  /** Set once the turn/start ack has named the turn. Notifications arriving
+   * in the send→ack window are buffered and replayed after the ack, so a
+   * trailing event from a prior turn in that window can never latch a stale
+   * turn id — the ack's id is authoritative before any event is interpreted. */
+  let ackReceived = false;
+  const preAckNotifications: Array<{
+    method: string;
+    params: Record<string, unknown>;
+  }> = [];
+  /** A turn-tagged fatal error that arrived before the turn was identified.
+   * Held until the turn/start ack (or another event) names the turn, so a
+   * stale turn's trailing failure cannot settle this run while this turn's
+   * own failure is still honored. */
+  let pendingTurnError: { turnId: string; error: CodexTurnError } | undefined;
+  const resolvePendingTurnError = (): void => {
+    if (!pendingTurnError || !turnId) return;
+    const held = pendingTurnError;
+    pendingTurnError = undefined;
+    if (held.turnId !== turnId) return;
+    flushPendingWebTools();
+    settleError(held.error);
+  };
+  /** The single gate for turn attribution: validates an event's turn id
+   * against the latch (adopting it when none is latched yet) and returns it,
+   * or undefined when the event belongs to another (or a previous) turn. */
+  const matchTurn = (eventTurnId: string | undefined): string | undefined => {
+    if (!turnStartSent || !eventTurnId) return undefined;
+    if (isPreviousTurn(eventTurnId)) return undefined;
+    if (turnId && eventTurnId !== turnId) return undefined;
+    if (!turnId) {
+      turnId = eventTurnId;
+      resolvePendingTurnError();
+    }
+    return eventTurnId;
+  };
   let resolvedModel = opts.model ?? openedThread?.model;
   let finalText = "";
   let latestUsage: TokenUsage | undefined;
@@ -923,10 +966,7 @@ async function runCodexAppServerTurn(
 
   const handleItem = (method: string, params: Record<string, unknown>): void => {
     if (params.threadId !== threadId) return;
-    const eventTurnId = text(params.turnId);
-    if (!eventTurnId || isPreviousTurn(eventTurnId)) return;
-    turnId ??= eventTurnId;
-    if (turnId !== eventTurnId) return;
+    if (!matchTurn(text(params.turnId))) return;
     const item = record(params.item);
     if (!item) return;
     const occurredAt = typeof params.startedAtMs === "number"
@@ -964,12 +1004,9 @@ async function runCodexAppServerTurn(
     if (method === "item/completed") emitToolResult(id, item);
   };
 
-  const removeNotification = client.onNotification((method, rawParams) => {
-    const params = record(rawParams);
-    if (!params) return;
+  const dispatchNotification = (method: string, params: Record<string, unknown>): void => {
     if (method === "turn/started" && params.threadId === threadId) {
-      const startedTurnId = text(record(params.turn)?.id);
-      if (startedTurnId && !isPreviousTurn(startedTurnId)) turnId ??= startedTurnId;
+      matchTurn(text(record(params.turn)?.id));
       if (interruption) requestInterrupt();
       return;
     }
@@ -981,11 +1018,7 @@ async function runCodexAppServerTurn(
       // A pooled connection multiplexes threads, and an interrupted turn can
       // trail deltas after the next one starts — both must be filtered out.
       if (params.threadId !== threadId) return;
-      const eventTurnId = text(params.turnId);
-      if (!eventTurnId || isPreviousTurn(eventTurnId) || (turnId && eventTurnId !== turnId)) {
-        return;
-      }
-      turnId ??= eventTurnId;
+      if (!matchTurn(text(params.turnId))) return;
       // Raw, not the trimming text() helper: word boundaries arrive as
       // leading spaces and paragraph breaks as whitespace-only chunks, so
       // trimming here jams the streamed words together.
@@ -995,20 +1028,13 @@ async function runCodexAppServerTurn(
     }
     if (method === "rawResponseItem/completed") {
       if (params.threadId !== threadId) return;
-      const eventTurnId = text(params.turnId);
-      if (!eventTurnId || isPreviousTurn(eventTurnId) || (turnId && eventTurnId !== turnId)) {
-        return;
-      }
-      turnId ??= eventTurnId;
+      if (!matchTurn(text(params.turnId))) return;
       handleRawResponseItem(params);
       return;
     }
     if (method === "turn/plan/updated" && params.threadId === threadId) {
-      const eventTurnId = text(params.turnId);
-      if (!eventTurnId || isPreviousTurn(eventTurnId) || (turnId && eventTurnId !== turnId)) {
-        return;
-      }
-      turnId ??= eventTurnId;
+      const eventTurnId = matchTurn(text(params.turnId));
+      if (!eventTurnId) return;
       const info = planToolInfo(params, eventTurnId);
       if (info) safeCallback(() => opts.onToolUse?.(info));
       return;
@@ -1022,18 +1048,32 @@ async function runCodexAppServerTurn(
     }
     if (method === "error" && params.threadId === threadId) {
       if (params.willRetry === true) return;
-      flushPendingWebTools();
+      // A turn-tagged error must pass the same attribution gate as every
+      // other turn-scoped notification, or a trailing failure from an
+      // aborted previous turn on a reused thread would kill this one — but
+      // unlike item events it must never latch the turn id itself. Before
+      // the turn is identified it is held instead, and settled or discarded
+      // once the ack (or a real turn event) names the turn. An untagged
+      // error is thread-fatal and settles regardless.
+      const errorTurnId = text(params.turnId);
       const message = text(record(params.error)?.message) ?? "Codex turn failed";
+      if (errorTurnId) {
+        if (!turnStartSent || isPreviousTurn(errorTurnId)) return;
+        if (!turnId) {
+          pendingTurnError = {
+            turnId: errorTurnId,
+            error: new CodexTurnError(`Codex error: ${message}`),
+          };
+          return;
+        }
+        if (errorTurnId !== turnId) return;
+      }
+      flushPendingWebTools();
       settleError(new CodexTurnError(`Codex error: ${message}`));
       return;
     }
     if (method !== "turn/completed" || params.threadId !== threadId) return;
-    const completedTurnId = text(record(params.turn)?.id);
-    if (!completedTurnId || isPreviousTurn(completedTurnId)
-      || (turnId && completedTurnId !== turnId)) {
-      return;
-    }
-    turnId ??= completedTurnId;
+    if (!matchTurn(text(record(params.turn)?.id))) return;
     flushPendingWebTools();
     if (interruption) {
       failLifecycle(interruption);
@@ -1050,6 +1090,43 @@ async function runCodexAppServerTurn(
     const message = text(record(record(params.turn)?.error)?.message)
       ?? `Codex turn ${status ?? "failed"}`;
     settleError(new CodexTurnError(message));
+  };
+  const removeNotification = client.onNotification((method, rawParams) => {
+    const params = record(rawParams);
+    if (!params) return;
+    // In the send→ack window no event's turn id can be verified yet, so hold
+    // everything settle-capable or host-visible and replay it (in order) once
+    // the ack names the turn. turn/started is exempt: it only latches the id
+    // (which the ack overrides), and when the ack is lost it is the sole
+    // source of the turn id the timeout path needs for its best-effort
+    // turn/interrupt.
+    // Only this thread's events are worth holding; a shared client's other
+    // threads flow straight through (dispatch drops them by threadId anyway).
+    // An untagged error is thread-fatal and settles immediately — only
+    // turn-tagged events wait for the ack to attribute them.
+    const untaggedFatalError = method === "error"
+      && params.willRetry !== true
+      && !text(params.turnId);
+    if (
+      turnStartSent
+      && !ackReceived
+      && method !== "turn/started"
+      && !untaggedFatalError
+      && params.threadId === threadId
+    ) {
+      if (preAckNotifications.length >= MAX_PRE_ACK_NOTIFICATIONS) {
+        // A server that floods events without ever acking turn/start is not
+        // going to converge; fail the turn instead of buffering unboundedly.
+        preAckNotifications.length = 0;
+        settleError(new CodexTurnError(
+          "Codex app-server flooded events without acknowledging turn/start",
+        ));
+        return;
+      }
+      preAckNotifications.push({ method, params });
+      return;
+    }
+    dispatchNotification(method, params);
   });
   const removeClose = client.onClose((error) => settleError(error));
   const removeStderr = client.onStderr((chunk) => safeCallback(() => opts.onStderr?.(chunk)));
@@ -1074,15 +1151,28 @@ async function runCodexAppServerTurn(
       ? TURN_START_TIMEOUT_MS
       : Math.max(1, Math.min(TURN_START_TIMEOUT_MS, runDeadline - Date.now()));
     let turnResult: unknown;
+    turnStartSent = true;
     try {
-      turnResult = await raceLifecycle(client.request("turn/start", {
-        threadId,
-        input,
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
-        ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
-        ...(opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}),
-      }, turnStartTimeoutMs));
+      // Also raced against `completion`: a thread-fatal error or pre-ack
+      // buffer overflow settles the turn while the ack is still pending, and
+      // that real error should surface immediately rather than after the
+      // turn/start timeout expires. One flat race — an extra nesting level
+      // would add a microtask hop and reorder ack handling against a
+      // same-tick abort.
+      turnResult = await Promise.race([
+        client.request("turn/start", {
+          threadId,
+          input,
+          ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
+          ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
+          ...(opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}),
+        }, turnStartTimeoutMs),
+        completion.then(() => {
+          throw new CodexTurnError("Codex turn settled before turn/start was acknowledged");
+        }),
+        lifecycleFailure,
+      ]);
     } catch (error) {
       // The turn may have started server-side despite the lost ack, and an
       // unacked start cannot be trusted to unwind before the thread is
@@ -1100,14 +1190,37 @@ async function runCodexAppServerTurn(
       throw error;
     }
     turnId = turnIdFrom(turnResult) ?? turnId;
+    ackReceived = true;
+    // Replay the send→ack window in arrival order, now that events can be
+    // attributed against the ack's authoritative turn id. When the ack named
+    // no turn, the replayed turn/started may still latch one.
+    for (const entry of preAckNotifications.splice(0)) {
+      dispatchNotification(entry.method, entry.params);
+    }
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
+    resolvePendingTurnError();
     if (interruption) requestInterrupt();
-    await raceLifecycle(completion);
-
-    const status = turnStatus(turnResult);
+    const ackStatus = turnStatus(turnResult);
+    // Both status spellings, mirroring the item handlers' defensiveness.
+    const ackTerminal = ackStatus !== undefined
+      && ackStatus !== "completed"
+      && ackStatus !== "inProgress"
+      && ackStatus !== "in_progress";
+    let exitCode = 0;
+    if (ackTerminal && !settled) {
+      // The ack already reports the turn finished (failed/rejected); no
+      // further notifications are guaranteed, so waiting on turn/completed
+      // could hang forever. Settle now with the nonzero exit the terminal
+      // status describes.
+      settled = true;
+      exitCode = 1;
+    } else {
+      await raceLifecycle(completion);
+      if (ackTerminal) exitCode = 1;
+    }
     return {
       text: finalText.trim(),
-      exitCode: status && status !== "completed" && status !== "inProgress" ? 1 : 0,
+      exitCode,
       sessionId: threadId as string,
       ...(latestUsage ? { usage: latestUsage } : {}),
     };

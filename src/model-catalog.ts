@@ -14,6 +14,8 @@
 
 import { execFile } from "node:child_process";
 import { createCodexAppServerClient } from "./codex-app-server.js";
+import { filterEnv } from "./internal.js";
+import { CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 
 export type ModelCatalogProvider = "claude" | "codex";
 
@@ -162,7 +164,15 @@ function readClaudeCliCapabilities(
     execFile(
       executablePath,
       ["--help"],
-      { cwd, timeout: 5_000, maxBuffer: 1_000_000 },
+      {
+        cwd,
+        timeout: 5_000,
+        maxBuffer: 1_000_000,
+        // Same nesting-guard strip every other claude spawn applies, so
+        // discovery still works for hosts running inside a Claude Code
+        // session instead of silently degrading to the static fallback.
+        env: filterEnv(process.env, CLAUDE_STRIPPED_ENV_VARS),
+      },
       (error, stdout, stderr) => {
         if (error) {
           reject(error);
@@ -329,8 +339,13 @@ export function createModelCatalogService(
       if (model && !option && !catalog.supportsCustomModel) {
         throw new Error(`Model is not available: ${model}`);
       }
+      // A custom model (no catalog entry) still inherits the host's default
+      // effort, which every catalog entry advertises via the default model —
+      // otherwise the run silently drops the effort the UI displays.
+      const defaultOption = catalog.models.find((candidate) => candidate.isDefault)
+        ?? catalog.models[0];
       const requestedEffort = input.effort === undefined
-        ? option?.defaultEffort ?? null
+        ? (option ?? defaultOption)?.defaultEffort ?? null
         : input.effort?.trim() || null;
       const supportedEfforts = option?.efforts.map((candidate) => candidate.id)
         ?? catalog.models.find((candidate) => candidate.isDefault)?.efforts

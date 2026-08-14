@@ -32,6 +32,29 @@ var CodexTurnError = class extends Error {
 import { spawn as nodeSpawn } from "child_process";
 import { StringDecoder } from "string_decoder";
 var SIGTERM_GRACE_MS = 2e3;
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function safeCallback(use) {
+  try {
+    const result = use();
+    if (result !== null && typeof result === "object" && typeof result.then === "function") {
+      void Promise.resolve(result).catch(() => {
+      });
+    }
+  } catch {
+  }
+}
+function planCompletionSummary(planItems2) {
+  const completed = planItems2.filter((item) => item.status === "completed").length;
+  return `${completed}/${planItems2.length} steps completed`;
+}
+function normalizePlanStatus(value) {
+  if (typeof value !== "string") return void 0;
+  const status = value.trim();
+  if (!status) return void 0;
+  return status.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
+}
 function normalizeSummary(value) {
   if (typeof value !== "string") return void 0;
   const summary = value.replace(/\s+/g, " ").trim();
@@ -53,7 +76,7 @@ function filterEnv(base, stripped) {
   return env;
 }
 function isMissingExecutable(error) {
-  return "code" in error && error.code === "ENOENT";
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 function createLineSplitter(onLine) {
   let buffer = "";
@@ -72,6 +95,19 @@ function createLineSplitter(onLine) {
       buffer += decoder.end();
       if (buffer) onLine(buffer);
       buffer = "";
+    }
+  };
+}
+function createChunkDecoder(onText) {
+  const decoder = new StringDecoder("utf8");
+  return {
+    push(chunk) {
+      const text2 = typeof chunk === "string" ? chunk : decoder.write(chunk);
+      if (text2) onText(text2);
+    },
+    flush() {
+      const rest = decoder.end();
+      if (rest) onText(rest);
     }
   };
 }
@@ -247,10 +283,6 @@ function claudeTodoPlanItems(name, input) {
   }
   return items.length > 0 ? items : void 0;
 }
-function planCompletionSummary(planItems2) {
-  const completed = planItems2.filter((item) => item.status === "completed").length;
-  return `${completed}/${planItems2.length} steps completed`;
-}
 function claudeBackgroundAgentStatus(status) {
   switch (status) {
     case "pending":
@@ -360,14 +392,20 @@ async function runClaude(opts) {
   } else if (opts.resumeSessionId) {
     args.push("--resume", opts.resumeSessionId);
   }
-  const child = spawnFn(opts.executablePath ?? "claude", args, {
-    cwd: opts.cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
-    // Process-group leader (POSIX), so the SIGKILL escalation reaches tool
-    // children (a running Bash) that the CLI can no longer reap itself.
-    detached: process.platform !== "win32"
-  });
+  let child;
+  try {
+    child = spawnFn(opts.executablePath ?? "claude", args, {
+      cwd: opts.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
+      // Process-group leader (POSIX), so the SIGKILL escalation reaches tool
+      // children (a running Bash) that the CLI can no longer reap itself.
+      detached: process.platform !== "win32"
+    });
+  } catch (error) {
+    if (isMissingExecutable(error)) throw new MissingCliError("claude");
+    throw error;
+  }
   writePrompt(child, opts.prompt);
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -383,14 +421,11 @@ async function runClaude(opts) {
     const backgroundAgents = /* @__PURE__ */ new Map();
     const emitBackgroundAgent = (agent) => {
       backgroundAgents.set(agent.id, agent);
-      try {
-        opts.onBackgroundAgentUpdate?.(agent);
-      } catch {
-      }
+      safeCallback(() => opts.onBackgroundAgentUpdate?.(agent));
     };
     const emitUsage = (usage) => {
       lastUsage = usage;
-      opts.onUsage?.(usage);
+      safeCallback(() => opts.onUsage?.(usage));
     };
     const lifecycle = watchLifecycle({
       cli: "claude",
@@ -402,7 +437,7 @@ async function runClaude(opts) {
       sessionId = id;
       if (sessionIdEmitted) return;
       sessionIdEmitted = true;
-      opts.onSessionId?.(id);
+      safeCallback(() => opts.onSessionId?.(id));
     };
     const handleLine = (line) => {
       const trimmed = line.trim();
@@ -417,7 +452,8 @@ async function runClaude(opts) {
         if (parsed.parent_tool_use_id) return;
         const delta = parsed.event?.type === "content_block_delta" ? parsed.event.delta : void 0;
         if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
-          opts.onAssistantTextDelta?.(delta.text);
+          const text2 = delta.text;
+          safeCallback(() => opts.onAssistantTextDelta?.(text2));
         }
         return;
       }
@@ -460,7 +496,9 @@ async function runClaude(opts) {
           ...typeof parsed.subagent_type === "string" ? { agentType: parsed.subagent_type } : {},
           ...typeof parsed.summary === "string" ? { summary: parsed.summary } : {},
           ...Object.keys(progress).length > 0 ? { progress } : {},
-          status: "running",
+          // A trailing progress rollup can arrive after the terminal
+          // task_updated; it must not resurrect a finished agent.
+          status: current.status === "completed" || current.status === "failed" || current.status === "interrupted" ? current.status : "running",
           updatedAt: Date.now()
         });
         return;
@@ -493,19 +531,20 @@ async function runClaude(opts) {
             }
             const planItems2 = claudeTodoPlanItems(block.name, block.input);
             const summary = planItems2 ? planCompletionSummary(planItems2) : summarizeClaudeTool(block.name, block.input);
-            opts.onToolUse?.({
+            const info = {
               ...typeof block.id === "string" ? { callId: block.id } : {},
               name: block.name,
               ...summary !== void 0 ? { summary } : {},
               ...block.input ? { input: block.input } : {},
               ...planItems2 ? { planItems: planItems2 } : {}
-            });
+            };
+            safeCallback(() => opts.onToolUse?.(info));
           }
         }
         if (texts.length > 0 && !parsed.parent_tool_use_id) {
           const text2 = texts.join("");
           lastAssistantText = text2;
-          opts.onAssistantText?.(text2);
+          safeCallback(() => opts.onAssistantText?.(text2));
         }
         if (parsed.parent_tool_use_id) return;
         const model = qualifyModel(parsed.message.model, sessionModel);
@@ -523,11 +562,12 @@ async function runClaude(opts) {
           if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
             continue;
           }
-          opts.onToolResult?.({
+          const result = {
             callId: block.tool_use_id,
             content: block.content,
             ...typeof block.is_error === "boolean" ? { isError: block.is_error } : {}
-          });
+          };
+          safeCallback(() => opts.onToolResult?.(result));
         }
         return;
       }
@@ -545,9 +585,10 @@ async function runClaude(opts) {
     };
     const splitter = createLineSplitter(handleLine);
     child.stdout?.on("data", (chunk) => splitter.push(chunk));
-    child.stderr?.on("data", (chunk) => {
-      opts.onStderr?.(chunk.toString());
-    });
+    const stderrDecoder = createChunkDecoder(
+      (text2) => safeCallback(() => opts.onStderr?.(text2))
+    );
+    child.stderr?.on("data", (chunk) => stderrDecoder.push(chunk));
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
@@ -558,6 +599,7 @@ async function runClaude(opts) {
       if (settled) return;
       settled = true;
       splitter.flush();
+      stderrDecoder.flush();
       lifecycle.cleanup();
       const interruption = lifecycle.interruptionError();
       if (interruption) {
@@ -581,15 +623,13 @@ import { spawn } from "child_process";
 import { spawn as nodeSpawn3 } from "child_process";
 var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;
 var TURN_START_TIMEOUT_MS = 6e4;
+var MAX_PRE_ACK_NOTIFICATIONS = 1e4;
 var CLIENT_INFO = {
   name: "agent_cli_runner",
   title: "Agent CLI Runner",
   version: "0.1.0"
 };
 var clientExitPromises = /* @__PURE__ */ new WeakMap();
-function isRecord(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 function rpcError(value, fallback) {
   if (!isRecord(value)) return new Error(fallback);
   const message = typeof value.message === "string" ? value.message : fallback;
@@ -597,12 +637,6 @@ function rpcError(value, fallback) {
   if (value.code !== void 0) error.code = value.code;
   if (value.data !== void 0) error.data = value.data;
   return error;
-}
-function safeCallback(use) {
-  try {
-    use();
-  } catch {
-  }
 }
 async function createCodexAppServerClient(options) {
   const spawnFn = options.spawnFn ?? nodeSpawn3;
@@ -620,7 +654,7 @@ async function createCodexAppServerClient(options) {
   }
   const pending = /* @__PURE__ */ new Map();
   const notificationHandlers = /* @__PURE__ */ new Set();
-  const serverRequestHandlers = /* @__PURE__ */ new Set();
+  let serverRequestRegistration;
   const stderrHandlers = /* @__PURE__ */ new Set();
   const closeHandlers = /* @__PURE__ */ new Set();
   const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -659,7 +693,7 @@ async function createCodexAppServerClient(options) {
     const id = message.id;
     const method = message.method;
     if (typeof id !== "number" && typeof id !== "string" || typeof method !== "string") return;
-    const handler = serverRequestHandlers.values().next().value;
+    const handler = serverRequestRegistration?.handler;
     if (!handler) {
       send({
         id,
@@ -710,11 +744,11 @@ async function createCodexAppServerClient(options) {
   };
   const splitter = createLineSplitter(handleLine);
   child.stdout?.on("data", (chunk) => splitter.push(chunk));
-  child.stderr?.on("data", (chunk) => {
-    const text2 = chunk.toString();
+  const stderrDecoder = createChunkDecoder((text2) => {
     stderr = (stderr + text2).slice(-4e3);
     for (const handler of stderrHandlers) safeCallback(() => handler(text2));
   });
+  child.stderr?.on("data", (chunk) => stderrDecoder.push(chunk));
   child.stdin?.on("error", (error) => fail(error));
   child.stdout?.on("error", (error) => fail(error));
   child.stderr?.on("error", (error) => fail(error));
@@ -727,6 +761,7 @@ async function createCodexAppServerClient(options) {
     if (killTimer) clearTimeout(killTimer);
     if (exitFallbackTimer) clearTimeout(exitFallbackTimer);
     splitter.flush();
+    stderrDecoder.flush();
     const detail = stderr.trim();
     fail(new Error(
       `Codex app-server exited${code === null ? "" : ` with code ${code}`}${detail ? `: ${detail}` : ""}`
@@ -753,8 +788,16 @@ async function createCodexAppServerClient(options) {
       return () => notificationHandlers.delete(handler);
     },
     onServerRequest(handler) {
-      serverRequestHandlers.add(handler);
-      return () => serverRequestHandlers.delete(handler);
+      if (serverRequestRegistration) {
+        throw new Error(
+          "Codex app-server client already has a server request handler \u2014 remove it first"
+        );
+      }
+      const registration = { handler };
+      serverRequestRegistration = registration;
+      return () => {
+        if (serverRequestRegistration === registration) serverRequestRegistration = void 0;
+      };
     },
     onStderr(handler) {
       stderrHandlers.add(handler);
@@ -970,11 +1013,6 @@ function withWebUrl(item, url) {
   if (!url || webUrl(item)) return item;
   return { ...item, url };
 }
-function normalizePlanStatus(value) {
-  const status = text(value);
-  if (!status) return void 0;
-  return status.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
-}
 function planItems(value) {
   if (!Array.isArray(value)) return void 0;
   const items = [];
@@ -990,11 +1028,10 @@ function planItems(value) {
 function planToolInfo(params, turnId) {
   const items = planItems(params.plan);
   if (!items) return void 0;
-  const completed = items.filter(({ status }) => status === "completed").length;
   return {
     callId: `${turnId}:plan`,
     name: "TodoWrite",
-    summary: `${completed}/${items.length} steps completed`,
+    summary: planCompletionSummary(items),
     planItems: items,
     input: params
   };
@@ -1028,13 +1065,15 @@ function toUsage(params, threadId, turnId, model, fallbackWindow) {
   const tokenUsage = record(params.tokenUsage);
   const last = record(tokenUsage?.last);
   if (!last) return void 0;
-  const used = toTokenCount(last.totalTokens);
-  if (used <= 0) return void 0;
+  if (toTokenCount(last.totalTokens) <= 0) return void 0;
   const input = toTokenCount(last.inputTokens);
   const cached = toTokenCount(last.cachedInputTokens);
   const contextWindow = toContextWindow(tokenUsage?.modelContextWindow) ?? fallbackWindow;
   return {
-    contextTokens: used,
+    // Input side only (cached included), per the TokenUsage contract — not
+    // last.totalTokens, which also counts output. Matches the Claude and
+    // isolated-exec paths.
+    contextTokens: input,
     inputTokens: Math.max(0, input - cached),
     cachedInputTokens: cached,
     outputTokens: toTokenCount(last.outputTokens),
@@ -1052,19 +1091,14 @@ function turnStatus(value) {
   return text(record(record(value)?.turn)?.status);
 }
 function requestCodexThread(client, opts) {
-  return opts.resumeSessionId ? client.request("thread/resume", {
-    threadId: opts.resumeSessionId,
-    cwd: opts.cwd,
-    ...opts.model ? { model: opts.model } : {},
-    ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
-    ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}
-  }) : client.request("thread/start", {
+  const params = {
     cwd: opts.cwd,
     experimentalRawEvents: true,
     ...opts.model ? { model: opts.model } : {},
     ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
     ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}
-  });
+  };
+  return opts.resumeSessionId ? client.request("thread/resume", { threadId: opts.resumeSessionId, ...params }) : client.request("thread/start", params);
 }
 function openedCodexThread(value, fallbackModel) {
   const threadId = threadIdFrom(value);
@@ -1077,6 +1111,28 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
   const isPreviousTurn = (turnId2) => continuity?.previousTurnIds?.has(turnId2) ?? false;
   let threadId = openedThread?.threadId ?? opts.resumeSessionId;
   let turnId;
+  let turnStartSent = false;
+  let ackReceived = false;
+  const preAckNotifications = [];
+  let pendingTurnError;
+  const resolvePendingTurnError = () => {
+    if (!pendingTurnError || !turnId) return;
+    const held = pendingTurnError;
+    pendingTurnError = void 0;
+    if (held.turnId !== turnId) return;
+    flushPendingWebTools();
+    settleError(held.error);
+  };
+  const matchTurn = (eventTurnId) => {
+    if (!turnStartSent || !eventTurnId) return void 0;
+    if (isPreviousTurn(eventTurnId)) return void 0;
+    if (turnId && eventTurnId !== turnId) return void 0;
+    if (!turnId) {
+      turnId = eventTurnId;
+      resolvePendingTurnError();
+    }
+    return eventTurnId;
+  };
   let resolvedModel = opts.model ?? openedThread?.model;
   let finalText = "";
   let latestUsage;
@@ -1248,10 +1304,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
   };
   const handleItem = (method, params) => {
     if (params.threadId !== threadId) return;
-    const eventTurnId = text(params.turnId);
-    if (!eventTurnId || isPreviousTurn(eventTurnId)) return;
-    turnId ??= eventTurnId;
-    if (turnId !== eventTurnId) return;
+    if (!matchTurn(text(params.turnId))) return;
     const item = record(params.item);
     if (!item) return;
     const occurredAt = typeof params.startedAtMs === "number" ? params.startedAtMs : typeof params.completedAtMs === "number" ? params.completedAtMs : Date.now();
@@ -1283,12 +1336,9 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     emitToolUse(id, item);
     if (method === "item/completed") emitToolResult(id, item);
   };
-  const removeNotification = client.onNotification((method, rawParams) => {
-    const params = record(rawParams);
-    if (!params) return;
+  const dispatchNotification = (method, params) => {
     if (method === "turn/started" && params.threadId === threadId) {
-      const startedTurnId = text(record(params.turn)?.id);
-      if (startedTurnId && !isPreviousTurn(startedTurnId)) turnId ??= startedTurnId;
+      matchTurn(text(record(params.turn)?.id));
       if (interruption) requestInterrupt();
       return;
     }
@@ -1298,31 +1348,20 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     }
     if (method === "item/agentMessage/delta") {
       if (params.threadId !== threadId) return;
-      const eventTurnId = text(params.turnId);
-      if (!eventTurnId || isPreviousTurn(eventTurnId) || turnId && eventTurnId !== turnId) {
-        return;
-      }
-      turnId ??= eventTurnId;
+      if (!matchTurn(text(params.turnId))) return;
       const chunk = typeof params.delta === "string" ? params.delta : "";
       if (chunk) safeCallback(() => opts.onAssistantTextDelta?.(chunk));
       return;
     }
     if (method === "rawResponseItem/completed") {
       if (params.threadId !== threadId) return;
-      const eventTurnId = text(params.turnId);
-      if (!eventTurnId || isPreviousTurn(eventTurnId) || turnId && eventTurnId !== turnId) {
-        return;
-      }
-      turnId ??= eventTurnId;
+      if (!matchTurn(text(params.turnId))) return;
       handleRawResponseItem(params);
       return;
     }
     if (method === "turn/plan/updated" && params.threadId === threadId) {
-      const eventTurnId = text(params.turnId);
-      if (!eventTurnId || isPreviousTurn(eventTurnId) || turnId && eventTurnId !== turnId) {
-        return;
-      }
-      turnId ??= eventTurnId;
+      const eventTurnId = matchTurn(text(params.turnId));
+      if (!eventTurnId) return;
       const info = planToolInfo(params, eventTurnId);
       if (info) safeCallback(() => opts.onToolUse?.(info));
       return;
@@ -1336,17 +1375,25 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     }
     if (method === "error" && params.threadId === threadId) {
       if (params.willRetry === true) return;
-      flushPendingWebTools();
+      const errorTurnId = text(params.turnId);
       const message2 = text(record(params.error)?.message) ?? "Codex turn failed";
+      if (errorTurnId) {
+        if (!turnStartSent || isPreviousTurn(errorTurnId)) return;
+        if (!turnId) {
+          pendingTurnError = {
+            turnId: errorTurnId,
+            error: new CodexTurnError(`Codex error: ${message2}`)
+          };
+          return;
+        }
+        if (errorTurnId !== turnId) return;
+      }
+      flushPendingWebTools();
       settleError(new CodexTurnError(`Codex error: ${message2}`));
       return;
     }
     if (method !== "turn/completed" || params.threadId !== threadId) return;
-    const completedTurnId = text(record(params.turn)?.id);
-    if (!completedTurnId || isPreviousTurn(completedTurnId) || turnId && completedTurnId !== turnId) {
-      return;
-    }
-    turnId ??= completedTurnId;
+    if (!matchTurn(text(record(params.turn)?.id))) return;
     flushPendingWebTools();
     if (interruption) {
       failLifecycle(interruption);
@@ -1362,6 +1409,23 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     }
     const message = text(record(record(params.turn)?.error)?.message) ?? `Codex turn ${status ?? "failed"}`;
     settleError(new CodexTurnError(message));
+  };
+  const removeNotification = client.onNotification((method, rawParams) => {
+    const params = record(rawParams);
+    if (!params) return;
+    const untaggedFatalError = method === "error" && params.willRetry !== true && !text(params.turnId);
+    if (turnStartSent && !ackReceived && method !== "turn/started" && !untaggedFatalError && params.threadId === threadId) {
+      if (preAckNotifications.length >= MAX_PRE_ACK_NOTIFICATIONS) {
+        preAckNotifications.length = 0;
+        settleError(new CodexTurnError(
+          "Codex app-server flooded events without acknowledging turn/start"
+        ));
+        return;
+      }
+      preAckNotifications.push({ method, params });
+      return;
+    }
+    dispatchNotification(method, params);
   });
   const removeClose = client.onClose((error) => settleError(error));
   const removeStderr = client.onStderr((chunk) => safeCallback(() => opts.onStderr?.(chunk)));
@@ -1381,15 +1445,22 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     ];
     const turnStartTimeoutMs = runDeadline === void 0 ? TURN_START_TIMEOUT_MS : Math.max(1, Math.min(TURN_START_TIMEOUT_MS, runDeadline - Date.now()));
     let turnResult;
+    turnStartSent = true;
     try {
-      turnResult = await raceLifecycle(client.request("turn/start", {
-        threadId,
-        input,
-        ...opts.model ? { model: opts.model } : {},
-        ...opts.reasoningEffort ? { effort: opts.reasoningEffort } : {},
-        ...opts.serviceTier !== void 0 ? { serviceTier: opts.serviceTier } : {},
-        ...opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}
-      }, turnStartTimeoutMs));
+      turnResult = await Promise.race([
+        client.request("turn/start", {
+          threadId,
+          input,
+          ...opts.model ? { model: opts.model } : {},
+          ...opts.reasoningEffort ? { effort: opts.reasoningEffort } : {},
+          ...opts.serviceTier !== void 0 ? { serviceTier: opts.serviceTier } : {},
+          ...opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}
+        }, turnStartTimeoutMs),
+        completion.then(() => {
+          throw new CodexTurnError("Codex turn settled before turn/start was acknowledged");
+        }),
+        lifecycleFailure
+      ]);
     } catch (error) {
       if ((error instanceof TimeoutError || error instanceof AbortError) && threadId) {
         if (turnId && !interruption) {
@@ -1401,13 +1472,26 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
       throw error;
     }
     turnId = turnIdFrom(turnResult) ?? turnId;
+    ackReceived = true;
+    for (const entry of preAckNotifications.splice(0)) {
+      dispatchNotification(entry.method, entry.params);
+    }
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
+    resolvePendingTurnError();
     if (interruption) requestInterrupt();
-    await raceLifecycle(completion);
-    const status = turnStatus(turnResult);
+    const ackStatus = turnStatus(turnResult);
+    const ackTerminal = ackStatus !== void 0 && ackStatus !== "completed" && ackStatus !== "inProgress" && ackStatus !== "in_progress";
+    let exitCode = 0;
+    if (ackTerminal && !settled) {
+      settled = true;
+      exitCode = 1;
+    } else {
+      await raceLifecycle(completion);
+      if (ackTerminal) exitCode = 1;
+    }
     return {
       text: finalText.trim(),
-      exitCode: status && status !== "completed" && status !== "inProgress" ? 1 : 0,
+      exitCode,
       sessionId: threadId,
       ...latestUsage ? { usage: latestUsage } : {}
     };
@@ -1501,9 +1585,6 @@ async function runCodexAppServer(opts) {
 
 // src/run-codex.ts
 var CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"];
-function isRecord2(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 function buildIsolatedArgs(opts) {
   const args = [
     "exec",
@@ -1527,65 +1608,27 @@ function buildIsolatedArgs(opts) {
   return args;
 }
 function execToolName(item) {
-  switch (item.type) {
-    case "command_execution":
-      return "Bash";
-    case "file_change":
-      return "Edit";
-    case "mcp_tool_call":
-      return typeof item.tool === "string" ? item.tool : "MCP";
-    case "web_search":
-      return "WebSearch";
-    case "todo_list":
-    case "plan_update":
-      return "TodoWrite";
-    default:
-      return null;
-  }
-}
-function execWebQuery(item) {
-  const direct = normalizeSummary(item.query);
-  if (direct) return direct;
-  if (!isRecord2(item.action)) return void 0;
-  const query = normalizeSummary(item.action.query);
-  if (query) return query;
-  if (!Array.isArray(item.action.queries)) return void 0;
-  for (const candidate of item.action.queries) {
-    const normalized = normalizeSummary(candidate);
-    if (normalized) return normalized;
-  }
-  return void 0;
+  if (item.type === "todo_list" || item.type === "plan_update") return "TodoWrite";
+  return toolName(item);
 }
 function execPlanItems(item) {
   const values = Array.isArray(item.items) ? item.items : Array.isArray(item.plan) ? item.plan : void 0;
   if (!values) return void 0;
   const items = [];
   for (const value of values) {
-    if (!isRecord2(value)) return void 0;
+    if (!isRecord(value)) return void 0;
     const text2 = normalizeSummary(value.text) ?? normalizeSummary(value.step);
-    const rawStatus = typeof value.completed === "boolean" ? value.completed ? "completed" : "pending" : normalizeSummary(value.status);
-    const status = rawStatus?.toLowerCase().replace(/\s+/g, "_");
+    const status = typeof value.completed === "boolean" ? value.completed ? "completed" : "pending" : normalizePlanStatus(value.status);
     if (!text2 || !status) return void 0;
     items.push({ text: text2, status });
   }
   return items.length > 0 ? items : void 0;
 }
 function execToolSummary(item, planItems2) {
-  if (item.type === "command_execution") return normalizeSummary(item.command);
-  if (item.type === "web_search") return execWebQuery(item);
-  if (item.type === "file_change" && Array.isArray(item.changes)) {
-    const paths = item.changes.flatMap((change) => {
-      const path = isRecord2(change) ? normalizeSummary(change.path) : void 0;
-      return path ? [path] : [];
-    });
-    if (paths.length === 1) return paths[0];
-    if (paths.length > 1) return `${paths.length} files`;
-  }
   if ((item.type === "todo_list" || item.type === "plan_update") && planItems2) {
-    const complete = planItems2.filter(({ status }) => status === "completed").length;
-    return `${complete}/${planItems2.length} steps completed`;
+    return planCompletionSummary(planItems2);
   }
-  return void 0;
+  return summarizeTool(item);
 }
 function execUsage(usage, opts) {
   const input = toTokenCount(usage.input_tokens);
@@ -1606,7 +1649,7 @@ function execUsage(usage, opts) {
 }
 function execFatalError(event) {
   if (event.type !== "error" && event.type !== "turn.failed") return void 0;
-  const detail = typeof event.message === "string" ? event.message : typeof event.error === "string" ? event.error : isRecord2(event.error) && typeof event.error.message === "string" ? event.error.message : void 0;
+  const detail = typeof event.message === "string" ? event.message : typeof event.error === "string" ? event.error : isRecord(event.error) && typeof event.error.message === "string" ? event.error.message : void 0;
   return new CodexTurnError(detail ? `Codex error: ${detail}` : "Codex error");
 }
 async function runIsolatedCodex(opts) {
@@ -1645,20 +1688,23 @@ async function runIsolatedCodex(opts) {
       }
       fatalError ??= execFatalError(event);
       if (event.type === "thread.started" && typeof event.thread_id === "string") {
-        sessionId = event.thread_id;
-        opts.onSessionId?.(event.thread_id);
+        const threadId = event.thread_id;
+        sessionId = threadId;
+        safeCallback(() => opts.onSessionId?.(threadId));
         return;
       }
       if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
-        finalText = event.item.text;
-        opts.onAssistantText?.(event.item.text);
+        const message = event.item.text;
+        finalText = message;
+        safeCallback(() => opts.onAssistantText?.(message));
         return;
       }
       if (event.type === "turn.completed") {
-        const usage = isRecord2(event.usage) ? execUsage(event.usage, opts) : void 0;
+        fatalError = void 0;
+        const usage = isRecord(event.usage) ? execUsage(event.usage, opts) : void 0;
         if (usage) {
           latestUsage = usage;
-          opts.onUsage?.(usage);
+          safeCallback(() => opts.onUsage?.(usage));
         }
         return;
       }
@@ -1672,21 +1718,24 @@ async function runIsolatedCodex(opts) {
         emittedTools.add(id);
         const planItems2 = execPlanItems(item);
         const summary = execToolSummary(item, planItems2);
-        opts.onToolUse?.({
+        safeCallback(() => opts.onToolUse?.({
           callId: id,
           name,
           ...summary ? { summary } : {},
           ...planItems2 ? { planItems: planItems2 } : {},
-          input: item.type === "web_search" ? { ...item, query: execWebQuery(item) } : item
-        });
+          input: toolInput(item)
+        }));
       }
       if (event.type === "item.completed") {
-        opts.onToolResult?.({ callId: id, content: item });
+        safeCallback(() => opts.onToolResult?.({ callId: id, content: item }));
       }
     };
     const splitter = createLineSplitter(handleLine);
     child.stdout?.on("data", (chunk) => splitter.push(chunk));
-    child.stderr?.on("data", (chunk) => opts.onStderr?.(chunk.toString()));
+    const stderrDecoder = createChunkDecoder(
+      (text2) => safeCallback(() => opts.onStderr?.(text2))
+    );
+    child.stderr?.on("data", (chunk) => stderrDecoder.push(chunk));
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
@@ -1697,6 +1746,7 @@ async function runIsolatedCodex(opts) {
       if (settled) return;
       settled = true;
       splitter.flush();
+      stderrDecoder.flush();
       lifecycle.cleanup();
       const interruption = lifecycle.interruptionError();
       if (interruption) {
@@ -1799,7 +1849,15 @@ function readClaudeCliCapabilities(executablePath, cwd) {
     execFile(
       executablePath,
       ["--help"],
-      { cwd, timeout: 5e3, maxBuffer: 1e6 },
+      {
+        cwd,
+        timeout: 5e3,
+        maxBuffer: 1e6,
+        // Same nesting-guard strip every other claude spawn applies, so
+        // discovery still works for hosts running inside a Claude Code
+        // session instead of silently degrading to the static fallback.
+        env: filterEnv(process.env, CLAUDE_STRIPPED_ENV_VARS)
+      },
       (error, stdout, stderr) => {
         if (error) {
           reject(error);
@@ -1934,7 +1992,8 @@ function createModelCatalogService(config = {}, deps = {}) {
       if (model && !option && !catalog.supportsCustomModel) {
         throw new Error(`Model is not available: ${model}`);
       }
-      const requestedEffort = input.effort === void 0 ? option?.defaultEffort ?? null : input.effort?.trim() || null;
+      const defaultOption = catalog.models.find((candidate) => candidate.isDefault) ?? catalog.models[0];
+      const requestedEffort = input.effort === void 0 ? (option ?? defaultOption)?.defaultEffort ?? null : input.effort?.trim() || null;
       const supportedEfforts = option?.efforts.map((candidate) => candidate.id) ?? catalog.models.find((candidate) => candidate.isDefault)?.efforts.map((candidate) => candidate.id) ?? CLAUDE_FALLBACK_EFFORTS;
       if (requestedEffort && supportedEfforts.length > 0 && !new Set(supportedEfforts).has(requestedEffort)) {
         throw new Error(`${model ?? "Default model"} does not support effort ${requestedEffort}`);
@@ -1964,6 +2023,10 @@ function defaultRunCommand(executable, args, options) {
       {
         env: options.env,
         timeout: options.timeoutMs,
+        // SIGKILL, not the default SIGTERM: the timeout is a hard ceiling,
+        // and an installer that traps SIGTERM would otherwise keep the
+        // callback (and apply()'s promise) pending forever.
+        killSignal: "SIGKILL",
         maxBuffer: 1e6,
         encoding: "utf8"
       },
@@ -2031,6 +2094,7 @@ function comparePrerelease(left, right) {
     if (leftIsNumber && rightIsNumber) {
       const normalizedLeft = leftPart.replace(/^0+(?=\d)/, "");
       const normalizedRight = rightPart.replace(/^0+(?=\d)/, "");
+      if (normalizedLeft === normalizedRight) continue;
       if (normalizedLeft.length !== normalizedRight.length) {
         return normalizedLeft.length < normalizedRight.length ? -1 : 1;
       }
@@ -2047,9 +2111,6 @@ function compareVersions(left, right) {
     if (left[key] !== right[key]) return left[key] < right[key] ? -1 : 1;
   }
   return comparePrerelease(left.prerelease, right.prerelease);
-}
-function isMissingExecutable2(error) {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 function formatTimeout(timeoutMs) {
   if (timeoutMs % 6e4 === 0) {
@@ -2069,9 +2130,6 @@ function partialOutput(error) {
   if (!(error instanceof Error)) return "";
   const { stdout, stderr } = error;
   return [stdout, stderr].filter((stream) => typeof stream === "string" && stream !== "").join("\n");
-}
-function isRecord3(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function unknownStatus(provider, checkedAt, reason, installedVersion = null) {
   return {
@@ -2109,9 +2167,9 @@ function parseCodexLatestVersion(output) {
   } catch {
     return null;
   }
-  if (!isRecord3(parsed) || !isRecord3(parsed.checks)) return null;
+  if (!isRecord(parsed) || !isRecord(parsed.checks)) return null;
   const updateCheck = parsed.checks["updates.status"];
-  if (!isRecord3(updateCheck) || !isRecord3(updateCheck.details)) return null;
+  if (!isRecord(updateCheck) || !isRecord(updateCheck.details)) return null;
   const latest = updateCheck.details["latest version"];
   return typeof latest === "string" ? parseVersion(latest) : null;
 }
@@ -2128,7 +2186,7 @@ function createProviderUpdateService(config = {}, deps = {}) {
         timeoutMs: CHECK_TIMEOUT_MS
       });
     } catch (error) {
-      if (isMissingExecutable2(error)) {
+      if (isMissingExecutable(error)) {
         return {
           provider,
           state: "not_installed",
@@ -2147,17 +2205,15 @@ ${command.stderr}`) ?? unknownStatus(provider, checkedAt, "version_unavailable")
   async function checkClaude(checkedAt) {
     const executable = config.claudePath ?? "claude";
     const env = filterEnv(baseEnv, CLAUDE_STRIPPED_ENV_VARS);
-    const installed = await installedVersion("claude", executable, env, checkedAt);
+    const [installed, doctorResult] = await Promise.all([
+      installedVersion("claude", executable, env, checkedAt),
+      runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS }).then((value) => ({ ok: true, value })).catch(() => ({ ok: false }))
+    ]);
     if ("state" in installed) return installed;
-    let doctor;
-    try {
-      doctor = await runCommand(executable, ["doctor"], {
-        env,
-        timeoutMs: CHECK_TIMEOUT_MS
-      });
-    } catch {
+    if (!doctorResult.ok) {
       return unknownStatus("claude", checkedAt, "check_failed", installed.version);
     }
+    const doctor = doctorResult.value;
     const metadata = parseClaudeDoctor(`${doctor.stdout}
 ${doctor.stderr}`);
     if (!metadata) {
@@ -2201,17 +2257,15 @@ ${doctor.stderr}`);
   async function checkCodex(checkedAt) {
     const executable = config.codexPath ?? "codex";
     const env = filterEnv(baseEnv, CODEX_STRIPPED_ENV_VARS);
-    const installed = await installedVersion("codex", executable, env, checkedAt);
+    const [installed, doctorResult] = await Promise.all([
+      installedVersion("codex", executable, env, checkedAt),
+      runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CHECK_TIMEOUT_MS }).then((value) => ({ ok: true, value })).catch(() => ({ ok: false }))
+    ]);
     if ("state" in installed) return installed;
-    let doctor;
-    try {
-      doctor = await runCommand(executable, ["doctor", "--json"], {
-        env,
-        timeoutMs: CHECK_TIMEOUT_MS
-      });
-    } catch {
+    if (!doctorResult.ok) {
       return unknownStatus("codex", checkedAt, "check_failed", installed.version);
     }
+    const doctor = doctorResult.value;
     const latest = parseCodexLatestVersion(doctor.stdout);
     if (!latest) {
       return unknownStatus("codex", checkedAt, "version_unavailable", installed.version);
@@ -2236,7 +2290,7 @@ ${doctor.stderr}`);
   }
   function failureFromError(provider, executable, step, error) {
     const output = partialOutput(error);
-    if (isMissingExecutable2(error)) {
+    if (isMissingExecutable(error)) {
       return refusal(provider, "cli_not_found", `${executable} was not found.`, output);
     }
     if (isTimeoutError(error)) {
@@ -2261,8 +2315,14 @@ ${doctor.stderr}`);
       env,
       timeoutMs: CHECK_TIMEOUT_MS
     });
-    return parseClaudeDoctor(`${doctor.stdout}
-${doctor.stderr}`)?.installMethod ?? null;
+    const output = doctor.stderr ? `${doctor.stdout}
+${doctor.stderr}` : doctor.stdout;
+    return {
+      installMethod: parseClaudeDoctor(output)?.installMethod ?? null,
+      // Kept even on refusal: when the parse fails, the transcript that
+      // failed to parse is the one artifact that explains why.
+      output
+    };
   }
   const apply = async (provider) => {
     const executable = executableFor(provider);
@@ -2272,8 +2332,9 @@ ${doctor.stderr}`)?.installMethod ?? null;
     );
     if (provider === "claude") {
       let installMethod;
+      let doctorOutput;
       try {
-        installMethod = await claudeInstallMethod(executable, env);
+        ({ installMethod, output: doctorOutput } = await claudeInstallMethod(executable, env));
       } catch (error) {
         return failureFromError(
           provider,
@@ -2286,14 +2347,16 @@ ${doctor.stderr}`)?.installMethod ?? null;
         return refusal(
           provider,
           "install_method_unknown",
-          "Could not read how Claude Code was installed, so the updater was not run."
+          "Could not read how Claude Code was installed, so the updater was not run.",
+          doctorOutput
         );
       }
       if (installMethod !== "native") {
         return refusal(
           provider,
           "unsupported_installation",
-          `Claude Code was installed with ${installMethod}; update it with that package manager.`
+          `Claude Code was installed with ${installMethod}; update it with that package manager.`,
+          doctorOutput
         );
       }
     }

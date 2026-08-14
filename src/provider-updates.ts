@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { filterEnv } from "./internal.js";
+import { filterEnv, isMissingExecutable, isRecord } from "./internal.js";
 import { CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 import { CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
 
@@ -120,6 +120,10 @@ function defaultRunCommand(
       {
         env: options.env,
         timeout: options.timeoutMs,
+        // SIGKILL, not the default SIGTERM: the timeout is a hard ceiling,
+        // and an installer that traps SIGTERM would otherwise keep the
+        // callback (and apply()'s promise) pending forever.
+        killSignal: "SIGKILL",
         maxBuffer: 1_000_000,
         encoding: "utf8",
       },
@@ -196,6 +200,9 @@ function comparePrerelease(left: string[], right: string[]): number {
     if (leftIsNumber && rightIsNumber) {
       const normalizedLeft = leftPart.replace(/^0+(?=\d)/, "");
       const normalizedRight = rightPart.replace(/^0+(?=\d)/, "");
+      // "01" and "1" differ as raw strings but are the same number; keep
+      // comparing later identifiers instead of inventing an ordering.
+      if (normalizedLeft === normalizedRight) continue;
       if (normalizedLeft.length !== normalizedRight.length) {
         return normalizedLeft.length < normalizedRight.length ? -1 : 1;
       }
@@ -213,12 +220,6 @@ function compareVersions(left: ParsedSemver, right: ParsedSemver): number {
     if (left[key] !== right[key]) return left[key] < right[key] ? -1 : 1;
   }
   return comparePrerelease(left.prerelease, right.prerelease);
-}
-
-function isMissingExecutable(error: unknown): boolean {
-  return error instanceof Error
-    && "code" in error
-    && (error as Error & { code?: unknown }).code === "ENOENT";
 }
 
 function formatTimeout(timeoutMs: number): string {
@@ -252,10 +253,6 @@ function partialOutput(error: unknown): string {
   return [stdout, stderr]
     .filter((stream): stream is string => typeof stream === "string" && stream !== "")
     .join("\n");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function unknownStatus(
@@ -361,18 +358,20 @@ export function createProviderUpdateService(
   async function checkClaude(checkedAt: string): Promise<ProviderUpdateStatus> {
     const executable = config.claudePath ?? "claude";
     const env = filterEnv(baseEnv, CLAUDE_STRIPPED_ENV_VARS);
-    const installed = await installedVersion("claude", executable, env, checkedAt);
+    // Independent spawns, so run them concurrently — serializing two CLI cold
+    // starts roughly doubles every check's latency. The doctor result is only
+    // consulted once --version confirms the CLI is installed.
+    const [installed, doctorResult] = await Promise.all([
+      installedVersion("claude", executable, env, checkedAt),
+      runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS })
+        .then((value) => ({ ok: true as const, value }))
+        .catch(() => ({ ok: false as const })),
+    ]);
     if ("state" in installed) return installed;
-
-    let doctor: ProviderUpdateCommandResult;
-    try {
-      doctor = await runCommand(executable, ["doctor"], {
-        env,
-        timeoutMs: CHECK_TIMEOUT_MS,
-      });
-    } catch {
+    if (!doctorResult.ok) {
       return unknownStatus("claude", checkedAt, "check_failed", installed.version);
     }
+    const doctor = doctorResult.value;
     const metadata = parseClaudeDoctor(`${doctor.stdout}\n${doctor.stderr}`);
     if (!metadata) {
       return unknownStatus("claude", checkedAt, "check_failed", installed.version);
@@ -417,18 +416,17 @@ export function createProviderUpdateService(
   async function checkCodex(checkedAt: string): Promise<ProviderUpdateStatus> {
     const executable = config.codexPath ?? "codex";
     const env = filterEnv(baseEnv, CODEX_STRIPPED_ENV_VARS);
-    const installed = await installedVersion("codex", executable, env, checkedAt);
+    const [installed, doctorResult] = await Promise.all([
+      installedVersion("codex", executable, env, checkedAt),
+      runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CHECK_TIMEOUT_MS })
+        .then((value) => ({ ok: true as const, value }))
+        .catch(() => ({ ok: false as const })),
+    ]);
     if ("state" in installed) return installed;
-
-    let doctor: ProviderUpdateCommandResult;
-    try {
-      doctor = await runCommand(executable, ["doctor", "--json"], {
-        env,
-        timeoutMs: CHECK_TIMEOUT_MS,
-      });
-    } catch {
+    if (!doctorResult.ok) {
       return unknownStatus("codex", checkedAt, "check_failed", installed.version);
     }
+    const doctor = doctorResult.value;
     const latest = parseCodexLatestVersion(doctor.stdout);
     if (!latest) {
       return unknownStatus("codex", checkedAt, "version_unavailable", installed.version);
@@ -502,12 +500,18 @@ export function createProviderUpdateService(
   async function claudeInstallMethod(
     executable: string,
     env: NodeJS.ProcessEnv,
-  ): Promise<string | null> {
+  ): Promise<{ installMethod: string | null; output: string }> {
     const doctor = await runCommand(executable, ["doctor"], {
       env,
       timeoutMs: CHECK_TIMEOUT_MS,
     });
-    return parseClaudeDoctor(`${doctor.stdout}\n${doctor.stderr}`)?.installMethod ?? null;
+    const output = doctor.stderr ? `${doctor.stdout}\n${doctor.stderr}` : doctor.stdout;
+    return {
+      installMethod: parseClaudeDoctor(output)?.installMethod ?? null,
+      // Kept even on refusal: when the parse fails, the transcript that
+      // failed to parse is the one artifact that explains why.
+      output,
+    };
   }
 
   const apply = async (
@@ -521,8 +525,9 @@ export function createProviderUpdateService(
 
     if (provider === "claude") {
       let installMethod: string | null;
+      let doctorOutput: string;
       try {
-        installMethod = await claudeInstallMethod(executable, env);
+        ({ installMethod, output: doctorOutput } = await claudeInstallMethod(executable, env));
       } catch (error) {
         return failureFromError(
           provider,
@@ -539,6 +544,7 @@ export function createProviderUpdateService(
           provider,
           "install_method_unknown",
           "Could not read how Claude Code was installed, so the updater was not run.",
+          doctorOutput,
         );
       }
       if (installMethod !== "native") {
@@ -546,6 +552,7 @@ export function createProviderUpdateService(
           provider,
           "unsupported_installation",
           `Claude Code was installed with ${installMethod}; update it with that package manager.`,
+          doctorOutput,
         );
       }
     }

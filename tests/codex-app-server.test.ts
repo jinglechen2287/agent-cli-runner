@@ -200,7 +200,9 @@ describe("Codex app-server runner", () => {
       content: expect.objectContaining({ aggregatedOutput: "ok", exitCode: 0 }),
     });
     expect(onUsage).toHaveBeenCalledWith({
-      contextTokens: 60,
+      // Input side only (cached included) — last.totalTokens also counts the
+      // 10 output tokens and must not inflate context occupancy.
+      contextTokens: 50,
       inputTokens: 10,
       cachedInputTokens: 40,
       outputTokens: 10,
@@ -211,7 +213,7 @@ describe("Codex app-server runner", () => {
       text: "Done",
       exitCode: 0,
       sessionId: "thread-1",
-      usage: expect.objectContaining({ contextTokens: 60 }),
+      usage: expect.objectContaining({ contextTokens: 50 }),
     });
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
   });
@@ -244,6 +246,9 @@ describe("Codex app-server runner", () => {
     expect(requests.find(({ method }) => method === "thread/resume")?.params).toEqual({
       threadId: "thread-2",
       cwd: "/tmp/project",
+      // Resumed threads keep raw events, so WebFetch URL enrichment does not
+      // silently disappear after a resume.
+      experimentalRawEvents: true,
     });
     expect(requests.find(({ method }) => method === "turn/interrupt")?.params).toEqual({
       threadId: "thread-2",
@@ -1813,5 +1818,205 @@ describe("Codex app-server runner", () => {
     expect(onAssistantTextDelta.mock.calls.map(([chunk]) => chunk))
       .toEqual(["Hel", "lo", " there", "\n\n", "friend"]);
     expect(onAssistantText).toHaveBeenCalledWith("Hello there\n\nfriend");
+  });
+});
+
+describe("Codex app-server turn attribution", () => {
+  it("ignores a trailing error notification tagged with another turn's id", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-1" } } });
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("turn-2", "inProgress") } });
+        // A late failure from an interrupted previous turn on this thread
+        // must not settle the current turn.
+        send(child, {
+          method: "error",
+          params: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            willRetry: false,
+            error: { message: "rate limited" },
+          },
+        });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-1",
+            turnId: "turn-2",
+            completedAtMs: 2_000,
+            item: { type: "agentMessage", id: "message-1", text: "Still healthy" },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-1", turn: completedTurn("turn-2") },
+        });
+      }
+    });
+
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+    })).resolves.toMatchObject({ text: "Still healthy", exitCode: 0 });
+  });
+
+  it("fails fast when a thread-fatal error lands while turn/start is unacknowledged", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-1" } } });
+      } else if (message.method === "turn/start") {
+        // No ack, ever — only the fatal error. The run must reject with the
+        // real error now, not a TimeoutError a minute later.
+        send(child, {
+          method: "error",
+          params: {
+            threadId: "thread-1",
+            willRetry: false,
+            error: { message: "thread wedged" },
+          },
+        });
+      }
+    });
+
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+    })).rejects.toMatchObject({ name: "CodexTurnError", message: "Codex error: thread wedged" });
+  });
+
+  it("still fails the turn for an untagged (thread-fatal) error notification", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-1" } } });
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("turn-1", "inProgress") } });
+        send(child, {
+          method: "error",
+          params: {
+            threadId: "thread-1",
+            willRetry: false,
+            error: { message: "auth expired" },
+          },
+        });
+      }
+    });
+
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+    })).rejects.toMatchObject({ name: "CodexTurnError", message: "Codex error: auth expired" });
+  });
+
+  it("ignores turn-scoped notifications that arrive before turn/start is sent", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/resume") {
+        send(child, { id: message.id, result: { thread: { id: "thread-9" } } });
+        // Trailing completion of an aborted earlier turn, delivered while the
+        // runner is still resuming — before this run's turn/start exists. It
+        // must not latch as this run's turn.
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-9", turn: completedTurn("turn-old", "interrupted") },
+        });
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("turn-new", "inProgress") } });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-9",
+            turnId: "turn-new",
+            completedAtMs: 2_000,
+            item: { type: "agentMessage", id: "message-1", text: "Fresh answer" },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-9", turn: completedTurn("turn-new") },
+        });
+      }
+    });
+
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      resumeSessionId: "thread-9",
+      spawnFn: (() => child) as never,
+    })).resolves.toMatchObject({ text: "Fresh answer", exitCode: 0 });
+  });
+
+  it("ignores a stale completion arriving between turn/start and its ack", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/resume") {
+        send(child, { id: message.id, result: { thread: { id: "thread-9" } } });
+      } else if (message.method === "turn/start") {
+        // Delivered before the ack: without pre-ack buffering this would
+        // latch turn-old and settle the run as interrupted.
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-9", turn: completedTurn("turn-old", "interrupted") },
+        });
+        send(child, { id: message.id, result: { turn: completedTurn("turn-new", "inProgress") } });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-9",
+            turnId: "turn-new",
+            completedAtMs: 2_000,
+            item: { type: "agentMessage", id: "message-1", text: "Fresh answer" },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-9", turn: completedTurn("turn-new") },
+        });
+      }
+    });
+
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      resumeSessionId: "thread-9",
+      spawnFn: (() => child) as never,
+    })).resolves.toMatchObject({ text: "Fresh answer", exitCode: 0 });
+  });
+
+  it("settles with exitCode 1 when the turn/start ack already reports a terminal status", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-1" } } });
+      } else if (message.method === "turn/start") {
+        // Terminal ack with no follow-up notifications: the runner must not
+        // wait for a turn/completed that will never arrive.
+        send(child, { id: message.id, result: { turn: completedTurn("turn-1", "failed") } });
+      }
+    });
+
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      spawnFn: (() => child) as never,
+    })).resolves.toMatchObject({ exitCode: 1, sessionId: "thread-1" });
   });
 });

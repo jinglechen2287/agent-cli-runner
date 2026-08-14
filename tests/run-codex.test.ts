@@ -210,3 +210,123 @@ describe("runCodex isolated mode", () => {
     await expect(run).rejects.toMatchObject({ name: "TimeoutError" });
   });
 });
+
+describe("runCodex isolated robustness", () => {
+  it("does not fail the run for a transient error event once the turn completes", async () => {
+    const child = makeFakeChild();
+    const run = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      isolated: true,
+      spawnFn: (() => child) as never,
+    });
+
+    child.stdout.write(`${JSON.stringify({
+      type: "error",
+      message: "stream disconnected; retrying...",
+    })}\n`);
+    child.stdout.write(`${JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", id: "message", text: "Recovered fine" },
+    })}\n`);
+    child.stdout.write(`${JSON.stringify({
+      type: "turn.completed",
+      usage: { input_tokens: 100, output_tokens: 5 },
+    })}\n`);
+    finish(child);
+
+    await expect(run).resolves.toMatchObject({ text: "Recovered fine", exitCode: 0 });
+  });
+
+  it("still rejects when the error is not followed by a completed turn", async () => {
+    const child = makeFakeChild();
+    const run = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      isolated: true,
+      spawnFn: (() => child) as never,
+    });
+
+    child.stdout.write(`${JSON.stringify({
+      type: "error",
+      message: "quota exhausted",
+    })}\n`);
+    finish(child, 1);
+
+    await expect(run).rejects.toMatchObject({
+      name: "CodexTurnError",
+      message: "Codex error: quota exhausted",
+      exitCode: 1,
+    });
+  });
+
+  it("contains a throwing host callback and still settles the run", async () => {
+    const child = makeFakeChild();
+    const onAssistantText = vi.fn(() => {
+      throw new Error("host bug");
+    });
+    const run = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      isolated: true,
+      spawnFn: (() => child) as never,
+      onAssistantText,
+    });
+
+    child.stdout.write(`${JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", id: "message", text: "A short title" },
+    })}\n`);
+    finish(child);
+
+    await expect(run).resolves.toMatchObject({ text: "A short title" });
+    expect(onAssistantText).toHaveBeenCalledTimes(1);
+  });
+
+  it("normalizes exec tool items with the shared app-server rules", async () => {
+    const child = makeFakeChild();
+    const onToolUse = vi.fn();
+    const run = runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      isolated: true,
+      spawnFn: (() => child) as never,
+      onToolUse,
+    });
+
+    child.stdout.write(`${JSON.stringify({
+      type: "item.started",
+      item: { type: "command_execution", id: "cmd-1", command: "ls -la" },
+    })}\n`);
+    child.stdout.write(`${JSON.stringify({
+      type: "item.completed",
+      item: {
+        type: "todo_list",
+        id: "todo-1",
+        items: [
+          { text: "Read files", status: "inProgress" },
+          { text: "Write summary", completed: true },
+        ],
+      },
+    })}\n`);
+    finish(child);
+    await run;
+
+    expect(onToolUse).toHaveBeenCalledWith(expect.objectContaining({
+      callId: "cmd-1",
+      name: "Bash",
+      summary: "ls -la",
+    }));
+    // camelCase statuses normalize to snake_case exactly like the app-server
+    // plan path, so hosts can match "in_progress" on either provider surface.
+    expect(onToolUse).toHaveBeenCalledWith(expect.objectContaining({
+      callId: "todo-1",
+      name: "TodoWrite",
+      summary: "1/2 steps completed",
+      planItems: [
+        { text: "Read files", status: "in_progress" },
+        { text: "Write summary", status: "completed" },
+      ],
+    }));
+  });
+});

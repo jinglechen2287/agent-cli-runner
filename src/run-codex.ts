@@ -2,14 +2,22 @@ import { spawn } from "node:child_process";
 import { CodexTurnError, MissingCliError } from "./errors.js";
 import {
   runCodexAppServer,
+  summarizeTool,
+  toolInput,
+  toolName,
   type CodexAppServerClient,
   type CodexAppServerSession,
 } from "./codex-app-server.js";
 import {
+  createChunkDecoder,
   createLineSplitter,
   filterEnv,
   isMissingExecutable,
+  isRecord,
+  normalizePlanStatus,
   normalizeSummary,
+  planCompletionSummary,
+  safeCallback,
   signalProcessTree,
   toTokenCount,
   watchLifecycle,
@@ -81,10 +89,6 @@ interface CodexExecEvent {
   usage?: unknown;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 function buildIsolatedArgs(opts: RunCodexOptions): string[] {
   const args = [
     "exec",
@@ -108,36 +112,13 @@ function buildIsolatedArgs(opts: RunCodexOptions): string[] {
   return args;
 }
 
+/** Plan/todo items are the one item family `codex exec` reports that the
+ * app-server expresses as a separate notification instead, so only this
+ * mapping stays exec-local; everything else defers to the shared normalizer
+ * in codex-app-server.ts so the two paths cannot drift. */
 function execToolName(item: Record<string, unknown>): string | null {
-  switch (item.type) {
-    case "command_execution":
-      return "Bash";
-    case "file_change":
-      return "Edit";
-    case "mcp_tool_call":
-      return typeof item.tool === "string" ? item.tool : "MCP";
-    case "web_search":
-      return "WebSearch";
-    case "todo_list":
-    case "plan_update":
-      return "TodoWrite";
-    default:
-      return null;
-  }
-}
-
-function execWebQuery(item: Record<string, unknown>): string | undefined {
-  const direct = normalizeSummary(item.query);
-  if (direct) return direct;
-  if (!isRecord(item.action)) return undefined;
-  const query = normalizeSummary(item.action.query);
-  if (query) return query;
-  if (!Array.isArray(item.action.queries)) return undefined;
-  for (const candidate of item.action.queries) {
-    const normalized = normalizeSummary(candidate);
-    if (normalized) return normalized;
-  }
-  return undefined;
+  if (item.type === "todo_list" || item.type === "plan_update") return "TodoWrite";
+  return toolName(item);
 }
 
 function execPlanItems(item: Record<string, unknown>): ToolPlanItem[] | undefined {
@@ -149,10 +130,9 @@ function execPlanItems(item: Record<string, unknown>): ToolPlanItem[] | undefine
   for (const value of values) {
     if (!isRecord(value)) return undefined;
     const text = normalizeSummary(value.text) ?? normalizeSummary(value.step);
-    const rawStatus = typeof value.completed === "boolean"
+    const status = typeof value.completed === "boolean"
       ? value.completed ? "completed" : "pending"
-      : normalizeSummary(value.status);
-    const status = rawStatus?.toLowerCase().replace(/\s+/g, "_");
+      : normalizePlanStatus(value.status);
     if (!text || !status) return undefined;
     items.push({ text, status });
   }
@@ -163,21 +143,10 @@ function execToolSummary(
   item: Record<string, unknown>,
   planItems: ToolPlanItem[] | undefined,
 ): string | undefined {
-  if (item.type === "command_execution") return normalizeSummary(item.command);
-  if (item.type === "web_search") return execWebQuery(item);
-  if (item.type === "file_change" && Array.isArray(item.changes)) {
-    const paths = item.changes.flatMap((change) => {
-      const path = isRecord(change) ? normalizeSummary(change.path) : undefined;
-      return path ? [path] : [];
-    });
-    if (paths.length === 1) return paths[0];
-    if (paths.length > 1) return `${paths.length} files`;
-  }
   if ((item.type === "todo_list" || item.type === "plan_update") && planItems) {
-    const complete = planItems.filter(({ status }) => status === "completed").length;
-    return `${complete}/${planItems.length} steps completed`;
+    return planCompletionSummary(planItems);
   }
-  return undefined;
+  return summarizeTool(item);
 }
 
 /** Normalize the `turn.completed` usage summary from `codex exec`. The counts
@@ -256,8 +225,9 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
       }
       fatalError ??= execFatalError(event);
       if (event.type === "thread.started" && typeof event.thread_id === "string") {
-        sessionId = event.thread_id;
-        opts.onSessionId?.(event.thread_id);
+        const threadId = event.thread_id;
+        sessionId = threadId;
+        safeCallback(() => opts.onSessionId?.(threadId));
         return;
       }
       if (
@@ -265,15 +235,19 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
         && event.item?.type === "agent_message"
         && typeof event.item.text === "string"
       ) {
-        finalText = event.item.text;
-        opts.onAssistantText?.(event.item.text);
+        const message = event.item.text;
+        finalText = message;
+        safeCallback(() => opts.onAssistantText?.(message));
         return;
       }
       if (event.type === "turn.completed") {
+        // The turn finished despite any earlier `error` event, so that error
+        // was transient (e.g. a retried stream drop), not the run's outcome.
+        fatalError = undefined;
         const usage = isRecord(event.usage) ? execUsage(event.usage, opts) : undefined;
         if (usage) {
           latestUsage = usage;
-          opts.onUsage?.(usage);
+          safeCallback(() => opts.onUsage?.(usage));
         }
         return;
       }
@@ -287,22 +261,25 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
         emittedTools.add(id);
         const planItems = execPlanItems(item);
         const summary = execToolSummary(item, planItems);
-        opts.onToolUse?.({
+        safeCallback(() => opts.onToolUse?.({
           callId: id,
           name,
           ...(summary ? { summary } : {}),
           ...(planItems ? { planItems } : {}),
-          input: item.type === "web_search" ? { ...item, query: execWebQuery(item) } : item,
-        });
+          input: toolInput(item),
+        }));
       }
       if (event.type === "item.completed") {
-        opts.onToolResult?.({ callId: id, content: item });
+        safeCallback(() => opts.onToolResult?.({ callId: id, content: item }));
       }
     };
 
     const splitter = createLineSplitter(handleLine);
     child.stdout?.on("data", (chunk: Buffer | string) => splitter.push(chunk));
-    child.stderr?.on("data", (chunk: Buffer | string) => opts.onStderr?.(chunk.toString()));
+    const stderrDecoder = createChunkDecoder((text) =>
+      safeCallback(() => opts.onStderr?.(text)),
+    );
+    child.stderr?.on("data", (chunk: Buffer | string) => stderrDecoder.push(chunk));
     child.on("error", (error: Error) => {
       if (settled) return;
       settled = true;
@@ -313,6 +290,7 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
       if (settled) return;
       settled = true;
       splitter.flush();
+      stderrDecoder.flush();
       lifecycle.cleanup();
       const interruption = lifecycle.interruptionError();
       if (interruption) {

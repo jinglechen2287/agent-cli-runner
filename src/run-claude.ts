@@ -1,10 +1,13 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { MissingCliError } from "./errors.js";
 import {
+  createChunkDecoder,
   createLineSplitter,
   filterEnv,
   isMissingExecutable,
   normalizeSummary,
+  planCompletionSummary,
+  safeCallback,
   signalProcessTree,
   toContextWindow,
   toTokenCount,
@@ -164,12 +167,6 @@ function claudeTodoPlanItems(
     items.push({ text, status });
   }
   return items.length > 0 ? items : undefined;
-}
-
-/** "N/M steps completed" — the same plan summary Codex reports. */
-function planCompletionSummary(planItems: ToolPlanItem[]): string {
-  const completed = planItems.filter((item) => item.status === "completed").length;
-  return `${completed}/${planItems.length} steps completed`;
 }
 
 /** The `usage` block on a Claude `assistant` message and the `result` event.
@@ -383,14 +380,20 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     args.push("--resume", opts.resumeSessionId);
   }
 
-  const child = spawnFn(opts.executablePath ?? "claude", args, {
-    cwd: opts.cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
-    // Process-group leader (POSIX), so the SIGKILL escalation reaches tool
-    // children (a running Bash) that the CLI can no longer reap itself.
-    detached: process.platform !== "win32",
-  });
+  let child;
+  try {
+    child = spawnFn(opts.executablePath ?? "claude", args, {
+      cwd: opts.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
+      // Process-group leader (POSIX), so the SIGKILL escalation reaches tool
+      // children (a running Bash) that the CLI can no longer reap itself.
+      detached: process.platform !== "win32",
+    });
+  } catch (error) {
+    if (isMissingExecutable(error)) throw new MissingCliError("claude");
+    throw error;
+  }
   writePrompt(child, opts.prompt);
 
   return new Promise<RunResult>((resolve, reject) => {
@@ -409,16 +412,12 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
 
     const emitBackgroundAgent = (agent: BackgroundAgentInfo): void => {
       backgroundAgents.set(agent.id, agent);
-      try {
-        opts.onBackgroundAgentUpdate?.(agent);
-      } catch {
-        // A host callback must not interrupt the provider stream.
-      }
+      safeCallback(() => opts.onBackgroundAgentUpdate?.(agent));
     };
 
     const emitUsage = (usage: TokenUsage): void => {
       lastUsage = usage;
-      opts.onUsage?.(usage);
+      safeCallback(() => opts.onUsage?.(usage));
     };
 
     const lifecycle = watchLifecycle({
@@ -432,7 +431,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
       sessionId = id;
       if (sessionIdEmitted) return;
       sessionIdEmitted = true;
-      opts.onSessionId?.(id);
+      safeCallback(() => opts.onSessionId?.(id));
     };
 
     const handleLine = (line: string): void => {
@@ -454,7 +453,8 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
           ? parsed.event.delta
           : undefined;
         if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
-          opts.onAssistantTextDelta?.(delta.text);
+          const text = delta.text;
+          safeCallback(() => opts.onAssistantTextDelta?.(text));
         }
         return;
       }
@@ -519,7 +519,13 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
             : {}),
           ...(typeof parsed.summary === "string" ? { summary: parsed.summary } : {}),
           ...(Object.keys(progress).length > 0 ? { progress } : {}),
-          status: "running",
+          // A trailing progress rollup can arrive after the terminal
+          // task_updated; it must not resurrect a finished agent.
+          status: current.status === "completed"
+            || current.status === "failed"
+            || current.status === "interrupted"
+            ? current.status
+            : "running",
           updatedAt: Date.now(),
         });
         return;
@@ -566,13 +572,14 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
             const summary = planItems
               ? planCompletionSummary(planItems)
               : summarizeClaudeTool(block.name, block.input);
-            opts.onToolUse?.({
+            const info = {
               ...(typeof block.id === "string" ? { callId: block.id } : {}),
               name: block.name,
               ...(summary !== undefined ? { summary } : {}),
               ...(block.input ? { input: block.input } : {}),
               ...(planItems ? { planItems } : {}),
-            });
+            };
+            safeCallback(() => opts.onToolUse?.(info));
           }
         }
         // Subagent prose belongs to the subagent, not this transcript —
@@ -582,7 +589,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
         if (texts.length > 0 && !parsed.parent_tool_use_id) {
           const text = texts.join("");
           lastAssistantText = text;
-          opts.onAssistantText?.(text);
+          safeCallback(() => opts.onAssistantText?.(text));
         }
         // A subagent also runs on its own context window; its usage says
         // nothing about how full this turn's is.
@@ -607,11 +614,12 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
           if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
             continue;
           }
-          opts.onToolResult?.({
+          const result = {
             callId: block.tool_use_id,
             content: block.content,
             ...(typeof block.is_error === "boolean" ? { isError: block.is_error } : {}),
-          });
+          };
+          safeCallback(() => opts.onToolResult?.(result));
         }
         return;
       }
@@ -636,9 +644,10 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
 
     const splitter = createLineSplitter(handleLine);
     child.stdout?.on("data", (chunk: Buffer | string) => splitter.push(chunk));
-    child.stderr?.on("data", (chunk: Buffer | string) => {
-      opts.onStderr?.(chunk.toString());
-    });
+    const stderrDecoder = createChunkDecoder((text) =>
+      safeCallback(() => opts.onStderr?.(text)),
+    );
+    child.stderr?.on("data", (chunk: Buffer | string) => stderrDecoder.push(chunk));
 
     child.on("error", (err) => {
       if (settled) return;
@@ -651,6 +660,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
       if (settled) return;
       settled = true;
       splitter.flush();
+      stderrDecoder.flush();
       lifecycle.cleanup();
       const interruption = lifecycle.interruptionError();
       if (interruption) {

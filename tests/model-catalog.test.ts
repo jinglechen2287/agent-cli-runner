@@ -270,3 +270,23 @@ describe("model catalog", () => {
       .toEqual({ model: "gpt-configured", effort: "xhigh", serviceTier: null });
   });
 });
+
+describe("model catalog custom-model selection", () => {
+  it("inherits the host default effort for a custom model with no saved effort", async () => {
+    const service = createModelCatalogService(
+      { defaultEffort: "high" },
+      {
+        getClaudeCapabilities: async () => ({
+          aliases: ["fable", "opus"],
+          efforts: ["low", "medium", "high"],
+        }),
+      },
+    );
+    const catalog = await service.getCatalog("claude", "/tmp");
+
+    // A model id outside the catalog must still send the effort the UI
+    // advertises as the default, not silently drop it.
+    expect(service.validateSelection(catalog, { model: "claude-opus-4-5" }))
+      .toEqual({ model: "claude-opus-4-5", effort: "high", serviceTier: null });
+  });
+});

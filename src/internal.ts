@@ -4,6 +4,46 @@ import { AbortError, TimeoutError } from "./errors.js";
 
 export const SIGTERM_GRACE_MS = 2000;
 
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Run a host callback without letting an exception escape into the provider
+ * stream: a throwing callback must never crash the process, drop the rest of
+ * a stdout chunk, or leave the run promise unsettled. An async callback's
+ * rejection is swallowed too — an unhandled rejection would otherwise bring
+ * down the process just like a synchronous throw. */
+export function safeCallback(use: () => unknown): void {
+  try {
+    const result = use();
+    if (
+      result !== null
+      && typeof result === "object"
+      && typeof (result as PromiseLike<unknown>).then === "function"
+    ) {
+      void Promise.resolve(result).catch(() => {});
+    }
+  } catch {
+    // Host callbacks must never corrupt the provider stream.
+  }
+}
+
+/** "N/M steps completed" — the one plan summary both providers report, kept
+ * here so the cross-provider wording can never drift. */
+export function planCompletionSummary(planItems: readonly { status: string }[]): string {
+  const completed = planItems.filter((item) => item.status === "completed").length;
+  return `${completed}/${planItems.length} steps completed`;
+}
+
+/** Normalize a provider plan/todo status into snake_case: camelCase
+ * ("inProgress") and spaced ("in progress") forms both become "in_progress". */
+export function normalizePlanStatus(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const status = value.trim();
+  if (!status) return undefined;
+  return status.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
+}
+
 /** Collapse a raw tool field into the one-line, non-empty form promised by a
  * tool-use summary. Runs of whitespace (including newlines in a multiline
  * command) become single spaces; an empty or whitespace-only value yields
@@ -46,8 +86,10 @@ export function filterEnv(
   return env;
 }
 
-export function isMissingExecutable(error: Error): boolean {
-  return "code" in error && (error as Error & { code?: unknown }).code === "ENOENT";
+export function isMissingExecutable(error: unknown): boolean {
+  return error instanceof Error
+    && "code" in error
+    && (error as Error & { code?: unknown }).code === "ENOENT";
 }
 
 /** Buffers stdout chunks and emits complete newline-terminated lines. */
@@ -73,6 +115,26 @@ export function createLineSplitter(onLine: (line: string) => void): {
       buffer += decoder.end();
       if (buffer) onLine(buffer);
       buffer = "";
+    },
+  };
+}
+
+/** Decodes stderr (or any text stream) chunk-by-chunk without corrupting a
+ * multibyte UTF-8 character split across a chunk boundary — the same
+ * StringDecoder treatment stdout gets from {@link createLineSplitter}. */
+export function createChunkDecoder(onText: (text: string) => void): {
+  push(chunk: Buffer | string): void;
+  flush(): void;
+} {
+  const decoder = new StringDecoder("utf8");
+  return {
+    push(chunk: Buffer | string): void {
+      const text = typeof chunk === "string" ? chunk : decoder.write(chunk);
+      if (text) onText(text);
+    },
+    flush(): void {
+      const rest = decoder.end();
+      if (rest) onText(rest);
     },
   };
 }
