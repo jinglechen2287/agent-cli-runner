@@ -237,8 +237,10 @@ function pickPrimaryModel(
   const entries = Object.entries(modelUsage);
   if (entries.length === 0) return undefined;
   if (preferred) {
+    // Exact first: the bare id and its `[1m]` variant can both be listed.
     const base = baseModelId(preferred);
-    const match = entries.find(([key]) => baseModelId(key) === base);
+    const match = entries.find(([key]) => key === preferred)
+      ?? entries.find(([key]) => baseModelId(key) === base);
     if (match) return { model: match[0], contextWindow: toContextWindow(match[1].contextWindow) };
   }
   let best = entries[0]!;
@@ -248,6 +250,14 @@ function pickPrimaryModel(
     }
   }
   return { model: best[0], contextWindow: toContextWindow(best[1].contextWindow) };
+}
+
+/** Whether a usage block counts any prompt or output tokens. */
+function countsTokens(usage: ClaudeUsage): boolean {
+  return (usage.input_tokens ?? 0) > 0
+    || (usage.output_tokens ?? 0) > 0
+    || (usage.cache_read_input_tokens ?? 0) > 0
+    || (usage.cache_creation_input_tokens ?? 0) > 0;
 }
 
 function isTerminalTaskStatus(status: string | undefined): boolean {
@@ -604,9 +614,15 @@ const handle = (message: unknown): void => {
       // per-message usage does. Take only the authoritative model/window
       // from here, falling back to the summed counts when no message carried
       // usage (then the turn had a single request and they coincide).
-      const occupancy = lastMessageUsage ?? parsed.usage;
+      // A result with no reply before it — a turn stopped before any output —
+      // counts nothing, and reporting that would zero the host's occupancy.
+      const occupancy = lastMessageUsage
+        ?? (parsed.usage && countsTokens(parsed.usage) ? parsed.usage : undefined);
       if (occupancy) {
-        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
+        // Without a reply to name the model, the session's own beats the
+        // largest-window guess: Claude Code's helper calls (Haiku) appear in
+        // modelUsage too, first, and can tie on window.
+        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? sessionModel);
         const model = primary?.model ?? lastAssistantModel;
         const contextWindow =
           primary?.contextWindow ?? contextWindowForModel(model);

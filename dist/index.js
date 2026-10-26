@@ -344,7 +344,7 @@ function pickPrimaryModel(modelUsage, preferred) {
   if (entries.length === 0) return void 0;
   if (preferred) {
     const base = baseModelId(preferred);
-    const match = entries.find(([key]) => baseModelId(key) === base);
+    const match = entries.find(([key]) => key === preferred) ?? entries.find(([key]) => baseModelId(key) === base);
     if (match) return { model: match[0], contextWindow: toContextWindow(match[1].contextWindow) };
   }
   let best = entries[0];
@@ -354,6 +354,9 @@ function pickPrimaryModel(modelUsage, preferred) {
     }
   }
   return { model: best[0], contextWindow: toContextWindow(best[1].contextWindow) };
+}
+function countsTokens(usage) {
+  return (usage.input_tokens ?? 0) > 0 || (usage.output_tokens ?? 0) > 0 || (usage.cache_read_input_tokens ?? 0) > 0 || (usage.cache_creation_input_tokens ?? 0) > 0;
 }
 function isTerminalTaskStatus(status) {
   return status === "completed" || status === "failed" || status === "stopped" || status === "killed";
@@ -561,9 +564,9 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       }
       isError = parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
       errors = Array.isArray(parsed.errors) ? parsed.errors.filter((entry) => typeof entry === "string") : [];
-      const occupancy = lastMessageUsage ?? parsed.usage;
+      const occupancy = lastMessageUsage ?? (parsed.usage && countsTokens(parsed.usage) ? parsed.usage : void 0);
       if (occupancy) {
-        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
+        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? sessionModel);
         const model = primary?.model ?? lastAssistantModel;
         const contextWindow = primary?.contextWindow ?? contextWindowForModel(model);
         emitUsage(toClaudeUsage(occupancy, model, contextWindow));

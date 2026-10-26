@@ -741,6 +741,67 @@ describe("createClaudeTurnTranslator", () => {
     });
   });
 
+  it("attributes a reply-less result to the session's model, not a tied helper model", () => {
+    // Claude Code makes small Haiku calls of its own, listed first in
+    // modelUsage with the same window: with no reply to name the model, the
+    // init line's model must win the tie.
+    const onUsage = vi.fn();
+    const t = feed({ onUsage }, [
+      { type: "system", subtype: "init", session_id: "s", model: "claude-opus-5-5[1m]" },
+      {
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        errors: [],
+        usage: { input_tokens: 12, output_tokens: 0 },
+        modelUsage: {
+          "claude-haiku-5-5": { contextWindow: 1_000_000 },
+          "claude-opus-5-5[1m]": { contextWindow: 1_000_000 },
+        },
+      },
+    ]);
+    expect(onUsage).toHaveBeenCalledTimes(1);
+    expect(t.finish().usage).toMatchObject({ model: "claude-opus-5-5[1m]", contextWindow: 1_000_000 });
+  });
+
+  it("prefers the exact session model over a same-base variant listed first", () => {
+    const t = feed({}, [
+      { type: "system", subtype: "init", session_id: "s", model: "claude-opus-5-5[1m]" },
+      {
+        type: "result",
+        result: "",
+        usage: { input_tokens: 12, output_tokens: 0 },
+        modelUsage: {
+          "claude-opus-5-5": { contextWindow: 200_000 },
+          "claude-opus-5-5[1m]": { contextWindow: 1_000_000 },
+        },
+      },
+    ]);
+    expect(t.finish().usage).toMatchObject({ model: "claude-opus-5-5[1m]", contextWindow: 1_000_000 });
+  });
+
+  it("reports no usage for a reply-less result that counted no tokens", () => {
+    // A turn stopped before any output: its zeroed usage would otherwise
+    // overwrite the thread's real context occupancy with nothing.
+    const onUsage = vi.fn();
+    const t = feed({ onUsage }, [
+      { type: "system", subtype: "init", session_id: "s", model: "claude-opus-5-5[1m]" },
+      {
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        errors: [],
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+        modelUsage: {
+          "claude-haiku-5-5": { contextWindow: 1_000_000 },
+          "claude-opus-5-5[1m]": { contextWindow: 1_000_000 },
+        },
+      },
+    ]);
+    expect(onUsage).not.toHaveBeenCalled();
+    expect(t.finish().usage).toBeUndefined();
+  });
+
   it("omits usage from the outcome when the CLI reports no token counts", () => {
     const t = feed({}, [
       { type: "assistant", message: { content: [{ type: "text", text: "hi" }] } },
