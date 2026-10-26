@@ -199,7 +199,7 @@ type ClaudeQueryFn = (params: {
     options: Options;
 }) => ClaudeQuery;
 /** How long an interrupted turn may take to deliver its `result` before the
- * session is killed instead. */
+ * process is killed without waiting for it. */
 declare const CLAUDE_INTERRUPT_GRACE_MS = 5000;
 interface CreateClaudeSessionOptions {
     cwd: string;
@@ -245,8 +245,9 @@ interface CreateClaudeSessionOptions {
 }
 type ClaudeSessionTurnOptions = AgentCallbacks & {
     prompt: string;
-    /** Aborting interrupts the turn (the session survives when the CLI answers
-     * within the grace period) and rejects with an AbortError. */
+    /** Aborting interrupts the turn, rejects with an AbortError, and closes the
+     * session once the CLI has finished the interrupt (or after the grace
+     * period); the next turn resumes from disk in a new session. */
     signal?: AbortSignal;
     /** Wall-clock limit for the turn, using the same interrupt path; rejects
      * with a TimeoutError. */

@@ -210,21 +210,26 @@ describe("createClaudeSession", () => {
     expect(session.closed).toBe(false);
   });
 
-  it("interrupts on abort and keeps the session when the turn settles", async () => {
+  it("interrupts on abort, then closes the session once the turn settles", async () => {
+    // A live process would carry the stopped request into the next turn: an
+    // interrupt that lands before any output leaves it unanswered, and the
+    // model answers it alongside the next prompt. Resuming from disk does not.
     const fake = makeFakeQuery();
     const session = await startSession(fake);
+    const reasons: string[] = [];
+    session.onClose((error) => reasons.push(error.message));
     const controller = new AbortController();
     const turn = session.runTurn({ prompt: "one", signal: controller.signal });
     await fake.waitForPrompt(1);
     controller.abort();
     expect(fake.interrupt).toHaveBeenCalledTimes(1);
+    // The CLI gets to finish the interrupt (and write its transcript) first.
+    expect(fake.close).not.toHaveBeenCalled();
     fake.emit({ type: "result", subtype: "error_during_execution", is_error: true, errors: [] });
     await expect(turn).rejects.toBeInstanceOf(AbortError);
-    expect(session.closed).toBe(false);
-
-    const next = session.runTurn({ prompt: "two" });
-    fake.emit(result("still alive"));
-    await expect(next).resolves.toMatchObject({ text: "still alive" });
+    expect(session.closed).toBe(true);
+    expect(fake.close).toHaveBeenCalledTimes(1);
+    expect(reasons).toEqual(["Claude session closed after an interrupted turn"]);
   });
 
   it("closes the session when an interrupted turn never settles", async () => {
@@ -258,7 +263,7 @@ describe("createClaudeSession", () => {
     const error = await turn.catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(TimeoutError);
     expect((error as Error).message).toContain("10ms");
-    expect(session.closed).toBe(false);
+    expect(session.closed).toBe(true);
   });
 
   it("closes the session when a background task outlives its turn", async () => {

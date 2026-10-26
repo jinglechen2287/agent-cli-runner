@@ -59,7 +59,7 @@ export type ClaudeQueryFn = (params: {
 }) => ClaudeQuery;
 
 /** How long an interrupted turn may take to deliver its `result` before the
- * session is killed instead. */
+ * process is killed without waiting for it. */
 export const CLAUDE_INTERRUPT_GRACE_MS = 5_000;
 
 export interface CreateClaudeSessionOptions {
@@ -107,8 +107,9 @@ export interface CreateClaudeSessionOptions {
 
 export type ClaudeSessionTurnOptions = AgentCallbacks & {
   prompt: string;
-  /** Aborting interrupts the turn (the session survives when the CLI answers
-   * within the grace period) and rejects with an AbortError. */
+  /** Aborting interrupts the turn, rejects with an AbortError, and closes the
+   * session once the CLI has finished the interrupt (or after the grace
+   * period); the next turn resumes from disk in a new session. */
   signal?: AbortSignal;
   /** Wall-clock limit for the turn, using the same interrupt path; rejects
    * with a TimeoutError. */
@@ -394,6 +395,15 @@ export async function createClaudeSession(
         ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
         ...(outcome.usage !== undefined ? { usage: outcome.usage } : {}),
       });
+    }
+    // A stopped turn ends the process once the CLI has finished the interrupt
+    // (so its transcript is written). Kept alive, the process would hand the
+    // stopped request to the model again with the next prompt — an interrupt
+    // that lands before any output leaves it unanswered. Resuming from disk
+    // does not.
+    if (turn.interruption) {
+      void closeWith(new Error("Claude session closed after an interrupted turn"));
+      return;
     }
     // Background work does not outlive its turn: a task still running at the
     // result would otherwise wake the CLI between turns.

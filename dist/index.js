@@ -776,6 +776,10 @@ async function createClaudeSession(opts) {
         ...outcome.usage !== void 0 ? { usage: outcome.usage } : {}
       });
     }
+    if (turn.interruption) {
+      void closeWith(new Error("Claude session closed after an interrupted turn"));
+      return;
+    }
     if (turn.translator.liveTaskIds.size > 0) {
       void closeWith(new Error("Claude left background tasks running at the end of a turn"));
     }

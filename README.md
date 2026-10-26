@@ -67,7 +67,7 @@ interface RunResult {
 | --- | --- |
 | `prompt`, `cwd` | Required. Prompts never appear in argv: Claude uses the Agent SDK's stream-json input, isolated Codex uses stdin, and regular Codex turns use app-server JSON-RPC. |
 | `executablePath` | Binary path; defaults to `"claude"` / `"codex"` on `PATH`. |
-| `signal` | `AbortSignal`; Claude and regular Codex interrupt the turn (a Claude session that does not answer within 5 s has its process tree killed), while isolated Codex terminates its process tree. Rejects with `AbortError`. |
+| `signal` | `AbortSignal`; Claude and regular Codex interrupt the turn (a Claude session then closes; if the interrupt goes unanswered for 5 s, shutdown starts anyway, sending the process tree SIGTERM and then SIGKILL after a further 2 s), while isolated Codex terminates its process tree. Rejects with `AbortError`. |
 | `timeoutMs` | Optional wall-clock limit using the provider-appropriate interruption path; rejects `TimeoutError`. No timeout by default. |
 | `env` | Base child environment (default `process.env`). Nesting-guard variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ACCESS_TOKEN` for Claude; `CODEX_THREAD_ID` for Codex) are always stripped. |
 | `spawnFn` | Injectable spawn primitive for tests. |
@@ -119,7 +119,7 @@ await session.runTurn({ prompt: "Now make it blue" });
 await session.close();
 ```
 
-Session settings (model, effort, permission mode, tools, hooks, system prompt, environment) are fixed for the life of the session; open a new one, resuming the same id, to change them. Turns run one at a time. A session closes itself — firing `onClose` — when its process exits, when a turn ends with background tasks still running, or when the CLI produces output between turns.
+Session settings (model, effort, permission mode, tools, hooks, system prompt, environment) are fixed for the life of the session; open a new one, resuming the same id, to change them. Turns run one at a time. A session closes itself — firing `onClose` — when its process exits, after an interrupted (aborted or timed-out) turn, when a turn ends with background tasks still running, or when the CLI produces output between turns. A live process would hand a stopped request back to the model with the next prompt, so a stop always ends in a resume from disk.
 
 ### Codex-specific
 
