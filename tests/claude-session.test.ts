@@ -24,6 +24,8 @@ interface FakeQuery {
   options(): Parameters<ClaudeQueryFn>[0]["options"];
   /** Prompts the session sent, in order. */
   prompts: string[];
+  /** The uuid stamped on each prompt the session sent, in order. */
+  uuids: Array<string | undefined>;
   /** Resolves once the session has sent its nth prompt (1-based). */
   waitForPrompt(count: number): Promise<void>;
   emit(message: unknown): void;
@@ -42,6 +44,7 @@ function makeFakeQuery(): FakeQuery {
   let wake: (() => void) | undefined;
   let captured: Parameters<ClaudeQueryFn>[0] | undefined;
   const prompts: string[] = [];
+  const uuids: Array<string | undefined> = [];
   const promptWaiters: Array<{ count: number; resolve: () => void }> = [];
   const notify = (): void => {
     wake?.();
@@ -49,6 +52,7 @@ function makeFakeQuery(): FakeQuery {
   };
   const fake: FakeQuery = {
     prompts,
+    uuids,
     interrupt: vi.fn(async () => undefined),
     close: vi.fn(() => {
       ended = true;
@@ -60,6 +64,7 @@ function makeFakeQuery(): FakeQuery {
         for await (const message of params.prompt) {
           const content = message.message.content;
           prompts.push(typeof content === "string" ? content : JSON.stringify(content));
+          uuids.push(message.uuid);
           for (const waiter of [...promptWaiters]) {
             if (prompts.length >= waiter.count) {
               promptWaiters.splice(promptWaiters.indexOf(waiter), 1);
@@ -288,6 +293,121 @@ describe("createClaudeSession", () => {
     fake.emit(result("done"));
     await turn;
     expect(session.closed).toBe(false);
+  });
+
+  it("answers a resumed session's prompt after an orphaned task's empty result", async () => {
+    // On resume the CLI first settles a task the previous process left
+    // running, with an empty result that names no prompt; the prompt's own
+    // turn follows.
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.runTurn({ prompt: "Reply PONG" });
+    await fake.waitForPrompt(1);
+    const uuid = fake.uuids[0];
+    expect(uuid).toMatch(/^[0-9a-f-]{36}$/);
+    fake.emit({ type: "system", subtype: "task_notification", task_id: "orphan", status: "stopped" });
+    fake.emit(init());
+    fake.emit(result(""));
+    fake.emit(init());
+    fake.emit(assistant("PONG"));
+    fake.emit(result("PONG", { user_message_uuid: uuid, user_message_uuids: [uuid] }));
+    await expect(turn).resolves.toMatchObject({ text: "PONG", exitCode: 0 });
+    expect(session.closed).toBe(false);
+  });
+
+  it("does not settle a turn on a result that answers another prompt", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    let settled = false;
+    const turn = session.runTurn({ prompt: "mine" });
+    void turn.then(() => {
+      settled = true;
+    });
+    await fake.waitForPrompt(1);
+    const uuid = fake.uuids[0];
+    fake.emit(assistant("someone else's answer"));
+    fake.emit(result("someone else's answer", { user_message_uuid: "other", user_message_uuids: ["other"] }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    fake.emit(assistant("mine"));
+    fake.emit(result("mine", { user_message_uuid: uuid, user_message_uuids: [uuid] }));
+    await expect(turn).resolves.toMatchObject({ text: "mine", exitCode: 0 });
+  });
+
+  it("holds the turn open until a background agent reports back", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    let settled = false;
+    const turn = session.runTurn({ prompt: "research, then plan" });
+    void turn.then(() => {
+      settled = true;
+    });
+    await fake.waitForPrompt(1);
+    const uuid = fake.uuids[0];
+    fake.emit({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    fake.emit(assistant("launched"));
+    fake.emit(result("launched", { user_message_uuid: uuid, user_message_uuids: [uuid] }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    expect(session.closed).toBe(false);
+
+    // The CLI wakes itself for the agent's notification and answers it.
+    fake.emit({ type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" });
+    fake.emit(init());
+    fake.emit(assistant("plan: do the thing"));
+    fake.emit(result("plan: do the thing"));
+    await expect(turn).resolves.toMatchObject({ text: "plan: do the thing", exitCode: 0 });
+    expect(session.closed).toBe(false);
+  });
+
+  it("settles a held turn when no follow-up arrives within the grace period", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake, { followUpGraceMs: 20 });
+    const turn = session.runTurn({ prompt: "research" });
+    await fake.waitForPrompt(1);
+    const uuid = fake.uuids[0];
+    fake.emit({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    fake.emit(result("launched", { user_message_uuid: uuid }));
+    fake.emit({ type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" });
+    await expect(turn).resolves.toMatchObject({ text: "launched", exitCode: 0 });
+    expect(session.closed).toBe(false);
+  });
+
+  it("keeps waiting on a follow-up that is still producing output", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake, { followUpGraceMs: 30 });
+    const turn = session.runTurn({ prompt: "research" });
+    await fake.waitForPrompt(1);
+    const uuid = fake.uuids[0];
+    fake.emit({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    fake.emit(result("launched", { user_message_uuid: uuid }));
+    fake.emit({ type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" });
+    // A long follow-up: output keeps arriving for well past the grace period.
+    for (let i = 0; i < 6; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      fake.emit(assistant(`step ${i}`));
+    }
+    fake.emit(result("the plan"));
+    await expect(turn).resolves.toMatchObject({ text: "the plan", exitCode: 0 });
+    expect(session.closed).toBe(false);
+  });
+
+  it("stops a turn held open for a background agent at once", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const controller = new AbortController();
+    const turn = session.runTurn({ prompt: "research", signal: controller.signal });
+    await fake.waitForPrompt(1);
+    const uuid = fake.uuids[0];
+    fake.emit({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    fake.emit(result("launched", { user_message_uuid: uuid }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    // The CLI is idle between its turns, so no result will answer the
+    // interrupt: the session goes without waiting out the grace period.
+    await expect(turn).rejects.toBeInstanceOf(AbortError);
+    expect(fake.interrupt).toHaveBeenCalledTimes(1);
+    expect(session.closed).toBe(true);
   });
 
   it("closes the session when the CLI produces output between turns", async () => {

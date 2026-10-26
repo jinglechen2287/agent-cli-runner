@@ -147,6 +147,11 @@ interface StreamLine {
   errors?: unknown;
   /** On `task_notification`: the task's terminal state. */
   status?: string;
+  /** On `result` (and a turn's stream frames): the uuid of the user message
+   * the turn answers, when the host stamped one. */
+  user_message_uuid?: unknown;
+  /** On `result`: every stamped user message the turn consumed. */
+  user_message_uuids?: unknown;
   message?: { content?: ClaudeContentBlock[]; usage?: ClaudeUsage; model?: string };
   usage?: ClaudeUsage;
   modelUsage?: Record<string, ClaudeModelUsage>;
@@ -268,19 +273,63 @@ export interface ClaudeTurnOutcome {
 export interface ClaudeTurnTranslator {
   /** Feed one stream-json message (a CLI stdout line or an SDK message). */
   handle(message: unknown): void;
-  /** True once the turn's `result` has arrived. */
+  /** True once the turn's own `result` has arrived and no subagent it started
+   * is still owed a follow-up: every live one has settled and the CLI has
+   * answered its notification with a further `result`. */
   readonly done: boolean;
+  /** The turn's own `result` has arrived, whether or not it is done. */
+  readonly resultSeen: boolean;
+  /** Every subagent has settled since the turn's own `result`, but the CLI
+   * has not yet answered with a follow-up `result`. */
+  readonly awaitingFollowUp: boolean;
+  /** A `result` this turn named the prompts it answers, so the CLI echoes
+   * prompt uuids. */
+  readonly echoedPromptUuid: boolean;
   /** Tasks (background Bash, Monitor, subagents) started this turn that have
    * not settled yet. */
   readonly liveTaskIds: ReadonlySet<string>;
+  /** The subagents among {@link liveTaskIds}. */
+  readonly liveAgentTaskIds: ReadonlySet<string>;
   finish(): ClaudeTurnOutcome;
+}
+
+export interface ClaudeTurnTranslatorOptions {
+  /** The uuid stamped on this turn's prompt. With it, a `result` that answers
+   * something else — a task the CLI settles on resume, another prompt — is
+   * not taken for this turn's. Without it, every `result` is this turn's. */
+  promptUuid?: string;
+  /** An earlier turn of the same process saw a `result` name its prompt, so
+   * one that names none is never this turn's own. */
+  cliEchoesPromptUuid?: boolean;
+}
+
+/** The prompt uuids a `result` names, or undefined when it names none. */
+function namedPromptUuids(parsed: StreamLine): string[] | undefined {
+  const named: string[] = [];
+  if (typeof parsed.user_message_uuid === "string") named.push(parsed.user_message_uuid);
+  if (Array.isArray(parsed.user_message_uuids)) {
+    for (const uuid of parsed.user_message_uuids) {
+      if (typeof uuid === "string") named.push(uuid);
+    }
+  }
+  return named.length > 0 ? named : undefined;
 }
 
 /** Translate one Claude turn's stream-json messages into host callbacks. One
  * translator per turn: session-id deduplication, usage attribution, and task
  * tracking are all scoped to it. */
-export function createClaudeTurnTranslator(callbacks: AgentCallbacks): ClaudeTurnTranslator {
-  let done = false;
+export function createClaudeTurnTranslator(
+  callbacks: AgentCallbacks,
+  options: ClaudeTurnTranslatorOptions = {},
+): ClaudeTurnTranslator {
+  const { promptUuid } = options;
+  let resultSeen = false;
+  /** A subagent settled after the turn's result; the CLI's answer to its
+   * notification is still to come. */
+  let followUpPending = false;
+  let echoedPromptUuid = false;
+  /** The parent conversation produced output this turn (not a subagent). */
+  let outputSeen = false;
   let isError = false;
   let errors: string[] = [];
   let sessionId: string | undefined;
@@ -295,7 +344,29 @@ export function createClaudeTurnTranslator(callbacks: AgentCallbacks): ClaudeTur
   const agentToolCallIds = new Set<string>();
   const backgroundAgents = new Map<string, BackgroundAgentInfo>();
   const liveTaskIds = new Set<string>();
+  const liveAgentTaskIds = new Set<string>();
 
+  const settleTask = (taskId: string): void => {
+    liveTaskIds.delete(taskId);
+    if (liveAgentTaskIds.delete(taskId) && resultSeen) followUpPending = true;
+  };
+
+  /** Whether a `result` answers some other command than this turn's prompt.
+   * One that names prompts must name this one. One that names none is, after
+   * the turn's own result, the CLI answering a subagent's notification on the
+   * turn's behalf; before it, a leftover of some other command. */
+  const isForeignResult = (parsed: StreamLine): boolean => {
+    if (promptUuid === undefined) return false;
+    const named = namedPromptUuids(parsed);
+    if (named) return !named.includes(promptUuid);
+    if (resultSeen) return false;
+    if (options.cliEchoesPromptUuid || echoedPromptUuid) return true;
+    // A CLI that does not echo: an empty success before the prompt produced
+    // anything is the CLI settling a task left over from an earlier process.
+    const failed = parsed.is_error === true
+      || (typeof parsed.subtype === "string" && parsed.subtype !== "success");
+    return !failed && !outputSeen && !parsed.result;
+  };
   const emitBackgroundAgent = (agent: BackgroundAgentInfo): void => {
     backgroundAgents.set(agent.id, agent);
     safeCallback(() => callbacks.onBackgroundAgentUpdate?.(agent));
@@ -349,6 +420,7 @@ const handle = (message: unknown): void => {
         || parsed.task_type === "remote_agent"
         || (typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id));
       if (!isAgent) return;
+      liveAgentTaskIds.add(parsed.task_id);
       const now = Date.now();
       emitBackgroundAgent({
         id: parsed.task_id,
@@ -412,7 +484,7 @@ const handle = (message: unknown): void => {
       && parsed.subtype === "task_updated"
       && typeof parsed.task_id === "string"
     ) {
-      if (isTerminalTaskStatus(parsed.patch?.status)) liveTaskIds.delete(parsed.task_id);
+      if (isTerminalTaskStatus(parsed.patch?.status)) settleTask(parsed.task_id);
       const current = backgroundAgents.get(parsed.task_id);
       if (!current || !parsed.patch) return;
       const status = claudeBackgroundAgentStatus(parsed.patch.status) ?? current.status;
@@ -439,7 +511,7 @@ const handle = (message: unknown): void => {
       && parsed.subtype === "task_notification"
       && typeof parsed.task_id === "string"
     ) {
-      if (isTerminalTaskStatus(parsed.status)) liveTaskIds.delete(parsed.task_id);
+      if (isTerminalTaskStatus(parsed.status)) settleTask(parsed.task_id);
       return;
     }
     if (parsed.type === "assistant" && parsed.message?.content) {
@@ -472,6 +544,7 @@ const handle = (message: unknown): void => {
       // matching the delta stream, which drops subagent fragments, so
       // fragments always concatenate to the next completed message. Its
       // tool calls above still belong in the parent transcript.
+      if (!parsed.parent_tool_use_id) outputSeen = true;
       if (texts.length > 0 && !parsed.parent_tool_use_id) {
         const text = texts.join("");
         lastAssistantText = text;
@@ -510,14 +583,22 @@ const handle = (message: unknown): void => {
       return;
     }
     if (parsed.type === "result") {
-      done = true;
+      if (namedPromptUuids(parsed)) echoedPromptUuid = true;
+      if (isForeignResult(parsed)) return;
+      // A follow-up that answers a notification with nothing to add leaves
+      // the turn's last words in place.
+      const followUp = resultSeen;
+      resultSeen = true;
+      followUpPending = false;
       if (parsed.session_id) emitSessionId(parsed.session_id);
-      if (typeof parsed.result === "string") resultText = parsed.result;
+      if (typeof parsed.result === "string" && (!followUp || parsed.result)) {
+        resultText = parsed.result;
+      }
       isError = parsed.is_error === true
         || (typeof parsed.subtype === "string" && parsed.subtype !== "success");
-      if (Array.isArray(parsed.errors)) {
-        errors = parsed.errors.filter((entry): entry is string => typeof entry === "string");
-      }
+      errors = Array.isArray(parsed.errors)
+        ? parsed.errors.filter((entry): entry is string => typeof entry === "string")
+        : [];
       // The result event's usage sums every request in the turn, so it does
       // not describe context occupancy on a multi-request turn — the last
       // per-message usage does. Take only the authoritative model/window
@@ -538,9 +619,19 @@ const handle = (message: unknown): void => {
   return {
     handle,
     get done() {
-      return done;
+      return resultSeen && liveAgentTaskIds.size === 0 && !followUpPending;
+    },
+    get resultSeen() {
+      return resultSeen;
+    },
+    get awaitingFollowUp() {
+      return resultSeen && liveAgentTaskIds.size === 0 && followUpPending;
+    },
+    get echoedPromptUuid() {
+      return echoedPromptUuid;
     },
     liveTaskIds,
+    liveAgentTaskIds,
     finish(): ClaudeTurnOutcome {
       // An error result carries its reasons in `errors`, not `result`; the
       // last assistant message would read as if the turn had succeeded.

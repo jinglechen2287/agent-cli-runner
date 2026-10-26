@@ -790,6 +790,113 @@ describe("createClaudeTurnTranslator task tracking", () => {
   });
 });
 
+describe("createClaudeTurnTranslator prompt correlation", () => {
+  const ours = (text: string) => ({
+    type: "result",
+    subtype: "success",
+    result: text,
+    session_id: "s",
+    user_message_uuid: "u1",
+    user_message_uuids: ["u1"],
+  });
+
+  it("ignores an empty result that arrives before any output of the prompt", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.handle({ type: "result", subtype: "success", result: "", session_id: "orphan" });
+    expect(t.done).toBe(false);
+    t.handle({ type: "assistant", message: { content: [{ type: "text", text: "PONG" }] } });
+    t.handle(ours("PONG"));
+    expect(t.done).toBe(true);
+    expect(t.finish()).toMatchObject({ text: "PONG", isError: false, sessionId: "s" });
+  });
+
+  it("ignores a result that names other prompts", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.handle({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      errors: ["not mine"],
+      user_message_uuids: ["u0"],
+    });
+    expect(t.done).toBe(false);
+    t.handle(ours("mine"));
+    expect(t.finish()).toMatchObject({ text: "mine", isError: false, errors: [] });
+  });
+
+  it("ignores an un-echoed result once the CLI is known to echo prompt uuids", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1", cliEchoesPromptUuid: true });
+    t.handle({ type: "assistant", message: { content: [{ type: "text", text: "re: notification" }] } });
+    t.handle({ type: "result", subtype: "success", result: "re: notification", session_id: "s" });
+    expect(t.done).toBe(false);
+    t.handle(ours("mine"));
+    expect(t.done).toBe(true);
+    expect(t.echoedPromptUuid).toBe(true);
+  });
+
+  it("accepts an un-echoed, non-empty result from a CLI that does not echo", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.handle({ type: "result", subtype: "success", result: "done", session_id: "s" });
+    expect(t.done).toBe(true);
+    expect(t.echoedPromptUuid).toBe(false);
+  });
+
+  it("waits past its result for a live background agent and its follow-up", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "bash-1", task_type: "local_bash" });
+    t.handle(ours("launched"));
+    expect(t.done).toBe(false);
+    expect(t.awaitingFollowUp).toBe(false);
+    expect([...t.liveAgentTaskIds]).toEqual(["agent-1"]);
+
+    t.handle({ type: "system", subtype: "task_updated", task_id: "agent-1", patch: { status: "completed" } });
+    t.handle({ type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" });
+    expect(t.done).toBe(false);
+    expect(t.awaitingFollowUp).toBe(true);
+    expect(t.liveAgentTaskIds.size).toBe(0);
+
+    t.handle({ type: "assistant", message: { content: [{ type: "text", text: "the plan" }] } });
+    t.handle({ type: "result", subtype: "success", result: "the plan", session_id: "s" });
+    expect(t.done).toBe(true);
+    expect(t.awaitingFollowUp).toBe(false);
+    expect(t.finish()).toMatchObject({ text: "the plan", isError: false });
+    // A shell does not hold the turn; the host decides what to do with it.
+    expect([...t.liveTaskIds]).toEqual(["bash-1"]);
+  });
+
+  it("ignores a follow-up result that names another prompt", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    t.handle(ours("launched"));
+    t.handle({ type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" });
+    t.handle({ type: "result", subtype: "success", result: "not mine", user_message_uuids: ["u2"] });
+    expect(t.done).toBe(false);
+    expect(t.awaitingFollowUp).toBe(true);
+    t.handle({ type: "result", subtype: "success", result: "the plan", session_id: "s" });
+    expect(t.done).toBe(true);
+    expect(t.finish().text).toBe("the plan");
+  });
+
+  it("keeps the last non-empty result text when a follow-up result is empty", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    t.handle(ours("launched"));
+    t.handle({ type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" });
+    t.handle({ type: "result", subtype: "success", result: "", session_id: "s" });
+    expect(t.done).toBe(true);
+    expect(t.finish().text).toBe("launched");
+  });
+
+  it("needs no follow-up for an agent that settled before the result", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    t.handle({ type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" });
+    t.handle(ours("done"));
+    expect(t.done).toBe(true);
+  });
+});
+
 describe("createClaudeTurnTranslator error results", () => {
   it("reports an error result's messages rather than earlier assistant text", () => {
     const t = feed({}, [

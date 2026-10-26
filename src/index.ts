@@ -1,6 +1,7 @@
 export { runClaude, CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 export type { ClaudePermissionMode, RunClaudeOptions } from "./run-claude.js";
 export {
+  CLAUDE_FOLLOW_UP_GRACE_MS,
   CLAUDE_INTERRUPT_GRACE_MS,
   createClaudeSession,
 } from "./claude-session.js";
@@ -13,7 +14,11 @@ export type {
   CreateClaudeSessionOptions,
 } from "./claude-session.js";
 export { createClaudeTurnTranslator } from "./claude-messages.js";
-export type { ClaudeTurnOutcome, ClaudeTurnTranslator } from "./claude-messages.js";
+export type {
+  ClaudeTurnOutcome,
+  ClaudeTurnTranslator,
+  ClaudeTurnTranslatorOptions,
+} from "./claude-messages.js";
 export type {
   HookCallback as ClaudeHookCallback,
   HookCallbackMatcher as ClaudeHookCallbackMatcher,

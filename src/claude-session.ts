@@ -62,6 +62,11 @@ export type ClaudeQueryFn = (params: {
  * process is killed without waiting for it. */
 export const CLAUDE_INTERRUPT_GRACE_MS = 5_000;
 
+/** How long a turn held open for a subagent waits in silence, once every
+ * subagent has settled, for the CLI to answer the notification with a
+ * `result` before the turn settles without it. */
+export const CLAUDE_FOLLOW_UP_GRACE_MS = 60_000;
+
 export interface CreateClaudeSessionOptions {
   cwd: string;
   /** Path or name of the `claude` binary, resolved through PATH. Defaults to
@@ -101,6 +106,8 @@ export interface CreateClaudeSessionOptions {
   isolated?: boolean;
   /** Override {@link CLAUDE_INTERRUPT_GRACE_MS}. */
   interruptGraceMs?: number;
+  /** Override {@link CLAUDE_FOLLOW_UP_GRACE_MS}. */
+  followUpGraceMs?: number;
   spawnFn?: SpawnFn;
   queryFn?: ClaudeQueryFn;
 }
@@ -134,6 +141,8 @@ interface ActiveTurn {
   callbacks: AgentCallbacks;
   interruption: "abort" | "timeout" | null;
   timeoutMs: number | undefined;
+  /** Running while the turn waits on the CLI's follow-up `result`. */
+  followUpTimer: ReturnType<typeof setTimeout> | undefined;
   resolve(result: RunResult): void;
   reject(error: Error): void;
 }
@@ -259,6 +268,10 @@ export async function createClaudeSession(
   const spawnFn = opts.spawnFn ?? nodeSpawn;
   const queryFn: ClaudeQueryFn = opts.queryFn ?? sdkQuery;
   const interruptGraceMs = opts.interruptGraceMs ?? CLAUDE_INTERRUPT_GRACE_MS;
+  const followUpGraceMs = opts.followUpGraceMs ?? CLAUDE_FOLLOW_UP_GRACE_MS;
+  /** Some `result` of this process named its prompt, so one that names none
+   * is never a turn's own. */
+  let cliEchoesPromptUuid = false;
 
   let closed = false;
   let child: ChildProcess | undefined;
@@ -405,8 +418,9 @@ export async function createClaudeSession(
       void closeWith(new Error("Claude session closed after an interrupted turn"));
       return;
     }
-    // Background work does not outlive its turn: a task still running at the
-    // result would otherwise wake the CLI between turns.
+    // A subagent holds its turn open until it reports back (see the message
+    // loop), but a background shell or Monitor does not: one still running at
+    // the result would otherwise wake the CLI between turns.
     if (turn.translator.liveTaskIds.size > 0) {
       void closeWith(new Error("Claude left background tasks running at the end of a turn"));
     }
@@ -425,7 +439,20 @@ export async function createClaudeSession(
           continue;
         }
         turn.translator.handle(message);
-        if (turn.translator.done) settleTurn(turn);
+        if (turn.translator.echoedPromptUuid) cliEchoesPromptUuid = true;
+        if (turn.translator.done) {
+          settleTurn(turn);
+        } else if (turn.translator.awaitingFollowUp) {
+          // Every subagent has reported back and the CLI is answering the
+          // notification. Any message shows it is still at it, so only a
+          // silent gap ends the wait — the thread is not held forever by a
+          // CLI that never answers.
+          if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
+          turn.followUpTimer = setTimeout(() => settleTurn(turn), followUpGraceMs);
+        } else if (turn.followUpTimer) {
+          clearTimeout(turn.followUpTimer);
+          turn.followUpTimer = undefined;
+        }
       }
       void closeWith(exitError());
     } catch (error) {
@@ -453,13 +480,18 @@ export async function createClaudeSession(
         const cleanup = (): void => {
           if (timeoutTimer) clearTimeout(timeoutTimer);
           if (graceTimer) clearTimeout(graceTimer);
+          if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
           signal?.removeEventListener("abort", onAbort);
         };
+        // Stamped so the turn's result can be told apart from one the CLI
+        // writes for something else — a task an earlier process left running.
+        const promptUuid = randomUUID();
         const turn: ActiveTurn = {
-          translator: createClaudeTurnTranslator(callbacks),
+          translator: createClaudeTurnTranslator(callbacks, { promptUuid, cliEchoesPromptUuid }),
           callbacks,
           interruption: null,
           timeoutMs,
+          followUpTimer: undefined,
           resolve: (result) => {
             cleanup();
             resolve(result);
@@ -473,6 +505,12 @@ export async function createClaudeSession(
           if (active !== turn || turn.interruption) return;
           turn.interruption = kind;
           runtime.interrupt().catch(() => {});
+          // Past its own result the turn is only waiting on subagents, and an
+          // idle CLI writes no result for the interrupt: the session goes now.
+          if (turn.translator.resultSeen) {
+            void closeWith(new Error("Claude session closed after an interrupted turn"));
+            return;
+          }
           // The interrupted turn still ends with a `result`; if it never
           // arrives, the process is wedged and goes.
           graceTimer = setTimeout(() => {
@@ -489,6 +527,7 @@ export async function createClaudeSession(
           type: "user",
           message: { role: "user", content: prompt },
           parent_tool_use_id: null,
+          uuid: promptUuid,
         });
       });
     },

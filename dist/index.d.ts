@@ -201,6 +201,10 @@ type ClaudeQueryFn = (params: {
 /** How long an interrupted turn may take to deliver its `result` before the
  * process is killed without waiting for it. */
 declare const CLAUDE_INTERRUPT_GRACE_MS = 5000;
+/** How long a turn held open for a subagent waits in silence, once every
+ * subagent has settled, for the CLI to answer the notification with a
+ * `result` before the turn settles without it. */
+declare const CLAUDE_FOLLOW_UP_GRACE_MS = 60000;
 interface CreateClaudeSessionOptions {
     cwd: string;
     /** Path or name of the `claude` binary, resolved through PATH. Defaults to
@@ -240,6 +244,8 @@ interface CreateClaudeSessionOptions {
     isolated?: boolean;
     /** Override {@link CLAUDE_INTERRUPT_GRACE_MS}. */
     interruptGraceMs?: number;
+    /** Override {@link CLAUDE_FOLLOW_UP_GRACE_MS}. */
+    followUpGraceMs?: number;
     spawnFn?: SpawnFn;
     queryFn?: ClaudeQueryFn;
 }
@@ -337,17 +343,38 @@ interface ClaudeTurnOutcome {
 interface ClaudeTurnTranslator {
     /** Feed one stream-json message (a CLI stdout line or an SDK message). */
     handle(message: unknown): void;
-    /** True once the turn's `result` has arrived. */
+    /** True once the turn's own `result` has arrived and no subagent it started
+     * is still owed a follow-up: every live one has settled and the CLI has
+     * answered its notification with a further `result`. */
     readonly done: boolean;
+    /** The turn's own `result` has arrived, whether or not it is done. */
+    readonly resultSeen: boolean;
+    /** Every subagent has settled since the turn's own `result`, but the CLI
+     * has not yet answered with a follow-up `result`. */
+    readonly awaitingFollowUp: boolean;
+    /** A `result` this turn named the prompts it answers, so the CLI echoes
+     * prompt uuids. */
+    readonly echoedPromptUuid: boolean;
     /** Tasks (background Bash, Monitor, subagents) started this turn that have
      * not settled yet. */
     readonly liveTaskIds: ReadonlySet<string>;
+    /** The subagents among {@link liveTaskIds}. */
+    readonly liveAgentTaskIds: ReadonlySet<string>;
     finish(): ClaudeTurnOutcome;
+}
+interface ClaudeTurnTranslatorOptions {
+    /** The uuid stamped on this turn's prompt. With it, a `result` that answers
+     * something else — a task the CLI settles on resume, another prompt — is
+     * not taken for this turn's. Without it, every `result` is this turn's. */
+    promptUuid?: string;
+    /** An earlier turn of the same process saw a `result` name its prompt, so
+     * one that names none is never this turn's own. */
+    cliEchoesPromptUuid?: boolean;
 }
 /** Translate one Claude turn's stream-json messages into host callbacks. One
  * translator per turn: session-id deduplication, usage attribution, and task
  * tracking are all scoped to it. */
-declare function createClaudeTurnTranslator(callbacks: AgentCallbacks): ClaudeTurnTranslator;
+declare function createClaudeTurnTranslator(callbacks: AgentCallbacks, options?: ClaudeTurnTranslatorOptions): ClaudeTurnTranslator;
 
 interface CodexServerRequest {
     id: number | string;
@@ -637,4 +664,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };

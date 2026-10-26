@@ -358,8 +358,22 @@ function pickPrimaryModel(modelUsage, preferred) {
 function isTerminalTaskStatus(status) {
   return status === "completed" || status === "failed" || status === "stopped" || status === "killed";
 }
-function createClaudeTurnTranslator(callbacks) {
-  let done = false;
+function namedPromptUuids(parsed) {
+  const named = [];
+  if (typeof parsed.user_message_uuid === "string") named.push(parsed.user_message_uuid);
+  if (Array.isArray(parsed.user_message_uuids)) {
+    for (const uuid of parsed.user_message_uuids) {
+      if (typeof uuid === "string") named.push(uuid);
+    }
+  }
+  return named.length > 0 ? named : void 0;
+}
+function createClaudeTurnTranslator(callbacks, options = {}) {
+  const { promptUuid } = options;
+  let resultSeen = false;
+  let followUpPending = false;
+  let echoedPromptUuid = false;
+  let outputSeen = false;
   let isError = false;
   let errors = [];
   let sessionId;
@@ -373,6 +387,20 @@ function createClaudeTurnTranslator(callbacks) {
   const agentToolCallIds = /* @__PURE__ */ new Set();
   const backgroundAgents = /* @__PURE__ */ new Map();
   const liveTaskIds = /* @__PURE__ */ new Set();
+  const liveAgentTaskIds = /* @__PURE__ */ new Set();
+  const settleTask = (taskId) => {
+    liveTaskIds.delete(taskId);
+    if (liveAgentTaskIds.delete(taskId) && resultSeen) followUpPending = true;
+  };
+  const isForeignResult = (parsed) => {
+    if (promptUuid === void 0) return false;
+    const named = namedPromptUuids(parsed);
+    if (named) return !named.includes(promptUuid);
+    if (resultSeen) return false;
+    if (options.cliEchoesPromptUuid || echoedPromptUuid) return true;
+    const failed = parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
+    return !failed && !outputSeen && !parsed.result;
+  };
   const emitBackgroundAgent = (agent) => {
     backgroundAgents.set(agent.id, agent);
     safeCallback(() => callbacks.onBackgroundAgentUpdate?.(agent));
@@ -408,6 +436,7 @@ function createClaudeTurnTranslator(callbacks) {
       liveTaskIds.add(parsed.task_id);
       const isAgent = parsed.task_type === "local_agent" || parsed.task_type === "remote_agent" || typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id);
       if (!isAgent) return;
+      liveAgentTaskIds.add(parsed.task_id);
       const now = Date.now();
       emitBackgroundAgent({
         id: parsed.task_id,
@@ -447,7 +476,7 @@ function createClaudeTurnTranslator(callbacks) {
       return;
     }
     if (parsed.type === "system" && parsed.subtype === "task_updated" && typeof parsed.task_id === "string") {
-      if (isTerminalTaskStatus(parsed.patch?.status)) liveTaskIds.delete(parsed.task_id);
+      if (isTerminalTaskStatus(parsed.patch?.status)) settleTask(parsed.task_id);
       const current = backgroundAgents.get(parsed.task_id);
       if (!current || !parsed.patch) return;
       const status = claudeBackgroundAgentStatus(parsed.patch.status) ?? current.status;
@@ -465,7 +494,7 @@ function createClaudeTurnTranslator(callbacks) {
       return;
     }
     if (parsed.type === "system" && parsed.subtype === "task_notification" && typeof parsed.task_id === "string") {
-      if (isTerminalTaskStatus(parsed.status)) liveTaskIds.delete(parsed.task_id);
+      if (isTerminalTaskStatus(parsed.status)) settleTask(parsed.task_id);
       return;
     }
     if (parsed.type === "assistant" && parsed.message?.content) {
@@ -489,6 +518,7 @@ function createClaudeTurnTranslator(callbacks) {
           safeCallback(() => callbacks.onToolUse?.(info));
         }
       }
+      if (!parsed.parent_tool_use_id) outputSeen = true;
       if (texts.length > 0 && !parsed.parent_tool_use_id) {
         const text2 = texts.join("");
         lastAssistantText = text2;
@@ -520,13 +550,17 @@ function createClaudeTurnTranslator(callbacks) {
       return;
     }
     if (parsed.type === "result") {
-      done = true;
+      if (namedPromptUuids(parsed)) echoedPromptUuid = true;
+      if (isForeignResult(parsed)) return;
+      const followUp = resultSeen;
+      resultSeen = true;
+      followUpPending = false;
       if (parsed.session_id) emitSessionId(parsed.session_id);
-      if (typeof parsed.result === "string") resultText = parsed.result;
-      isError = parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
-      if (Array.isArray(parsed.errors)) {
-        errors = parsed.errors.filter((entry) => typeof entry === "string");
+      if (typeof parsed.result === "string" && (!followUp || parsed.result)) {
+        resultText = parsed.result;
       }
+      isError = parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
+      errors = Array.isArray(parsed.errors) ? parsed.errors.filter((entry) => typeof entry === "string") : [];
       const occupancy = lastMessageUsage ?? parsed.usage;
       if (occupancy) {
         const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
@@ -539,9 +573,19 @@ function createClaudeTurnTranslator(callbacks) {
   return {
     handle,
     get done() {
-      return done;
+      return resultSeen && liveAgentTaskIds.size === 0 && !followUpPending;
+    },
+    get resultSeen() {
+      return resultSeen;
+    },
+    get awaitingFollowUp() {
+      return resultSeen && liveAgentTaskIds.size === 0 && followUpPending;
+    },
+    get echoedPromptUuid() {
+      return echoedPromptUuid;
     },
     liveTaskIds,
+    liveAgentTaskIds,
     finish() {
       const text2 = isError && errors.length > 0 ? errors.join("\n") : resultText ?? lastAssistantText ?? "";
       return {
@@ -562,6 +606,7 @@ var CLAUDE_STRIPPED_ENV_VARS = [
   "CLAUDE_CODE_SESSION_ACCESS_TOKEN"
 ];
 var CLAUDE_INTERRUPT_GRACE_MS = 5e3;
+var CLAUDE_FOLLOW_UP_GRACE_MS = 6e4;
 var TURN_MESSAGE_TYPES = /* @__PURE__ */ new Set(["assistant", "user", "stream_event", "result"]);
 var STDERR_TAIL_CHARS = 2e3;
 function validateSessionOptions(opts) {
@@ -654,6 +699,8 @@ async function createClaudeSession(opts) {
   const spawnFn = opts.spawnFn ?? nodeSpawn2;
   const queryFn = opts.queryFn ?? sdkQuery;
   const interruptGraceMs = opts.interruptGraceMs ?? CLAUDE_INTERRUPT_GRACE_MS;
+  const followUpGraceMs = opts.followUpGraceMs ?? CLAUDE_FOLLOW_UP_GRACE_MS;
+  let cliEchoesPromptUuid = false;
   let closed = false;
   let child;
   let childExited = false;
@@ -797,7 +844,16 @@ async function createClaudeSession(opts) {
           continue;
         }
         turn.translator.handle(message);
-        if (turn.translator.done) settleTurn(turn);
+        if (turn.translator.echoedPromptUuid) cliEchoesPromptUuid = true;
+        if (turn.translator.done) {
+          settleTurn(turn);
+        } else if (turn.translator.awaitingFollowUp) {
+          if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
+          turn.followUpTimer = setTimeout(() => settleTurn(turn), followUpGraceMs);
+        } else if (turn.followUpTimer) {
+          clearTimeout(turn.followUpTimer);
+          turn.followUpTimer = void 0;
+        }
       }
       void closeWith(exitError());
     } catch (error) {
@@ -821,13 +877,16 @@ async function createClaudeSession(opts) {
         const cleanup = () => {
           if (timeoutTimer) clearTimeout(timeoutTimer);
           if (graceTimer) clearTimeout(graceTimer);
+          if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
           signal?.removeEventListener("abort", onAbort);
         };
+        const promptUuid = randomUUID();
         const turn = {
-          translator: createClaudeTurnTranslator(callbacks),
+          translator: createClaudeTurnTranslator(callbacks, { promptUuid, cliEchoesPromptUuid }),
           callbacks,
           interruption: null,
           timeoutMs,
+          followUpTimer: void 0,
           resolve: (result) => {
             cleanup();
             resolve(result);
@@ -842,6 +901,10 @@ async function createClaudeSession(opts) {
           turn.interruption = kind;
           runtime.interrupt().catch(() => {
           });
+          if (turn.translator.resultSeen) {
+            void closeWith(new Error("Claude session closed after an interrupted turn"));
+            return;
+          }
           graceTimer = setTimeout(() => {
             if (active === turn) void closeWith(new Error("Claude did not stop after an interrupt"));
           }, interruptGraceMs);
@@ -855,7 +918,8 @@ async function createClaudeSession(opts) {
         input.push({
           type: "user",
           message: { role: "user", content: prompt },
-          parent_tool_use_id: null
+          parent_tool_use_id: null,
+          uuid: promptUuid
         });
       });
     },
@@ -2712,6 +2776,7 @@ ${command.stderr}` : command.stdout,
 }
 export {
   AbortError,
+  CLAUDE_FOLLOW_UP_GRACE_MS,
   CLAUDE_INTERRUPT_GRACE_MS,
   CLAUDE_STRIPPED_ENV_VARS,
   CODEX_STRIPPED_ENV_VARS,
