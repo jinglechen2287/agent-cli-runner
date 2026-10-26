@@ -1,3 +1,5 @@
+import { HookEvent, HookCallbackMatcher, SDKUserMessage, Options } from '@anthropic-ai/claude-agent-sdk';
+export { HookCallback as ClaudeHookCallback, HookCallbackMatcher as ClaudeHookCallbackMatcher, HookInput as ClaudeHookInput, HookJSONOutput as ClaudeHookOutput, PreToolUseHookInput as ClaudePreToolUseHookInput, PreToolUseHookSpecificOutput as ClaudePreToolUseHookOutput } from '@anthropic-ai/claude-agent-sdk';
 import { SpawnOptions, ChildProcess } from 'node:child_process';
 
 /**
@@ -180,46 +182,129 @@ interface RunResult {
  * another Claude Code session. Stripped so hosts launched by Claude Code
  * (or exposing it, like a bot) can still spawn turns. */
 declare const CLAUDE_STRIPPED_ENV_VARS: readonly ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ACCESS_TOKEN"];
-/** The Claude Code CLI's --permission-mode choices. Like the system prompt,
- * the mode is rebuilt from flags on each run, so it must be supplied on
- * resumed turns too — a session does not remember it. */
+/** Claude Code permission modes. `manual` is this package's name for the
+ * CLI's `default` (prompt-for-everything) mode. */
 type ClaudePermissionMode = "acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan";
-interface RunClaudeOptions extends CommonRunOptions {
-    /** Model passed via --model: an alias for the latest of a family
-     * ("fable", "opus", "sonnet", "haiku") or a full id ("claude-fable-5").
-     * Omitted = the CLI's configured default. */
+/** In-process hook callbacks, keyed by hook event — the Agent SDK's shape. */
+type ClaudeHooks = Partial<Record<HookEvent, HookCallbackMatcher[]>>;
+/** The slice of the Agent SDK's `Query` a session drives. */
+interface ClaudeQuery extends AsyncIterable<unknown> {
+    interrupt(): Promise<unknown>;
+    close(): void;
+}
+/** The Agent SDK's `query()`, narrowed to the streaming-input form a session
+ * uses. Injectable so tests can script the message stream. */
+type ClaudeQueryFn = (params: {
+    prompt: AsyncIterable<SDKUserMessage>;
+    options: Options;
+}) => ClaudeQuery;
+/** How long an interrupted turn may take to deliver its `result` before the
+ * session is killed instead. */
+declare const CLAUDE_INTERRUPT_GRACE_MS = 5000;
+interface CreateClaudeSessionOptions {
+    cwd: string;
+    /** Path or name of the `claude` binary, resolved through PATH. Defaults to
+     * "claude". The SDK's bundled binary is never used. */
+    executablePath?: string;
+    /** Base environment for the CLI. Defaults to process.env. Nesting-guard
+     * variables are stripped from it either way. */
+    env?: NodeJS.ProcessEnv;
+    /** Pre-assign the id of a new session. Mutually exclusive with resumeSessionId. */
+    newSessionId?: string;
+    /** Resume an existing session by id. Mutually exclusive with newSessionId. */
+    resumeSessionId?: string;
+    /** Model alias or id. Omitted = the CLI's configured default. */
     model?: string;
-    /** Effort level passed via --effort ("low" | "medium" | "high" | "xhigh" |
-     * "max"). Omitted = the CLI's default for the session's model. */
+    /** "low" | "medium" | "high" | "xhigh" | "max". Omitted = the model's default. */
     effort?: string;
-    /** Text passed via --append-system-prompt. The CLI rebuilds the system
-     * prompt from flags on each run, so this must be supplied on resumed turns
-     * too, not just the first spawn. */
-    appendSystemPrompt?: string;
-    /** Permission mode passed via --permission-mode. `plan` keeps the turn
-     * read-only on the project while research tools still run. */
+    /** Fixed for the life of the session. Omitted = the CLI's settings default. */
     permissionMode?: ClaudePermissionMode;
-    /** Tool names passed via --disallowed-tools. Headless plan turns disallow
-     * ExitPlanMode: the CLI never enables it under -p, and suppressing it stops
-     * the model from hunting for an approval channel that doesn't exist. */
-    disallowedTools?: string[];
-    /** Built-in tool whitelist passed via --tools as one comma-joined argument
-     * (the CLI's documented "Bash,Edit,Read" form; the flag is variadic, so
-     * separate arguments would swallow whatever followed). Unlike
-     * disallowedTools, an explicit empty array is emitted as --tools "" — the
-     * CLI's disable-all form — rather than omitted, so an empty whitelist can
-     * never silently widen back to the full set. MCP tools are outside this
-     * flag's scope; gate those with permission settings instead. */
+    /** Built-in tools: `["default"]` is the full Claude Code set; an explicit
+     * `[]` disables every built-in. Omitted = the SDK default. */
     tools?: string[];
-    /** Settings sources the CLI may load ("user", "project", "local"), passed
-     * via --setting-sources as one comma-joined argument. Omitting a source
-     * drops its permission rules for the turn — e.g. excluding "user" keeps a
-     * broad `permissions.allow` in ~/.claude/settings.json from pre-approving
-     * what the turn's permission mode would otherwise gate. */
+    /** Tools pre-approved without a permission check. Auto-allow only — this
+     * never restricts the tool set. */
+    allowedTools?: string[];
+    /** Tools removed from the model's context. */
+    disallowedTools?: string[];
+    /** Settings sources the CLI may load. Omitted = all of them. */
     settingSources?: Array<"user" | "project" | "local">;
-    /** Extra session settings passed verbatim via --settings: a JSON string or
-     * a file path, per the CLI. Merged on top of the loaded setting sources. */
-    settings?: string;
+    /** Extra flag settings: a JSON string, a file path, or an object. */
+    settings?: string | Record<string, unknown>;
+    /** Appended to the Claude Code system prompt. */
+    appendSystemPrompt?: string;
+    /** In-process hook callbacks (e.g. a PreToolUse guard). */
+    hooks?: ClaudeHooks;
+    /** A non-persistent session with customizations, tools, and MCP disabled,
+     * for small metadata tasks such as chat titles. */
+    isolated?: boolean;
+    /** Override {@link CLAUDE_INTERRUPT_GRACE_MS}. */
+    interruptGraceMs?: number;
+    spawnFn?: SpawnFn;
+    queryFn?: ClaudeQueryFn;
+}
+type ClaudeSessionTurnOptions = AgentCallbacks & {
+    prompt: string;
+    /** Aborting interrupts the turn (the session survives when the CLI answers
+     * within the grace period) and rejects with an AbortError. */
+    signal?: AbortSignal;
+    /** Wall-clock limit for the turn, using the same interrupt path; rejects
+     * with a TimeoutError. */
+    timeoutMs?: number;
+};
+interface ClaudeSession {
+    /** The Claude session id: the pre-assigned or resumed id. */
+    readonly sessionId: string;
+    readonly cwd: string;
+    readonly closed: boolean;
+    /** Run one turn. Rejects when another turn is active or the session is closed. */
+    runTurn(options: ClaudeSessionTurnOptions): Promise<RunResult>;
+    /** Called once, with the reason, when the session closes for any reason. */
+    onClose(handler: (error: Error) => void): () => void;
+    /** Terminate the CLI process tree. Resolves once it has exited. */
+    close(): Promise<void>;
+}
+/** Start a long-lived Claude Code session over the Agent SDK. Turns run one at
+ * a time through {@link ClaudeSession.runTurn}; the CLI process stays up
+ * between them. Startup failures surface on the first turn. */
+declare function createClaudeSession(opts: CreateClaudeSessionOptions): Promise<ClaudeSession>;
+
+interface RunClaudeOptions extends CommonRunOptions {
+    /** Model: an alias for the latest of a family ("fable", "opus", "sonnet",
+     * "haiku") or a full id ("claude-fable-5"). Omitted = the CLI's configured
+     * default. */
+    model?: string;
+    /** Effort level ("low" | "medium" | "high" | "xhigh" | "max"). Omitted =
+     * the CLI's default for the session's model. */
+    effort?: string;
+    /** Text appended to the Claude Code system prompt. The system prompt is
+     * rebuilt on each run, so this must be supplied on resumed turns too. */
+    appendSystemPrompt?: string;
+    /** Permission mode for the run. `plan` keeps the turn read-only on the
+     * project while research tools still run. */
+    permissionMode?: ClaudePermissionMode;
+    /** Tool names removed from the model's context. */
+    disallowedTools?: string[];
+    /** Built-in tools: `["default"]` is the full Claude Code set. An explicit
+     * empty array disables every built-in rather than being omitted, so an
+     * empty whitelist can never silently widen back to the full set. MCP tools
+     * are outside this option's scope; gate those with hooks or settings. */
+    tools?: string[];
+    /** Tools pre-approved without a permission check. Auto-allow only: this
+     * never restricts the tool set. */
+    allowedTools?: string[];
+    /** Settings sources the CLI may load ("user", "project", "local").
+     * Omitted = all of them. Omitting a source drops its permission rules for
+     * the turn — e.g. excluding "user" keeps a broad `permissions.allow` in
+     * ~/.claude/settings.json from pre-approving what the turn's permission
+     * mode would otherwise gate. */
+    settingSources?: Array<"user" | "project" | "local">;
+    /** Extra flag settings: a JSON string, a file path, or an object. Merged
+     * on top of the loaded setting sources. */
+    settings?: string | Record<string, unknown>;
+    /** In-process hook callbacks (e.g. a PreToolUse guard). A callback that
+     * throws counts as no opinion, so a guard must catch its own errors. */
+    hooks?: ClaudeHooks;
     /** Pre-assign a UUID for the new session (turn 1). Mutually exclusive with resumeSessionId. */
     newSessionId?: string;
     /** Resume an existing session by id (turn 2+). Mutually exclusive with newSessionId. */
@@ -227,10 +312,41 @@ interface RunClaudeOptions extends CommonRunOptions {
     /** Run a non-persistent one-shot request with customizations, tools, and MCP
      * disabled. Intended for small metadata tasks such as chat titles. */
     isolated?: boolean;
+    /** Test seam: replaces the Agent SDK's `query()`. */
+    queryFn?: ClaudeQueryFn;
 }
-/** Spawn a non-interactive Claude Code CLI turn (`claude -p` with stream-json
- * output) and translate its JSONL stream into callbacks plus a final result. */
+/** Run one Claude Code turn through the Agent SDK: start a session, run the
+ * turn, and close the session. Hosts that keep a conversation going should
+ * hold a {@link createClaudeSession} session instead, which keeps the CLI up
+ * between turns. */
 declare function runClaude(opts: RunClaudeOptions): Promise<RunResult>;
+
+/** What a Claude turn produced once its `result` arrived (or the stream ended
+ * without one). */
+interface ClaudeTurnOutcome {
+    /** The result text, else the last parent assistant message, trimmed. */
+    text: string;
+    sessionId?: string;
+    usage?: TokenUsage;
+    /** The `result` reported a failed turn. */
+    isError: boolean;
+    /** The error `result`'s messages, when it carried any. */
+    errors: string[];
+}
+interface ClaudeTurnTranslator {
+    /** Feed one stream-json message (a CLI stdout line or an SDK message). */
+    handle(message: unknown): void;
+    /** True once the turn's `result` has arrived. */
+    readonly done: boolean;
+    /** Tasks (background Bash, Monitor, subagents) started this turn that have
+     * not settled yet. */
+    readonly liveTaskIds: ReadonlySet<string>;
+    finish(): ClaudeTurnOutcome;
+}
+/** Translate one Claude turn's stream-json messages into host callbacks. One
+ * translator per turn: session-id deduplication, usage attribution, and task
+ * tracking are all scoped to it. */
+declare function createClaudeTurnTranslator(callbacks: AgentCallbacks): ClaudeTurnTranslator;
 
 interface CodexServerRequest {
     id: number | string;
@@ -520,4 +636,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudePermissionMode, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };

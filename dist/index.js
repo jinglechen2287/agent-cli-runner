@@ -1,5 +1,15 @@
-// src/run-claude.ts
+// src/claude-session.ts
 import { spawn as nodeSpawn2 } from "child_process";
+import { randomUUID } from "crypto";
+import {
+  query as sdkQuery
+} from "@anthropic-ai/claude-agent-sdk";
+
+// src/internal.ts
+import { spawn as nodeSpawn } from "child_process";
+import { accessSync, constants, statSync } from "fs";
+import { delimiter, join, resolve as resolvePath } from "path";
+import { StringDecoder } from "string_decoder";
 
 // src/errors.ts
 var AbortError = class extends Error {
@@ -29,8 +39,6 @@ var CodexTurnError = class extends Error {
 };
 
 // src/internal.ts
-import { spawn as nodeSpawn } from "child_process";
-import { StringDecoder } from "string_decoder";
 var SIGTERM_GRACE_MS = 2e3;
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -193,6 +201,24 @@ function signalProcessTree(child, signal) {
   } catch {
   }
 }
+function resolveExecutable(name, env) {
+  if (process.platform === "win32") return name;
+  const isExecutable = (candidate) => {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (name.includes("/")) return isExecutable(name) ? resolvePath(name) : void 0;
+  for (const dir of (env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    if (isExecutable(candidate)) return candidate;
+  }
+  return void 0;
+}
 
 // src/usage.ts
 var KNOWN_CONTEXT_WINDOWS = {
@@ -223,12 +249,7 @@ function contextWindowForModel(model) {
   return void 0;
 }
 
-// src/run-claude.ts
-var CLAUDE_STRIPPED_ENV_VARS = [
-  "CLAUDECODE",
-  "CLAUDE_CODE_ENTRYPOINT",
-  "CLAUDE_CODE_SESSION_ACCESS_TOKEN"
-];
+// src/claude-messages.ts
 function summarizeClaudeTool(name, input) {
   if (!input) return void 0;
   const str = (key) => normalizeSummary(input[key]);
@@ -334,7 +355,216 @@ function pickPrimaryModel(modelUsage, preferred) {
   }
   return { model: best[0], contextWindow: toContextWindow(best[1].contextWindow) };
 }
-async function runClaude(opts) {
+function isTerminalTaskStatus(status) {
+  return status === "completed" || status === "failed" || status === "stopped" || status === "killed";
+}
+function createClaudeTurnTranslator(callbacks) {
+  let done = false;
+  let isError = false;
+  let errors = [];
+  let sessionId;
+  let sessionIdEmitted = false;
+  let lastAssistantText;
+  let resultText;
+  let lastAssistantModel;
+  let sessionModel;
+  let lastMessageUsage;
+  let lastUsage;
+  const agentToolCallIds = /* @__PURE__ */ new Set();
+  const backgroundAgents = /* @__PURE__ */ new Map();
+  const liveTaskIds = /* @__PURE__ */ new Set();
+  const emitBackgroundAgent = (agent) => {
+    backgroundAgents.set(agent.id, agent);
+    safeCallback(() => callbacks.onBackgroundAgentUpdate?.(agent));
+  };
+  const emitUsage = (usage) => {
+    lastUsage = usage;
+    safeCallback(() => callbacks.onUsage?.(usage));
+  };
+  const emitSessionId = (id) => {
+    sessionId = id;
+    if (sessionIdEmitted) return;
+    sessionIdEmitted = true;
+    safeCallback(() => callbacks.onSessionId?.(id));
+  };
+  const handle = (message) => {
+    if (!isRecord(message)) return;
+    const parsed = message;
+    if (parsed.type === "stream_event") {
+      if (parsed.parent_tool_use_id) return;
+      const delta = parsed.event?.type === "content_block_delta" ? parsed.event.delta : void 0;
+      if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+        const text2 = delta.text;
+        safeCallback(() => callbacks.onAssistantTextDelta?.(text2));
+      }
+      return;
+    }
+    if (parsed.type === "system" && parsed.subtype === "init") {
+      if (typeof parsed.model === "string" && parsed.model) sessionModel = parsed.model;
+      if (parsed.session_id) emitSessionId(parsed.session_id);
+      return;
+    }
+    if (parsed.type === "system" && parsed.subtype === "task_started" && typeof parsed.task_id === "string") {
+      liveTaskIds.add(parsed.task_id);
+      const isAgent = parsed.task_type === "local_agent" || parsed.task_type === "remote_agent" || typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id);
+      if (!isAgent) return;
+      const now = Date.now();
+      emitBackgroundAgent({
+        id: parsed.task_id,
+        provider: "claude",
+        ...typeof parsed.tool_use_id === "string" ? { parentToolCallId: parsed.tool_use_id } : {},
+        ...typeof parsed.description === "string" ? { description: parsed.description } : {},
+        ...typeof parsed.task_type === "string" ? { agentType: parsed.task_type } : {},
+        status: "running",
+        startedAt: now,
+        updatedAt: now
+      });
+      return;
+    }
+    if (parsed.type === "system" && parsed.subtype === "task_progress" && typeof parsed.task_id === "string") {
+      const current = backgroundAgents.get(parsed.task_id);
+      if (!current) return;
+      const usage = parsed.usage;
+      const progress = {
+        ...current.progress ?? {},
+        ...typeof usage?.total_tokens === "number" ? { totalTokens: usage.total_tokens } : {},
+        ...typeof usage?.tool_uses === "number" ? { toolUses: usage.tool_uses } : {},
+        ...typeof usage?.duration_ms === "number" ? { durationMs: usage.duration_ms } : {},
+        ...typeof parsed.last_tool_name === "string" ? { lastToolName: parsed.last_tool_name } : {}
+      };
+      emitBackgroundAgent({
+        ...current,
+        ...typeof parsed.tool_use_id === "string" ? { parentToolCallId: parsed.tool_use_id } : {},
+        ...typeof parsed.description === "string" ? { description: parsed.description } : {},
+        ...typeof parsed.subagent_type === "string" ? { agentType: parsed.subagent_type } : {},
+        ...typeof parsed.summary === "string" ? { summary: parsed.summary } : {},
+        ...Object.keys(progress).length > 0 ? { progress } : {},
+        // A trailing progress rollup can arrive after the terminal
+        // task_updated; it must not resurrect a finished agent.
+        status: current.status === "completed" || current.status === "failed" || current.status === "interrupted" ? current.status : "running",
+        updatedAt: Date.now()
+      });
+      return;
+    }
+    if (parsed.type === "system" && parsed.subtype === "task_updated" && typeof parsed.task_id === "string") {
+      if (isTerminalTaskStatus(parsed.patch?.status)) liveTaskIds.delete(parsed.task_id);
+      const current = backgroundAgents.get(parsed.task_id);
+      if (!current || !parsed.patch) return;
+      const status = claudeBackgroundAgentStatus(parsed.patch.status) ?? current.status;
+      const now = Date.now();
+      emitBackgroundAgent({
+        ...current,
+        ...typeof parsed.patch.description === "string" ? { description: parsed.patch.description } : {},
+        ...typeof parsed.patch.error === "string" ? { error: parsed.patch.error } : {},
+        status,
+        updatedAt: now,
+        ...status === "completed" || status === "failed" || status === "interrupted" ? {
+          endedAt: current.endedAt ?? (typeof parsed.patch.end_time === "number" ? parsed.patch.end_time : now)
+        } : {}
+      });
+      return;
+    }
+    if (parsed.type === "system" && parsed.subtype === "task_notification" && typeof parsed.task_id === "string") {
+      if (isTerminalTaskStatus(parsed.status)) liveTaskIds.delete(parsed.task_id);
+      return;
+    }
+    if (parsed.type === "assistant" && parsed.message?.content) {
+      const texts = [];
+      for (const block of parsed.message.content) {
+        if (block.type === "text" && typeof block.text === "string") {
+          texts.push(block.text);
+        } else if (block.type === "tool_use" && typeof block.name === "string") {
+          if ((block.name === "Agent" || block.name === "Task") && typeof block.id === "string") {
+            agentToolCallIds.add(block.id);
+          }
+          const planItems2 = claudeTodoPlanItems(block.name, block.input);
+          const summary = planItems2 ? planCompletionSummary(planItems2) : summarizeClaudeTool(block.name, block.input);
+          const info = {
+            ...typeof block.id === "string" ? { callId: block.id } : {},
+            name: block.name,
+            ...summary !== void 0 ? { summary } : {},
+            ...block.input ? { input: block.input } : {},
+            ...planItems2 ? { planItems: planItems2 } : {}
+          };
+          safeCallback(() => callbacks.onToolUse?.(info));
+        }
+      }
+      if (texts.length > 0 && !parsed.parent_tool_use_id) {
+        const text2 = texts.join("");
+        lastAssistantText = text2;
+        safeCallback(() => callbacks.onAssistantText?.(text2));
+      }
+      if (parsed.parent_tool_use_id) return;
+      const model = qualifyModel(parsed.message.model, sessionModel);
+      if (model) lastAssistantModel = model;
+      if (parsed.message.usage) {
+        lastMessageUsage = parsed.message.usage;
+        emitUsage(
+          toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model))
+        );
+      }
+      return;
+    }
+    if (parsed.type === "user" && parsed.message?.content) {
+      for (const block of parsed.message.content) {
+        if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
+          continue;
+        }
+        const result = {
+          callId: block.tool_use_id,
+          content: block.content,
+          ...typeof block.is_error === "boolean" ? { isError: block.is_error } : {}
+        };
+        safeCallback(() => callbacks.onToolResult?.(result));
+      }
+      return;
+    }
+    if (parsed.type === "result") {
+      done = true;
+      if (parsed.session_id) emitSessionId(parsed.session_id);
+      if (typeof parsed.result === "string") resultText = parsed.result;
+      isError = parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
+      if (Array.isArray(parsed.errors)) {
+        errors = parsed.errors.filter((entry) => typeof entry === "string");
+      }
+      const occupancy = lastMessageUsage ?? parsed.usage;
+      if (occupancy) {
+        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
+        const model = primary?.model ?? lastAssistantModel;
+        const contextWindow = primary?.contextWindow ?? contextWindowForModel(model);
+        emitUsage(toClaudeUsage(occupancy, model, contextWindow));
+      }
+    }
+  };
+  return {
+    handle,
+    get done() {
+      return done;
+    },
+    liveTaskIds,
+    finish() {
+      const text2 = isError && errors.length > 0 ? errors.join("\n") : resultText ?? lastAssistantText ?? "";
+      return {
+        text: text2.trim(),
+        ...sessionId !== void 0 ? { sessionId } : {},
+        ...lastUsage !== void 0 ? { usage: lastUsage } : {},
+        isError,
+        errors
+      };
+    }
+  };
+}
+
+// src/claude-session.ts
+var CLAUDE_STRIPPED_ENV_VARS = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_SESSION_ACCESS_TOKEN"
+];
+var CLAUDE_INTERRUPT_GRACE_MS = 5e3;
+var TURN_MESSAGE_TYPES = /* @__PURE__ */ new Set(["assistant", "user", "stream_event", "result"]);
+var STDERR_TAIL_CHARS = 2e3;
+function validateSessionOptions(opts) {
   if (opts.newSessionId && opts.resumeSessionId) {
     throw new Error(
       "newSessionId and resumeSessionId are mutually exclusive \u2014 pass one or the other"
@@ -349,271 +579,354 @@ async function runClaude(opts) {
   if (opts.isolated && opts.tools) {
     throw new Error("isolated Claude runs cannot set tools \u2014 isolated already disables them all");
   }
-  const spawnFn = opts.spawnFn ?? nodeSpawn2;
-  const args = ["-p", "--output-format", "stream-json", "--verbose"];
-  if (opts.isolated) {
-    args.push(
-      "--safe-mode",
-      "--tools",
-      "",
-      "--strict-mcp-config",
-      "--no-session-persistence"
-    );
-  }
-  if (opts.onAssistantTextDelta) {
-    args.push("--include-partial-messages");
-  }
-  if (opts.model) {
-    args.push("--model", opts.model);
-  }
-  if (opts.effort) {
-    args.push("--effort", opts.effort);
-  }
-  if (opts.appendSystemPrompt) {
-    args.push("--append-system-prompt", opts.appendSystemPrompt);
-  }
-  if (opts.permissionMode) {
-    args.push("--permission-mode", opts.permissionMode);
-  }
-  if (opts.disallowedTools && opts.disallowedTools.length > 0) {
-    args.push("--disallowed-tools", opts.disallowedTools.join(" "));
-  }
-  if (opts.tools) {
-    args.push("--tools", opts.tools.join(","));
-  }
-  if (opts.settingSources) {
-    args.push("--setting-sources", opts.settingSources.join(","));
-  }
-  if (opts.settings) {
-    args.push("--settings", opts.settings);
-  }
-  if (opts.newSessionId) {
-    args.push("--session-id", opts.newSessionId);
-  } else if (opts.resumeSessionId) {
-    args.push("--resume", opts.resumeSessionId);
-  }
-  let child;
-  try {
-    child = spawnFn(opts.executablePath ?? "claude", args, {
-      cwd: opts.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
-      // Process-group leader (POSIX), so the SIGKILL escalation reaches tool
-      // children (a running Bash) that the CLI can no longer reap itself.
-      detached: process.platform !== "win32"
-    });
-  } catch (error) {
-    if (isMissingExecutable(error)) throw new MissingCliError("claude");
-    throw error;
-  }
-  writePrompt(child, opts.prompt);
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let sessionId;
-    let sessionIdEmitted = false;
-    let lastAssistantText;
-    let resultText;
-    let lastAssistantModel;
-    let sessionModel;
-    let lastMessageUsage;
-    let lastUsage;
-    const agentToolCallIds = /* @__PURE__ */ new Set();
-    const backgroundAgents = /* @__PURE__ */ new Map();
-    const emitBackgroundAgent = (agent) => {
-      backgroundAgents.set(agent.id, agent);
-      safeCallback(() => opts.onBackgroundAgentUpdate?.(agent));
-    };
-    const emitUsage = (usage) => {
-      lastUsage = usage;
-      safeCallback(() => opts.onUsage?.(usage));
-    };
-    const lifecycle = watchLifecycle({
-      cli: "claude",
-      signal: opts.signal,
-      timeoutMs: opts.timeoutMs,
-      kill: (signal) => signalProcessTree(child, signal)
-    });
-    const emitSessionId = (id) => {
-      sessionId = id;
-      if (sessionIdEmitted) return;
-      sessionIdEmitted = true;
-      safeCallback(() => opts.onSessionId?.(id));
-    };
-    const handleLine = (line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-      let parsed;
-      try {
-        parsed = JSON.parse(trimmed);
-      } catch {
-        return;
-      }
-      if (parsed.type === "stream_event") {
-        if (parsed.parent_tool_use_id) return;
-        const delta = parsed.event?.type === "content_block_delta" ? parsed.event.delta : void 0;
-        if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
-          const text2 = delta.text;
-          safeCallback(() => opts.onAssistantTextDelta?.(text2));
-        }
-        return;
-      }
-      if (parsed.type === "system" && parsed.subtype === "init") {
-        if (typeof parsed.model === "string" && parsed.model) sessionModel = parsed.model;
-        if (parsed.session_id) emitSessionId(parsed.session_id);
-        return;
-      }
-      if (parsed.type === "system" && parsed.subtype === "task_started" && typeof parsed.task_id === "string") {
-        const isAgent = parsed.task_type === "local_agent" || parsed.task_type === "remote_agent" || typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id);
-        if (!isAgent) return;
-        const now = Date.now();
-        emitBackgroundAgent({
-          id: parsed.task_id,
-          provider: "claude",
-          ...typeof parsed.tool_use_id === "string" ? { parentToolCallId: parsed.tool_use_id } : {},
-          ...typeof parsed.description === "string" ? { description: parsed.description } : {},
-          ...typeof parsed.task_type === "string" ? { agentType: parsed.task_type } : {},
-          status: "running",
-          startedAt: now,
-          updatedAt: now
-        });
-        return;
-      }
-      if (parsed.type === "system" && parsed.subtype === "task_progress" && typeof parsed.task_id === "string") {
-        const current = backgroundAgents.get(parsed.task_id);
-        if (!current) return;
-        const usage = parsed.usage;
-        const progress = {
-          ...current.progress ?? {},
-          ...typeof usage?.total_tokens === "number" ? { totalTokens: usage.total_tokens } : {},
-          ...typeof usage?.tool_uses === "number" ? { toolUses: usage.tool_uses } : {},
-          ...typeof usage?.duration_ms === "number" ? { durationMs: usage.duration_ms } : {},
-          ...typeof parsed.last_tool_name === "string" ? { lastToolName: parsed.last_tool_name } : {}
-        };
-        emitBackgroundAgent({
-          ...current,
-          ...typeof parsed.tool_use_id === "string" ? { parentToolCallId: parsed.tool_use_id } : {},
-          ...typeof parsed.description === "string" ? { description: parsed.description } : {},
-          ...typeof parsed.subagent_type === "string" ? { agentType: parsed.subagent_type } : {},
-          ...typeof parsed.summary === "string" ? { summary: parsed.summary } : {},
-          ...Object.keys(progress).length > 0 ? { progress } : {},
-          // A trailing progress rollup can arrive after the terminal
-          // task_updated; it must not resurrect a finished agent.
-          status: current.status === "completed" || current.status === "failed" || current.status === "interrupted" ? current.status : "running",
-          updatedAt: Date.now()
-        });
-        return;
-      }
-      if (parsed.type === "system" && parsed.subtype === "task_updated" && typeof parsed.task_id === "string") {
-        const current = backgroundAgents.get(parsed.task_id);
-        if (!current || !parsed.patch) return;
-        const status = claudeBackgroundAgentStatus(parsed.patch.status) ?? current.status;
-        const now = Date.now();
-        emitBackgroundAgent({
-          ...current,
-          ...typeof parsed.patch.description === "string" ? { description: parsed.patch.description } : {},
-          ...typeof parsed.patch.error === "string" ? { error: parsed.patch.error } : {},
-          status,
-          updatedAt: now,
-          ...status === "completed" || status === "failed" || status === "interrupted" ? {
-            endedAt: current.endedAt ?? (typeof parsed.patch.end_time === "number" ? parsed.patch.end_time : now)
-          } : {}
-        });
-        return;
-      }
-      if (parsed.type === "assistant" && parsed.message?.content) {
-        const texts = [];
-        for (const block of parsed.message.content) {
-          if (block.type === "text" && typeof block.text === "string") {
-            texts.push(block.text);
-          } else if (block.type === "tool_use" && typeof block.name === "string") {
-            if ((block.name === "Agent" || block.name === "Task") && typeof block.id === "string") {
-              agentToolCallIds.add(block.id);
-            }
-            const planItems2 = claudeTodoPlanItems(block.name, block.input);
-            const summary = planItems2 ? planCompletionSummary(planItems2) : summarizeClaudeTool(block.name, block.input);
-            const info = {
-              ...typeof block.id === "string" ? { callId: block.id } : {},
-              name: block.name,
-              ...summary !== void 0 ? { summary } : {},
-              ...block.input ? { input: block.input } : {},
-              ...planItems2 ? { planItems: planItems2 } : {}
-            };
-            safeCallback(() => opts.onToolUse?.(info));
-          }
-        }
-        if (texts.length > 0 && !parsed.parent_tool_use_id) {
-          const text2 = texts.join("");
-          lastAssistantText = text2;
-          safeCallback(() => opts.onAssistantText?.(text2));
-        }
-        if (parsed.parent_tool_use_id) return;
-        const model = qualifyModel(parsed.message.model, sessionModel);
-        if (model) lastAssistantModel = model;
-        if (parsed.message.usage) {
-          lastMessageUsage = parsed.message.usage;
-          emitUsage(
-            toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model))
-          );
-        }
-        return;
-      }
-      if (parsed.type === "user" && parsed.message?.content) {
-        for (const block of parsed.message.content) {
-          if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
+}
+function sdkTools(tools) {
+  if (!tools) return void 0;
+  if (tools.length === 1 && tools[0] === "default") return { type: "preset", preset: "claude_code" };
+  return [...tools];
+}
+function claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeCodeProcess) {
+  const permissionMode = opts.permissionMode === "manual" ? "default" : opts.permissionMode;
+  const tools = opts.isolated ? [] : sdkTools(opts.tools);
+  return {
+    cwd: opts.cwd,
+    env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
+    pathToClaudeCodeExecutable: executablePath,
+    spawnClaudeCodeProcess,
+    ...opts.resumeSessionId ? { resume: opts.resumeSessionId } : { sessionId },
+    // Omitting systemPrompt sends an empty one, not Claude Code's.
+    systemPrompt: {
+      type: "preset",
+      preset: "claude_code",
+      ...opts.appendSystemPrompt ? { append: opts.appendSystemPrompt } : {}
+    },
+    includePartialMessages: true,
+    ...opts.model ? { model: opts.model } : {},
+    ...opts.effort ? { effort: opts.effort } : {},
+    ...permissionMode ? { permissionMode } : {},
+    ...permissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {},
+    ...tools !== void 0 ? { tools } : {},
+    ...opts.allowedTools?.length ? { allowedTools: [...opts.allowedTools] } : {},
+    ...opts.disallowedTools?.length ? { disallowedTools: [...opts.disallowedTools] } : {},
+    ...opts.settingSources ? { settingSources: [...opts.settingSources] } : {},
+    ...opts.settings !== void 0 ? { settings: opts.settings } : {},
+    ...opts.hooks ? { hooks: opts.hooks } : {},
+    ...opts.isolated ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } } : {}
+  };
+}
+function createInputQueue() {
+  const pending = [];
+  let ended = false;
+  let wake;
+  return {
+    push(message) {
+      pending.push(message);
+      wake?.();
+    },
+    end() {
+      ended = true;
+      wake?.();
+    },
+    iterable: {
+      async *[Symbol.asyncIterator]() {
+        while (true) {
+          const next = pending.shift();
+          if (next) {
+            yield next;
             continue;
           }
-          const result = {
-            callId: block.tool_use_id,
-            content: block.content,
-            ...typeof block.is_error === "boolean" ? { isError: block.is_error } : {}
-          };
-          safeCallback(() => opts.onToolResult?.(result));
-        }
-        return;
-      }
-      if (parsed.type === "result") {
-        if (parsed.session_id) emitSessionId(parsed.session_id);
-        if (typeof parsed.result === "string") resultText = parsed.result;
-        const occupancy = lastMessageUsage ?? parsed.usage;
-        if (occupancy) {
-          const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
-          const model = primary?.model ?? lastAssistantModel;
-          const contextWindow = primary?.contextWindow ?? contextWindowForModel(model);
-          emitUsage(toClaudeUsage(occupancy, model, contextWindow));
+          if (ended) return;
+          await new Promise((resolve) => {
+            wake = resolve;
+          });
+          wake = void 0;
         }
       }
+    }
+  };
+}
+async function createClaudeSession(opts) {
+  validateSessionOptions(opts);
+  const env = opts.env ?? process.env;
+  const executablePath = resolveExecutable(opts.executablePath ?? "claude", env);
+  if (!executablePath) throw new MissingCliError("claude");
+  const sessionId = opts.resumeSessionId ?? opts.newSessionId ?? randomUUID();
+  const spawnFn = opts.spawnFn ?? nodeSpawn2;
+  const queryFn = opts.queryFn ?? sdkQuery;
+  const interruptGraceMs = opts.interruptGraceMs ?? CLAUDE_INTERRUPT_GRACE_MS;
+  let closed = false;
+  let child;
+  let childExited = false;
+  let active;
+  let stderrTail = "";
+  const closeHandlers = /* @__PURE__ */ new Set();
+  const exitWaiters = /* @__PURE__ */ new Set();
+  const input = createInputQueue();
+  const spawnClaudeCodeProcess = (spawnOptions) => {
+    const spawned = spawnFn(spawnOptions.command, spawnOptions.args, {
+      cwd: spawnOptions.cwd ?? opts.cwd,
+      env: spawnOptions.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      // Process-group leader (POSIX), so killing the session reaches tool
+      // children (a running Bash) as well as the CLI.
+      detached: process.platform !== "win32"
+    });
+    child = spawned;
+    spawned.once("exit", () => {
+      childExited = true;
+      for (const waiter of exitWaiters) waiter();
+      exitWaiters.clear();
+    });
+    const stderr = createChunkDecoder((text2) => {
+      stderrTail = (stderrTail + text2).slice(-STDERR_TAIL_CHARS);
+      const callbacks = active?.callbacks;
+      safeCallback(() => callbacks?.onStderr?.(text2));
+    });
+    spawned.stderr?.on("data", (chunk) => stderr.push(chunk));
+    spawned.stderr?.on("end", () => stderr.flush());
+    spawnOptions.signal.addEventListener("abort", () => signalProcessTree(spawned, "SIGKILL"), {
+      once: true
+    });
+    if (!spawned.stdin || !spawned.stdout) {
+      throw new Error("Claude process was spawned without stdio pipes");
+    }
+    const stdin = spawned.stdin;
+    const stdout = spawned.stdout;
+    return {
+      stdin,
+      stdout,
+      get killed() {
+        return spawned.killed;
+      },
+      get exitCode() {
+        return spawned.exitCode;
+      },
+      get signalCode() {
+        return spawned.signalCode;
+      },
+      kill(signal) {
+        signalProcessTree(spawned, signal);
+        return true;
+      },
+      on: spawned.on.bind(spawned),
+      once: spawned.once.bind(spawned),
+      off: spawned.off.bind(spawned)
     };
-    const splitter = createLineSplitter(handleLine);
-    child.stdout?.on("data", (chunk) => splitter.push(chunk));
-    const stderrDecoder = createChunkDecoder(
-      (text2) => safeCallback(() => opts.onStderr?.(text2))
-    );
-    child.stderr?.on("data", (chunk) => stderrDecoder.push(chunk));
-    child.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      lifecycle.cleanup();
-      reject(isMissingExecutable(err) ? new MissingCliError("claude") : err);
+  };
+  const options = claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeCodeProcess);
+  const runtime = queryFn({ prompt: input.iterable, options });
+  const killTree = () => {
+    const current = child;
+    if (!current || childExited) return Promise.resolve();
+    return new Promise((resolve) => {
+      let killTimer;
+      let giveUpTimer;
+      const done = () => {
+        if (killTimer) clearTimeout(killTimer);
+        if (giveUpTimer) clearTimeout(giveUpTimer);
+        exitWaiters.delete(done);
+        resolve();
+      };
+      exitWaiters.add(done);
+      signalProcessTree(current, "SIGTERM");
+      killTimer = setTimeout(() => {
+        signalProcessTree(current, "SIGKILL");
+        giveUpTimer = setTimeout(done, SIGTERM_GRACE_MS);
+        giveUpTimer.unref?.();
+      }, SIGTERM_GRACE_MS);
+      killTimer.unref?.();
     });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      splitter.flush();
-      stderrDecoder.flush();
-      lifecycle.cleanup();
-      const interruption = lifecycle.interruptionError();
-      if (interruption) {
-        reject(interruption);
-        return;
-      }
-      resolve({
-        text: (resultText ?? lastAssistantText ?? "").trim(),
-        exitCode: code ?? -1,
-        ...sessionId !== void 0 ? { sessionId } : {},
-        ...lastUsage !== void 0 ? { usage: lastUsage } : {}
+  };
+  const interruptionError = (turn) => turn.interruption === "timeout" ? new TimeoutError(`claude run timed out after ${turn.timeoutMs}ms`) : new AbortError("claude run aborted");
+  let closing;
+  let closeReason;
+  const closeWith = (reason) => {
+    if (closing) return closing;
+    closed = true;
+    closeReason = reason;
+    const turn = active;
+    active = void 0;
+    if (turn) turn.reject(turn.interruption ? interruptionError(turn) : reason);
+    for (const handler of closeHandlers) safeCallback(() => handler(reason));
+    closeHandlers.clear();
+    input.end();
+    try {
+      runtime.close();
+    } catch {
+    }
+    closing = killTree();
+    return closing;
+  };
+  const exitError = (cause) => {
+    const detail = cause instanceof Error ? cause.message : "Claude process exited";
+    const tail = stderrTail.trim();
+    return new Error(tail && !detail.includes(tail) ? `${detail}: ${tail}` : detail);
+  };
+  const settleTurn = (turn) => {
+    if (active !== turn) return;
+    active = void 0;
+    const outcome = turn.translator.finish();
+    if (turn.interruption) {
+      turn.reject(interruptionError(turn));
+    } else {
+      turn.resolve({
+        text: outcome.text,
+        exitCode: outcome.isError ? 1 : 0,
+        ...outcome.sessionId !== void 0 ? { sessionId: outcome.sessionId } : {},
+        ...outcome.usage !== void 0 ? { usage: outcome.usage } : {}
       });
-    });
+    }
+    if (turn.translator.liveTaskIds.size > 0) {
+      void closeWith(new Error("Claude left background tasks running at the end of a turn"));
+    }
+  };
+  void (async () => {
+    try {
+      for await (const message of runtime) {
+        const turn = active;
+        if (!turn) {
+          const type = isRecord(message) ? message.type : void 0;
+          if (typeof type === "string" && TURN_MESSAGE_TYPES.has(type)) {
+            void closeWith(new Error("Claude produced output outside a turn"));
+            return;
+          }
+          continue;
+        }
+        turn.translator.handle(message);
+        if (turn.translator.done) settleTurn(turn);
+      }
+      void closeWith(exitError());
+    } catch (error) {
+      void closeWith(exitError(error));
+    }
+  })();
+  return {
+    sessionId,
+    cwd: opts.cwd,
+    get closed() {
+      return closed;
+    },
+    runTurn(turnOptions) {
+      if (closed) return Promise.reject(closeReason ?? new Error("Claude session is closed"));
+      if (active) return Promise.reject(new Error("Claude session already has an active turn"));
+      const { prompt, signal, timeoutMs, ...callbacks } = turnOptions;
+      if (signal?.aborted) return Promise.reject(new AbortError("claude run aborted"));
+      return new Promise((resolve, reject) => {
+        let timeoutTimer;
+        let graceTimer;
+        const cleanup = () => {
+          if (timeoutTimer) clearTimeout(timeoutTimer);
+          if (graceTimer) clearTimeout(graceTimer);
+          signal?.removeEventListener("abort", onAbort);
+        };
+        const turn = {
+          translator: createClaudeTurnTranslator(callbacks),
+          callbacks,
+          interruption: null,
+          timeoutMs,
+          resolve: (result) => {
+            cleanup();
+            resolve(result);
+          },
+          reject: (error) => {
+            cleanup();
+            reject(error);
+          }
+        };
+        const interrupt = (kind) => {
+          if (active !== turn || turn.interruption) return;
+          turn.interruption = kind;
+          runtime.interrupt().catch(() => {
+          });
+          graceTimer = setTimeout(() => {
+            if (active === turn) void closeWith(new Error("Claude did not stop after an interrupt"));
+          }, interruptGraceMs);
+        };
+        const onAbort = () => interrupt("abort");
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (timeoutMs !== void 0) {
+          timeoutTimer = setTimeout(() => interrupt("timeout"), timeoutMs);
+        }
+        active = turn;
+        input.push({
+          type: "user",
+          message: { role: "user", content: prompt },
+          parent_tool_use_id: null
+        });
+      });
+    },
+    onClose(handler) {
+      if (closed) {
+        safeCallback(() => handler(closeReason ?? new Error("Claude session is closed")));
+        return () => {
+        };
+      }
+      closeHandlers.add(handler);
+      return () => closeHandlers.delete(handler);
+    },
+    close() {
+      return closeWith(new Error("Claude session closed"));
+    }
+  };
+}
+
+// src/run-claude.ts
+async function runClaude(opts) {
+  const {
+    prompt,
+    signal,
+    timeoutMs,
+    cwd,
+    executablePath,
+    env,
+    spawnFn,
+    queryFn,
+    model,
+    effort,
+    appendSystemPrompt,
+    permissionMode,
+    disallowedTools,
+    tools,
+    allowedTools,
+    settingSources,
+    settings,
+    hooks,
+    newSessionId,
+    resumeSessionId,
+    isolated,
+    ...callbacks
+  } = opts;
+  if (signal?.aborted) throw new AbortError("claude run aborted");
+  const session = await createClaudeSession({
+    cwd,
+    ...executablePath !== void 0 ? { executablePath } : {},
+    ...env !== void 0 ? { env } : {},
+    ...spawnFn !== void 0 ? { spawnFn } : {},
+    ...queryFn !== void 0 ? { queryFn } : {},
+    ...model !== void 0 ? { model } : {},
+    ...effort !== void 0 ? { effort } : {},
+    ...appendSystemPrompt !== void 0 ? { appendSystemPrompt } : {},
+    ...permissionMode !== void 0 ? { permissionMode } : {},
+    ...disallowedTools !== void 0 ? { disallowedTools } : {},
+    ...tools !== void 0 ? { tools } : {},
+    ...allowedTools !== void 0 ? { allowedTools } : {},
+    ...settingSources !== void 0 ? { settingSources } : {},
+    ...settings !== void 0 ? { settings } : {},
+    ...hooks !== void 0 ? { hooks } : {},
+    ...newSessionId !== void 0 ? { newSessionId } : {},
+    ...resumeSessionId !== void 0 ? { resumeSessionId } : {},
+    ...isolated !== void 0 ? { isolated } : {}
   });
+  try {
+    return await session.runTurn({
+      prompt,
+      ...signal !== void 0 ? { signal } : {},
+      ...timeoutMs !== void 0 ? { timeoutMs } : {},
+      ...callbacks
+    });
+  } finally {
+    await session.close();
+  }
 }
 
 // src/run-codex.ts
@@ -2395,6 +2708,7 @@ ${command.stderr}` : command.stdout,
 }
 export {
   AbortError,
+  CLAUDE_INTERRUPT_GRACE_MS,
   CLAUDE_STRIPPED_ENV_VARS,
   CODEX_STRIPPED_ENV_VARS,
   CodexTurnError,
@@ -2403,6 +2717,8 @@ export {
   TimeoutError,
   collectCodexModels,
   contextWindowForModel,
+  createClaudeSession,
+  createClaudeTurnTranslator,
   createCodexAppServerClient,
   createCodexAppServerSession,
   createModelCatalogService,

@@ -1,4 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { accessSync, constants, statSync } from "node:fs";
+import { delimiter, join, resolve as resolvePath } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { AbortError, TimeoutError } from "./errors.js";
 
@@ -249,4 +251,27 @@ export function signalProcessTree(child: ChildProcess, signal: NodeJS.Signals): 
   } catch {
     // The process may already have exited.
   }
+}
+
+/** Resolve a CLI name to an absolute path through `env.PATH`, the way a shell
+ * would; a name that already contains a path separator is checked in place.
+ * Returns undefined when nothing executable is found. Windows names are
+ * returned unchanged — spawn resolves them with PATHEXT there. */
+export function resolveExecutable(name: string, env: NodeJS.ProcessEnv): string | undefined {
+  if (process.platform === "win32") return name;
+  const isExecutable = (candidate: string): boolean => {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (name.includes("/")) return isExecutable(name) ? resolvePath(name) : undefined;
+  for (const dir of (env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    if (isExecutable(candidate)) return candidate;
+  }
+  return undefined;
 }

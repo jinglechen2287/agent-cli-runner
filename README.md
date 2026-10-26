@@ -1,6 +1,6 @@
 # agent-cli-runner
 
-Stream [Claude Code](https://claude.com/claude-code) and [Codex app-server](https://developers.openai.com/codex/app-server) from Node or Bun: session resume, tool events, live usage, and abort/timeout handling — with zero runtime dependencies.
+Stream [Claude Code](https://claude.com/claude-code) and [Codex app-server](https://developers.openai.com/codex/app-server) from Node or Bun: session resume, tool events, live usage, and abort/timeout handling. Claude runs over the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) — the package's runtime dependency, along with the SDK's peers (`zod`, `@anthropic-ai/sdk`, `@modelcontextprotocol/sdk`) — against your installed `claude` binary.
 
 Extracted from two apps that each talked to both CLIs; this package is the shared protocol layer.
 
@@ -65,14 +65,14 @@ interface RunResult {
 
 | Option | Meaning |
 | --- | --- |
-| `prompt`, `cwd` | Required. Prompts never appear in argv: Claude and isolated Codex use stdin; regular Codex turns use app-server JSON-RPC. |
+| `prompt`, `cwd` | Required. Prompts never appear in argv: Claude uses the Agent SDK's stream-json input, isolated Codex uses stdin, and regular Codex turns use app-server JSON-RPC. |
 | `executablePath` | Binary path; defaults to `"claude"` / `"codex"` on `PATH`. |
-| `signal` | `AbortSignal`; Claude and isolated Codex terminate their process tree, while regular Codex sends `turn/interrupt`. Rejects with `AbortError`. |
+| `signal` | `AbortSignal`; Claude and regular Codex interrupt the turn (a Claude session that does not answer within 5 s has its process tree killed), while isolated Codex terminates its process tree. Rejects with `AbortError`. |
 | `timeoutMs` | Optional wall-clock limit using the provider-appropriate interruption path; rejects `TimeoutError`. No timeout by default. |
 | `env` | Base child environment (default `process.env`). Nesting-guard variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ACCESS_TOKEN` for Claude; `CODEX_THREAD_ID` for Codex) are always stripped. |
 | `spawnFn` | Injectable spawn primitive for tests. |
 | `onSessionId`, `onAssistantText`, `onToolUse`, `onToolResult`, `onBackgroundAgentUpdate`, `onUsage`, `onStderr` | Streaming callbacks. Tool uses and results share a provider call ID. Codex app-server items are mapped to shared names (`commandExecution` → `Bash`, `fileChange` → `Edit`, web page operations → `WebFetch`) and plan notifications become normalized `TodoWrite` snapshots. Background subagents emit replace-in-place snapshots keyed by child thread id; their tool events stay in the parent stream, but their prose is excluded from `onAssistantText` (matching the delta stream). Usage snapshots describe the latest request's context occupancy, never cumulative turn totals; isolated Codex runs report the `codex exec` turn summary, which coincides with occupancy on their single-request metadata turns. |
-| `onAssistantTextDelta` | Assistant prose as the model produces it. Opt-in: supplying it adds Claude's `--include-partial-messages` (roughly doubling CLI output) and subscribes to Codex's `item/agentMessage/delta`. Fragments exclude extended thinking, streamed tool input, and background-subagent prose, and concatenate to the next `onAssistantText` message — treat them as scratch state that the completed message supersedes. Not emitted by isolated Codex runs. |
+| `onAssistantTextDelta` | Assistant prose as the model produces it. Claude always streams partial messages and only forwards them when this is supplied; for Codex, supplying it subscribes to `item/agentMessage/delta`. Fragments exclude extended thinking, streamed tool input, and background-subagent prose, and concatenate to the next `onAssistantText` message — treat them as scratch state that the completed message supersedes. Not emitted by isolated Codex runs. |
 
 ### Provider update checks
 
@@ -98,9 +98,28 @@ Checks use five-second command and network timeouts and strip the same provider 
 
 ### Claude-specific
 
-`appendSystemPrompt` (passed on every turn — the CLI rebuilds the system prompt from flags each run), `newSessionId` / `resumeSessionId` (mutually exclusive), and `isolated`.
+`model`, `effort`, `appendSystemPrompt` (appended to the Claude Code system prompt; supply it on every run), `permissionMode`, `tools` (`["default"]` is the full set, `[]` disables every built-in), `allowedTools` (pre-approval only), `disallowedTools`, `settingSources`, `settings`, `hooks` (in-process Agent SDK hook callbacks), `newSessionId` / `resumeSessionId` (mutually exclusive), and `isolated`. `executablePath` is resolved through `PATH` up front, so a missing binary rejects with `MissingCliError`; the SDK's bundled binary is never used.
+
+A hook callback that throws counts as "no opinion" to the CLI, so a guard hook must catch its own errors and return an explicit `deny`.
 
 `isolated: true` is for non-persistent one-shot metadata requests. It requires Claude Code 2.1.169 or newer because it enables `--safe-mode`; it also disables built-in tools and MCP servers and prevents session persistence. It cannot resume a session.
+
+`runClaude` starts a session, runs one turn, and closes it. To keep the CLI up between turns, hold a session instead:
+
+```ts
+import { createClaudeSession } from "agent-cli-runner";
+
+const session = await createClaudeSession({
+  cwd: "/path/to/project",
+  newSessionId: crypto.randomUUID(),
+  tools: ["default"],
+});
+await session.runTurn({ prompt: "Make the button round", onAssistantText: console.log });
+await session.runTurn({ prompt: "Now make it blue" });
+await session.close();
+```
+
+Session settings (model, effort, permission mode, tools, hooks, system prompt, environment) are fixed for the life of the session; open a new one, resuming the same id, to change them. Turns run one at a time. A session closes itself — firing `onClose` — when its process exits, when a turn ends with background tasks still running, or when the CLI produces output between turns.
 
 ### Codex-specific
 

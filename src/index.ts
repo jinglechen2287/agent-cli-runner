@@ -1,5 +1,27 @@
 export { runClaude, CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 export type { ClaudePermissionMode, RunClaudeOptions } from "./run-claude.js";
+export {
+  CLAUDE_INTERRUPT_GRACE_MS,
+  createClaudeSession,
+} from "./claude-session.js";
+export type {
+  ClaudeHooks,
+  ClaudeQuery,
+  ClaudeQueryFn,
+  ClaudeSession,
+  ClaudeSessionTurnOptions,
+  CreateClaudeSessionOptions,
+} from "./claude-session.js";
+export { createClaudeTurnTranslator } from "./claude-messages.js";
+export type { ClaudeTurnOutcome, ClaudeTurnTranslator } from "./claude-messages.js";
+export type {
+  HookCallback as ClaudeHookCallback,
+  HookCallbackMatcher as ClaudeHookCallbackMatcher,
+  HookInput as ClaudeHookInput,
+  HookJSONOutput as ClaudeHookOutput,
+  PreToolUseHookInput as ClaudePreToolUseHookInput,
+  PreToolUseHookSpecificOutput as ClaudePreToolUseHookOutput,
+} from "@anthropic-ai/claude-agent-sdk";
 export { runCodex, CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
 export type { CodexSandboxPolicy, RunCodexOptions } from "./run-codex.js";
 export {

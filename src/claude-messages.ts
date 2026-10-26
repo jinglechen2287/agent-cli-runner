@@ -1,0 +1,559 @@
+import {
+  isRecord,
+  normalizeSummary,
+  planCompletionSummary,
+  safeCallback,
+  toContextWindow,
+  toTokenCount,
+} from "./internal.js";
+import type {
+  AgentCallbacks,
+  BackgroundAgentInfo,
+  BackgroundAgentStatus,
+  ToolPlanItem,
+} from "./types.js";
+import { contextWindowForModel, type TokenUsage } from "./usage.js";
+
+interface ClaudeContentBlock {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+  tool_use_id?: string;
+  content?: unknown;
+  is_error?: boolean;
+}
+
+/** Pull a one-line target out of a Claude tool's `input`: the file it touched,
+ * the command it ran, the pattern it searched, and so on. Returns undefined
+ * for tools whose input has no single meaningful target (e.g. TodoWrite) or
+ * for MCP tools, whose inputs are arbitrary. */
+function summarizeClaudeTool(
+  name: string,
+  input: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!input) return undefined;
+  const str = (key: string): string | undefined => normalizeSummary(input[key]);
+  switch (name) {
+    case "Read":
+    case "Edit":
+    case "MultiEdit":
+    case "Write":
+      return str("file_path");
+    case "NotebookEdit":
+      return str("notebook_path") ?? str("file_path");
+    case "Bash":
+      return str("command");
+    case "Grep":
+    case "Glob":
+      return str("pattern");
+    case "WebFetch":
+      return str("url");
+    case "WebSearch":
+      return str("query");
+    case "Task":
+    case "Agent":
+      return str("description");
+    case "TaskCreate":
+      return str("subject");
+    case "TaskUpdate": {
+      const taskId = str("taskId");
+      const status = str("status")?.replace(/_/g, " ");
+      if (taskId && status) return `Task #${taskId} · ${status}`;
+      return taskId ? `Task #${taskId}` : status;
+    }
+    case "Skill": {
+      const skill = str("skill");
+      const skillArgs = str("args");
+      if (skill && skillArgs) return `${skill} · ${skillArgs}`;
+      return skill;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** Normalize Claude's TodoWrite `todos` array into the shared plan-item shape,
+ * mirroring the Codex plan snapshot so both providers render the same
+ * checklist. A malformed entry invalidates the whole list so consumers never
+ * present a misleading partial plan. */
+function claudeTodoPlanItems(
+  name: string,
+  input: Record<string, unknown> | undefined,
+): ToolPlanItem[] | undefined {
+  if (name !== "TodoWrite" || !input || !Array.isArray(input.todos)) return undefined;
+  const items: ToolPlanItem[] = [];
+  for (const raw of input.todos) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const record = raw as Record<string, unknown>;
+    const text = normalizeSummary(record.content) ?? normalizeSummary(record.activeForm);
+    const status = normalizeSummary(record.status)?.toLowerCase().replace(/\s+/g, "_");
+    if (!text || !status) return undefined;
+    items.push({ text, status });
+  }
+  return items.length > 0 ? items : undefined;
+}
+
+/** The `usage` block on a Claude `assistant` message and the `result` event.
+ * `cache_read_input_tokens` are prior context replayed from cache;
+ * `cache_creation_input_tokens` are tokens written to cache this request. Both
+ * occupy the context window alongside the fresh `input_tokens`. On a message
+ * the counts describe that one request; on `result` they are summed across
+ * every request in the turn, so only a single-request turn's result usage
+ * doubles as an occupancy snapshot. */
+interface ClaudeUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  total_tokens?: number;
+  tool_uses?: number;
+  duration_ms?: number;
+}
+
+/** Per-model rollup on the `result` event. Claude bills each model it used in
+ * the turn (a turn may spend a small sub-agent model too) and, crucially,
+ * reports each model's `contextWindow` here — the authoritative window size.
+ * Straight out of JSON.parse, so fields are unvalidated until read. */
+interface ClaudeModelUsage {
+  contextWindow?: unknown;
+}
+
+/** One `stream_event` payload from `--include-partial-messages`. The CLI wraps
+ * the raw Anthropic streaming event, so `content_block_delta` carries the same
+ * `delta` union the API uses — text, extended thinking, its signature, or a
+ * tool's streamed input JSON. */
+interface ClaudeStreamEvent {
+  type?: string;
+  delta?: { type?: string; text?: string };
+}
+
+interface StreamLine {
+  type?: string;
+  subtype?: string;
+  session_id?: string;
+  /** On the `init` line: the session's model, variant marker included. */
+  model?: string;
+  event?: ClaudeStreamEvent;
+  /** Set on lines produced by a background subagent, naming the tool call that
+   * spawned it. Null/absent on the parent turn's own output. */
+  parent_tool_use_id?: string | null;
+  result?: string;
+  /** On `result`: set when the turn failed (an error subtype, or an API
+   * error the CLI reported as the success subtype's text). */
+  is_error?: boolean;
+  /** On an error `result`: the CLI's error messages. */
+  errors?: unknown;
+  /** On `task_notification`: the task's terminal state. */
+  status?: string;
+  message?: { content?: ClaudeContentBlock[]; usage?: ClaudeUsage; model?: string };
+  usage?: ClaudeUsage;
+  modelUsage?: Record<string, ClaudeModelUsage>;
+  task_id?: string;
+  tool_use_id?: string;
+  description?: string;
+  task_type?: string;
+  subagent_type?: string;
+  last_tool_name?: string;
+  summary?: string;
+  patch?: {
+    status?: string;
+    description?: string;
+    end_time?: number;
+    error?: string;
+  };
+}
+
+function claudeBackgroundAgentStatus(status: string | undefined): BackgroundAgentStatus | undefined {
+  switch (status) {
+    case "pending":
+    case "running":
+    case "completed":
+    case "failed":
+      return status;
+    case "killed":
+      return "interrupted";
+    default:
+      return undefined;
+  }
+}
+
+/** Normalize a Claude usage block into the shared shape. Context occupancy is
+ * fresh input plus both cache lanes; only cache *reads* count as "cached". */
+function toClaudeUsage(
+  usage: ClaudeUsage,
+  model: string | undefined,
+  contextWindow: number | undefined,
+): TokenUsage {
+  const input = toTokenCount(usage.input_tokens);
+  const cacheRead = toTokenCount(usage.cache_read_input_tokens);
+  const cacheCreation = toTokenCount(usage.cache_creation_input_tokens);
+  return {
+    contextTokens: input + cacheRead + cacheCreation,
+    inputTokens: input,
+    cachedInputTokens: cacheRead,
+    outputTokens: toTokenCount(usage.output_tokens),
+    ...(model ? { model } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
+}
+
+/** Drop a Claude model id's `[...]` variant marker so `claude-opus-4-8` (from
+ * an assistant message) matches `claude-opus-4-8[1m]` (a modelUsage key). */
+function baseModelId(model: string): string {
+  return model.replace(/\[[^\]]*\]$/, "");
+}
+
+/** Restore the variant marker an assistant message dropped. Claude Code names
+ * the qualified model (`claude-opus-4-8[1m]`) once, on the init line, and
+ * reports the bare id on every assistant message — and that marker is the only
+ * thing that tells a 1M session apart from the 200k default, so guessing the
+ * live window from the bare id reads a 1M turn as 200k until the result event
+ * corrects it. Only the same base model inherits the marker: a sub-agent or a
+ * mid-turn switch keeps its own id. */
+function qualifyModel(
+  model: string | undefined,
+  sessionModel: string | undefined,
+): string | undefined {
+  if (!model) return sessionModel;
+  if (!sessionModel) return model;
+  return baseModelId(sessionModel) === baseModelId(model) ? sessionModel : model;
+}
+
+/** Pick the turn's main model from the `result` event's per-model rollup: the
+ * one that produced the final assistant message when identifiable, else the one
+ * with the largest context window (a sub-agent model has a smaller window). */
+function pickPrimaryModel(
+  modelUsage: Record<string, ClaudeModelUsage> | undefined,
+  preferred: string | undefined,
+): { model: string; contextWindow: number | undefined } | undefined {
+  if (!modelUsage) return undefined;
+  const entries = Object.entries(modelUsage);
+  if (entries.length === 0) return undefined;
+  if (preferred) {
+    const base = baseModelId(preferred);
+    const match = entries.find(([key]) => baseModelId(key) === base);
+    if (match) return { model: match[0], contextWindow: toContextWindow(match[1].contextWindow) };
+  }
+  let best = entries[0]!;
+  for (const entry of entries) {
+    if ((toContextWindow(entry[1].contextWindow) ?? 0) > (toContextWindow(best[1].contextWindow) ?? 0)) {
+      best = entry;
+    }
+  }
+  return { model: best[0], contextWindow: toContextWindow(best[1].contextWindow) };
+}
+
+function isTerminalTaskStatus(status: string | undefined): boolean {
+  return status === "completed"
+    || status === "failed"
+    || status === "stopped"
+    || status === "killed";
+}
+
+/** What a Claude turn produced once its `result` arrived (or the stream ended
+ * without one). */
+export interface ClaudeTurnOutcome {
+  /** The result text, else the last parent assistant message, trimmed. */
+  text: string;
+  sessionId?: string;
+  usage?: TokenUsage;
+  /** The `result` reported a failed turn. */
+  isError: boolean;
+  /** The error `result`'s messages, when it carried any. */
+  errors: string[];
+}
+
+export interface ClaudeTurnTranslator {
+  /** Feed one stream-json message (a CLI stdout line or an SDK message). */
+  handle(message: unknown): void;
+  /** True once the turn's `result` has arrived. */
+  readonly done: boolean;
+  /** Tasks (background Bash, Monitor, subagents) started this turn that have
+   * not settled yet. */
+  readonly liveTaskIds: ReadonlySet<string>;
+  finish(): ClaudeTurnOutcome;
+}
+
+/** Translate one Claude turn's stream-json messages into host callbacks. One
+ * translator per turn: session-id deduplication, usage attribution, and task
+ * tracking are all scoped to it. */
+export function createClaudeTurnTranslator(callbacks: AgentCallbacks): ClaudeTurnTranslator {
+  let done = false;
+  let isError = false;
+  let errors: string[] = [];
+  let sessionId: string | undefined;
+  let sessionIdEmitted = false;
+  let lastAssistantText: string | undefined;
+  let resultText: string | undefined;
+  let lastAssistantModel: string | undefined;
+  /** The init line's fully-qualified model id, variant marker included. */
+  let sessionModel: string | undefined;
+  let lastMessageUsage: ClaudeUsage | undefined;
+  let lastUsage: TokenUsage | undefined;
+  const agentToolCallIds = new Set<string>();
+  const backgroundAgents = new Map<string, BackgroundAgentInfo>();
+  const liveTaskIds = new Set<string>();
+
+  const emitBackgroundAgent = (agent: BackgroundAgentInfo): void => {
+    backgroundAgents.set(agent.id, agent);
+    safeCallback(() => callbacks.onBackgroundAgentUpdate?.(agent));
+  };
+
+  const emitUsage = (usage: TokenUsage): void => {
+    lastUsage = usage;
+    safeCallback(() => callbacks.onUsage?.(usage));
+  };
+
+  const emitSessionId = (id: string): void => {
+    sessionId = id;
+    if (sessionIdEmitted) return;
+    sessionIdEmitted = true;
+    safeCallback(() => callbacks.onSessionId?.(id));
+  };
+
+const handle = (message: unknown): void => {
+  if (!isRecord(message)) return;
+  const parsed = message as StreamLine;
+    // Checked first: with --include-partial-messages these outnumber every
+    // other line type by an order of magnitude.
+    if (parsed.type === "stream_event") {
+      // Subagent prose streams through the parent's stdout tagged with the
+      // spawning tool call — it belongs to that agent, not this transcript.
+      if (parsed.parent_tool_use_id) return;
+      const delta = parsed.event?.type === "content_block_delta"
+        ? parsed.event.delta
+        : undefined;
+      if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+        const text = delta.text;
+        safeCallback(() => callbacks.onAssistantTextDelta?.(text));
+      }
+      return;
+    }
+    if (parsed.type === "system" && parsed.subtype === "init") {
+      if (typeof parsed.model === "string" && parsed.model) sessionModel = parsed.model;
+      if (parsed.session_id) emitSessionId(parsed.session_id);
+      return;
+    }
+    if (
+      parsed.type === "system"
+      && parsed.subtype === "task_started"
+      && typeof parsed.task_id === "string"
+    ) {
+      // Every task — a background Bash or Monitor as much as a subagent — is
+      // live until it settles, so the host can tell a turn that leaves work
+      // running behind it.
+      liveTaskIds.add(parsed.task_id);
+      const isAgent = parsed.task_type === "local_agent"
+        || parsed.task_type === "remote_agent"
+        || (typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id));
+      if (!isAgent) return;
+      const now = Date.now();
+      emitBackgroundAgent({
+        id: parsed.task_id,
+        provider: "claude",
+        ...(typeof parsed.tool_use_id === "string"
+          ? { parentToolCallId: parsed.tool_use_id }
+          : {}),
+        ...(typeof parsed.description === "string"
+          ? { description: parsed.description }
+          : {}),
+        ...(typeof parsed.task_type === "string" ? { agentType: parsed.task_type } : {}),
+        status: "running",
+        startedAt: now,
+        updatedAt: now,
+      });
+      return;
+    }
+    if (
+      parsed.type === "system"
+      && parsed.subtype === "task_progress"
+      && typeof parsed.task_id === "string"
+    ) {
+      const current = backgroundAgents.get(parsed.task_id);
+      if (!current) return;
+      const usage = parsed.usage;
+      const progress = {
+        ...(current.progress ?? {}),
+        ...(typeof usage?.total_tokens === "number" ? { totalTokens: usage.total_tokens } : {}),
+        ...(typeof usage?.tool_uses === "number" ? { toolUses: usage.tool_uses } : {}),
+        ...(typeof usage?.duration_ms === "number" ? { durationMs: usage.duration_ms } : {}),
+        ...(typeof parsed.last_tool_name === "string"
+          ? { lastToolName: parsed.last_tool_name }
+          : {}),
+      };
+      emitBackgroundAgent({
+        ...current,
+        ...(typeof parsed.tool_use_id === "string"
+          ? { parentToolCallId: parsed.tool_use_id }
+          : {}),
+        ...(typeof parsed.description === "string"
+          ? { description: parsed.description }
+          : {}),
+        ...(typeof parsed.subagent_type === "string"
+          ? { agentType: parsed.subagent_type }
+          : {}),
+        ...(typeof parsed.summary === "string" ? { summary: parsed.summary } : {}),
+        ...(Object.keys(progress).length > 0 ? { progress } : {}),
+        // A trailing progress rollup can arrive after the terminal
+        // task_updated; it must not resurrect a finished agent.
+        status: current.status === "completed"
+          || current.status === "failed"
+          || current.status === "interrupted"
+          ? current.status
+          : "running",
+        updatedAt: Date.now(),
+      });
+      return;
+    }
+    if (
+      parsed.type === "system"
+      && parsed.subtype === "task_updated"
+      && typeof parsed.task_id === "string"
+    ) {
+      if (isTerminalTaskStatus(parsed.patch?.status)) liveTaskIds.delete(parsed.task_id);
+      const current = backgroundAgents.get(parsed.task_id);
+      if (!current || !parsed.patch) return;
+      const status = claudeBackgroundAgentStatus(parsed.patch.status) ?? current.status;
+      const now = Date.now();
+      emitBackgroundAgent({
+        ...current,
+        ...(typeof parsed.patch.description === "string"
+          ? { description: parsed.patch.description }
+          : {}),
+        ...(typeof parsed.patch.error === "string" ? { error: parsed.patch.error } : {}),
+        status,
+        updatedAt: now,
+        ...((status === "completed" || status === "failed" || status === "interrupted")
+          ? {
+              endedAt: current.endedAt
+                ?? (typeof parsed.patch.end_time === "number" ? parsed.patch.end_time : now),
+            }
+          : {}),
+      });
+      return;
+    }
+    if (
+      parsed.type === "system"
+      && parsed.subtype === "task_notification"
+      && typeof parsed.task_id === "string"
+    ) {
+      if (isTerminalTaskStatus(parsed.status)) liveTaskIds.delete(parsed.task_id);
+      return;
+    }
+    if (parsed.type === "assistant" && parsed.message?.content) {
+      const texts: string[] = [];
+      for (const block of parsed.message.content) {
+        if (block.type === "text" && typeof block.text === "string") {
+          texts.push(block.text);
+        } else if (block.type === "tool_use" && typeof block.name === "string") {
+          if (
+            (block.name === "Agent" || block.name === "Task")
+            && typeof block.id === "string"
+          ) {
+            agentToolCallIds.add(block.id);
+          }
+          const planItems = claudeTodoPlanItems(block.name, block.input);
+          const summary = planItems
+            ? planCompletionSummary(planItems)
+            : summarizeClaudeTool(block.name, block.input);
+          const info = {
+            ...(typeof block.id === "string" ? { callId: block.id } : {}),
+            name: block.name,
+            ...(summary !== undefined ? { summary } : {}),
+            ...(block.input ? { input: block.input } : {}),
+            ...(planItems ? { planItems } : {}),
+          };
+          safeCallback(() => callbacks.onToolUse?.(info));
+        }
+      }
+      // Subagent prose belongs to the subagent, not this transcript —
+      // matching the delta stream, which drops subagent fragments, so
+      // fragments always concatenate to the next completed message. Its
+      // tool calls above still belong in the parent transcript.
+      if (texts.length > 0 && !parsed.parent_tool_use_id) {
+        const text = texts.join("");
+        lastAssistantText = text;
+        safeCallback(() => callbacks.onAssistantText?.(text));
+      }
+      // A subagent also runs on its own context window; its usage says
+      // nothing about how full this turn's is.
+      if (parsed.parent_tool_use_id) return;
+      const model = qualifyModel(parsed.message.model, sessionModel);
+      // Track the responding model even on messages without usage, so the
+      // result event can attribute usage to it rather than the largest-window
+      // model in a multi-model turn.
+      if (model) lastAssistantModel = model;
+      if (parsed.message.usage) {
+        // Live window is a best-effort guess from the model id; the `result`
+        // event corrects it with the authoritative modelUsage window.
+        lastMessageUsage = parsed.message.usage;
+        emitUsage(
+          toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model)),
+        );
+      }
+      return;
+    }
+    if (parsed.type === "user" && parsed.message?.content) {
+      for (const block of parsed.message.content) {
+        if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
+          continue;
+        }
+        const result = {
+          callId: block.tool_use_id,
+          content: block.content,
+          ...(typeof block.is_error === "boolean" ? { isError: block.is_error } : {}),
+        };
+        safeCallback(() => callbacks.onToolResult?.(result));
+      }
+      return;
+    }
+    if (parsed.type === "result") {
+      done = true;
+      if (parsed.session_id) emitSessionId(parsed.session_id);
+      if (typeof parsed.result === "string") resultText = parsed.result;
+      isError = parsed.is_error === true
+        || (typeof parsed.subtype === "string" && parsed.subtype !== "success");
+      if (Array.isArray(parsed.errors)) {
+        errors = parsed.errors.filter((entry): entry is string => typeof entry === "string");
+      }
+      // The result event's usage sums every request in the turn, so it does
+      // not describe context occupancy on a multi-request turn — the last
+      // per-message usage does. Take only the authoritative model/window
+      // from here, falling back to the summed counts when no message carried
+      // usage (then the turn had a single request and they coincide).
+      const occupancy = lastMessageUsage ?? parsed.usage;
+      if (occupancy) {
+        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel);
+        const model = primary?.model ?? lastAssistantModel;
+        const contextWindow =
+          primary?.contextWindow ?? contextWindowForModel(model);
+        emitUsage(toClaudeUsage(occupancy, model, contextWindow));
+      }
+    }
+  };
+
+
+  return {
+    handle,
+    get done() {
+      return done;
+    },
+    liveTaskIds,
+    finish(): ClaudeTurnOutcome {
+      // An error result carries its reasons in `errors`, not `result`; the
+      // last assistant message would read as if the turn had succeeded.
+      const text = isError && errors.length > 0
+        ? errors.join("\n")
+        : resultText ?? lastAssistantText ?? "";
+      return {
+        text: text.trim(),
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(lastUsage !== undefined ? { usage: lastUsage } : {}),
+        isError,
+        errors,
+      };
+    },
+  };
+}
