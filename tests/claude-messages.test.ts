@@ -958,6 +958,59 @@ describe("createClaudeTurnTranslator prompt correlation", () => {
   });
 });
 
+describe("createClaudeTurnTranslator expected user messages", () => {
+  const named = (text: string, uuids: string[]) => ({
+    type: "result",
+    subtype: "success",
+    result: text,
+    session_id: "s",
+    user_message_uuids: uuids,
+  });
+
+  it("is done once one result answers the prompt and the steer together", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.expectUserMessage("u2");
+    t.handle(named("both", ["u1", "u2"]));
+    expect(t.done).toBe(true);
+    expect(t.finish().text).toBe("both");
+  });
+
+  it("waits for the steer's own result after the prompt's", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.expectUserMessage("u2");
+    t.handle(named("first", ["u1"]));
+    expect(t.resultSeen).toBe(true);
+    expect(t.done).toBe(false);
+    // Owed a reply, so a silent CLI is timed out like a subagent follow-up.
+    expect(t.awaitingFollowUp).toBe(true);
+    t.handle(named("second", ["u2"]));
+    expect(t.done).toBe(true);
+    expect(t.finish().text).toBe("second");
+  });
+
+  it("counts a result naming the steer as answering the prompt before it", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.expectUserMessage("u2");
+    t.handle({ type: "result", subtype: "success", result: "batched", session_id: "s", user_message_uuid: "u2" });
+    expect(t.done).toBe(true);
+  });
+
+  it("still ignores a result naming neither the prompt nor a steer", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.expectUserMessage("u2");
+    t.handle(named("not mine", ["u0"]));
+    expect(t.resultSeen).toBe(false);
+  });
+
+  it("lets an un-echoed result answer every steer when the CLI does not echo", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.expectUserMessage("u2");
+    t.handle({ type: "assistant", message: { content: [{ type: "text", text: "both" }] } });
+    t.handle({ type: "result", subtype: "success", result: "both", session_id: "s" });
+    expect(t.done).toBe(true);
+  });
+});
+
 describe("createClaudeTurnTranslator error results", () => {
   it("reports an error result's messages rather than earlier assistant text", () => {
     const t = feed({}, [

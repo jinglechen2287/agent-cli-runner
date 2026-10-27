@@ -9,6 +9,7 @@ import {
   createClaudeSession,
   MissingCliError,
   runClaude,
+  SteerRejectedError,
   TimeoutError,
   type ClaudeQuery,
   type ClaudeQueryFn,
@@ -26,6 +27,8 @@ interface FakeQuery {
   prompts: string[];
   /** The uuid stamped on each prompt the session sent, in order. */
   uuids: Array<string | undefined>;
+  /** The priority on each prompt the session sent, in order. */
+  priorities: Array<string | undefined>;
   /** Resolves once the session has sent its nth prompt (1-based). */
   waitForPrompt(count: number): Promise<void>;
   emit(message: unknown): void;
@@ -45,6 +48,7 @@ function makeFakeQuery(): FakeQuery {
   let captured: Parameters<ClaudeQueryFn>[0] | undefined;
   const prompts: string[] = [];
   const uuids: Array<string | undefined> = [];
+  const priorities: Array<string | undefined> = [];
   const promptWaiters: Array<{ count: number; resolve: () => void }> = [];
   const notify = (): void => {
     wake?.();
@@ -53,6 +57,7 @@ function makeFakeQuery(): FakeQuery {
   const fake: FakeQuery = {
     prompts,
     uuids,
+    priorities,
     interrupt: vi.fn(async () => undefined),
     close: vi.fn(() => {
       ended = true;
@@ -65,6 +70,7 @@ function makeFakeQuery(): FakeQuery {
           const content = message.message.content;
           prompts.push(typeof content === "string" ? content : JSON.stringify(content));
           uuids.push(message.uuid);
+          priorities.push(message.priority);
           for (const waiter of [...promptWaiters]) {
             if (prompts.length >= waiter.count) {
               promptWaiters.splice(promptWaiters.indexOf(waiter), 1);
@@ -461,6 +467,99 @@ describe("createClaudeSession", () => {
     const late = vi.fn();
     session.onClose(late);
     expect(late).toHaveBeenCalledWith(expect.objectContaining({ message: "Claude session closed" }));
+  });
+});
+
+describe("ClaudeSession.steer", () => {
+  it("sends the steer into the running turn, to be read at the next tool round", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.runTurn({ prompt: "do the thing" });
+    await fake.waitForPrompt(1);
+    await session.steer({ prompt: "also do this" });
+    await fake.waitForPrompt(2);
+    expect(fake.prompts).toEqual(["do the thing", "also do this"]);
+    expect(fake.priorities).toEqual([undefined, "next"]);
+    expect(fake.uuids[1]).toEqual(expect.any(String));
+    expect(fake.uuids[1]).not.toBe(fake.uuids[0]);
+    fake.emit(result("done", { user_message_uuids: [fake.uuids[0], fake.uuids[1]] }));
+    await expect(turn).resolves.toMatchObject({ text: "done", exitCode: 0 });
+  });
+
+  it("holds the turn for a steer the CLI runs as its own turn", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    let settled = false;
+    const turn = session.runTurn({ prompt: "do the thing" });
+    void turn.then(() => {
+      settled = true;
+    });
+    await fake.waitForPrompt(1);
+    await session.steer({ prompt: "also do this" });
+    await fake.waitForPrompt(2);
+    const [promptUuid, steerUuid] = fake.uuids;
+    fake.emit(assistant("first answer"));
+    fake.emit(result("first answer", { user_message_uuids: [promptUuid] }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    // The steer's own reply arrives while the turn is still open, so it is
+    // not mistaken for output between turns.
+    fake.emit(assistant("steered answer"));
+    fake.emit(result("steered answer", { user_message_uuids: [steerUuid] }));
+    await expect(turn).resolves.toMatchObject({ text: "steered answer", exitCode: 0 });
+    expect(session.closed).toBe(false);
+  });
+
+  it("settles on one result that names only the steer, the last of the batch", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.runTurn({ prompt: "do the thing" });
+    await fake.waitForPrompt(1);
+    await session.steer({ prompt: "also do this" });
+    await fake.waitForPrompt(2);
+    fake.emit(result("both done", { user_message_uuid: fake.uuids[1] }));
+    await expect(turn).resolves.toMatchObject({ text: "both done" });
+  });
+
+  it("rejects a steer with no turn running", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    await expect(session.steer({ prompt: "hello" })).rejects.toBeInstanceOf(SteerRejectedError);
+  });
+
+  it("rejects a steer once the turn's result has arrived", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.runTurn({ prompt: "research" });
+    await fake.waitForPrompt(1);
+    // A live subagent holds the turn open past its result.
+    fake.emit({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    fake.emit(result("launched", { user_message_uuids: [fake.uuids[0]] }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await expect(session.steer({ prompt: "too late" })).rejects.toBeInstanceOf(SteerRejectedError);
+    expect(fake.prompts).toEqual(["research"]);
+    fake.emit({ type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" });
+    fake.emit(result("all done"));
+    await expect(turn).resolves.toMatchObject({ text: "all done" });
+  });
+
+  it("rejects a steer while the turn is being interrupted", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const controller = new AbortController();
+    const turn = session.runTurn({ prompt: "one", signal: controller.signal });
+    await fake.waitForPrompt(1);
+    controller.abort();
+    await expect(session.steer({ prompt: "two" })).rejects.toBeInstanceOf(SteerRejectedError);
+    fake.emit(result("stopped", { subtype: "error_during_execution", is_error: true }));
+    await expect(turn).rejects.toBeInstanceOf(AbortError);
+  });
+
+  it("rejects a steer after the session closed", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    await session.close();
+    await expect(session.steer({ prompt: "hello" })).rejects.toBeInstanceOf(SteerRejectedError);
   });
 });
 

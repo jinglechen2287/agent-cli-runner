@@ -283,14 +283,20 @@ export interface ClaudeTurnOutcome {
 export interface ClaudeTurnTranslator {
   /** Feed one stream-json message (a CLI stdout line or an SDK message). */
   handle(message: unknown): void;
-  /** True once the turn's own `result` has arrived and no subagent it started
-   * is still owed a follow-up: every live one has settled and the CLI has
-   * answered its notification with a further `result`. */
+  /** A further user message (a steer) was sent into this turn under `uuid`;
+   * a `result` naming it is the turn's own, and the turn is not done until
+   * one has answered it. */
+  expectUserMessage(uuid: string): void;
+  /** True once the turn's own `result` has arrived, every steer has been
+   * answered, and no subagent it started is still owed a follow-up: every
+   * live one has settled and the CLI has answered its notification with a
+   * further `result`. */
   readonly done: boolean;
   /** The turn's own `result` has arrived, whether or not it is done. */
   readonly resultSeen: boolean;
-  /** Every subagent has settled since the turn's own `result`, but the CLI
-   * has not yet answered with a follow-up `result`. */
+  /** The turn's own `result` is in and every subagent has settled, but the
+   * CLI still owes a `result`: the answer to a subagent's notification, or to
+   * a steer it took up as a turn of its own. */
   readonly awaitingFollowUp: boolean;
   /** A `result` this turn named the prompts it answers, so the CLI echoes
    * prompt uuids. */
@@ -333,6 +339,12 @@ export function createClaudeTurnTranslator(
   options: ClaudeTurnTranslatorOptions = {},
 ): ClaudeTurnTranslator {
   const { promptUuid } = options;
+  /** The prompt, then every steer, in the order the CLI received them. */
+  const expected: string[] = promptUuid !== undefined ? [promptUuid] : [];
+  /** How many of {@link expected} some `result` has answered. A result that
+   * names one answers everything sent before it too: a CLI that names only
+   * the last message of a batch still covers the batch. */
+  let answeredCount = 0;
   let resultSeen = false;
   /** A subagent settled after the turn's result; the CLI's answer to its
    * notification is still to come. */
@@ -368,7 +380,7 @@ export function createClaudeTurnTranslator(
   const isForeignResult = (parsed: StreamLine): boolean => {
     if (promptUuid === undefined) return false;
     const named = namedPromptUuids(parsed);
-    if (named) return !named.includes(promptUuid);
+    if (named) return !named.some((uuid) => expected.includes(uuid));
     if (resultSeen) return false;
     if (options.cliEchoesPromptUuid || echoedPromptUuid) return true;
     // A CLI that does not echo: an empty success before the prompt produced
@@ -600,6 +612,17 @@ const handle = (message: unknown): void => {
       const followUp = resultSeen;
       resultSeen = true;
       followUpPending = false;
+      const named = namedPromptUuids(parsed);
+      if (named) {
+        const last = Math.max(...named.map((uuid) => expected.indexOf(uuid)));
+        answeredCount = Math.max(answeredCount, last + 1);
+      } else if (options.cliEchoesPromptUuid || echoedPromptUuid) {
+        // An echoing CLI names what it answers; this one answers a subagent's
+        // notification, which leaves any steer still owed.
+        answeredCount = Math.max(answeredCount, 1);
+      } else {
+        answeredCount = expected.length;
+      }
       if (parsed.session_id) emitSessionId(parsed.session_id);
       if (typeof parsed.result === "string" && (!followUp || parsed.result)) {
         resultText = parsed.result;
@@ -632,16 +655,21 @@ const handle = (message: unknown): void => {
   };
 
 
+  const allAnswered = (): boolean => answeredCount >= expected.length;
+
   return {
     handle,
+    expectUserMessage(uuid: string) {
+      expected.push(uuid);
+    },
     get done() {
-      return resultSeen && liveAgentTaskIds.size === 0 && !followUpPending;
+      return resultSeen && allAnswered() && liveAgentTaskIds.size === 0 && !followUpPending;
     },
     get resultSeen() {
       return resultSeen;
     },
     get awaitingFollowUp() {
-      return resultSeen && liveAgentTaskIds.size === 0 && followUpPending;
+      return resultSeen && liveAgentTaskIds.size === 0 && (followUpPending || !allAnswered());
     },
     get echoedPromptUuid() {
       return echoedPromptUuid;

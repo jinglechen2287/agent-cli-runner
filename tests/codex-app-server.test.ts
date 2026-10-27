@@ -5,6 +5,7 @@ import {
   createCodexAppServerClient,
   createCodexAppServerSession,
   runCodex,
+  SteerRejectedError,
   type CodexAppServerSession,
 } from "../src/index.js";
 
@@ -1122,6 +1123,7 @@ describe("Codex app-server runner", () => {
       cwd: "/tmp/bound",
       closed: false,
       runTurn,
+      steer: async () => {},
       onClose: () => () => {},
       close: async () => {},
     };
@@ -2018,5 +2020,158 @@ describe("Codex app-server turn attribution", () => {
       cwd: "/tmp",
       spawnFn: (() => child) as never,
     })).resolves.toMatchObject({ exitCode: 1, sessionId: "thread-1" });
+  });
+});
+
+describe("CodexAppServerSession.steer", () => {
+  /** A session whose turn stays in progress until the test completes it. */
+  async function steerableSession(options: {
+    holdAck?: boolean;
+    startError?: { code: number; message: string };
+    steerError?: { code: number; message: string };
+  } = {}) {
+    const child = makeFakeChild();
+    let ackTurn: (() => void) | undefined;
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-steer" } } });
+      } else if (message.method === "turn/start") {
+        ackTurn = () => send(child, options.startError
+          ? { id: message.id, error: options.startError }
+          : { id: message.id, result: { turn: completedTurn("turn-1", "inProgress") } });
+        if (!options.holdAck) ackTurn();
+      } else if (message.method === "turn/steer") {
+        if (options.steerError) {
+          send(child, { id: message.id, error: options.steerError });
+        } else {
+          send(child, { id: message.id, result: { turnId: "turn-1" } });
+        }
+      }
+    });
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      spawnFn: (() => child) as never,
+    });
+    const complete = (): void => {
+      send(child, {
+        method: "item/completed",
+        params: {
+          threadId: "thread-steer",
+          turnId: "turn-1",
+          item: { type: "agentMessage", id: "m1", text: "Done" },
+        },
+      });
+      send(child, {
+        method: "turn/completed",
+        params: { threadId: "thread-steer", turn: completedTurn("turn-1") },
+      });
+    };
+    const waitForRequest = (method: string) =>
+      vi.waitFor(() => {
+        const found = requests.find((request) => request.method === method);
+        if (!found) throw new Error(`no ${method} yet`);
+        return found;
+      });
+    const close = async (): Promise<void> => {
+      const closing = session.close();
+      child.emit("close", 0);
+      await closing;
+    };
+    return { child, session, requests, complete, waitForRequest, close, ack: () => ackTurn?.() };
+  }
+
+  it("steers the running turn with the expected turn id", async () => {
+    const { session, complete, waitForRequest, child, close } = await steerableSession();
+    const onToolUse = vi.fn();
+    const onAssistantText = vi.fn();
+    const turn = session.runTurn({ prompt: "one", onToolUse, onAssistantText });
+    await waitForRequest("turn/start");
+    await session.steer({ prompt: "also two" });
+    const steer = await waitForRequest("turn/steer");
+    expect(steer.params).toEqual({
+      threadId: "thread-steer",
+      expectedTurnId: "turn-1",
+      input: [{ type: "text", text: "also two", text_elements: [] }],
+    });
+    // The steered input comes back as a userMessage item; it is the user's
+    // words, not a tool call or a reply.
+    send(child, {
+      method: "item/completed",
+      params: {
+        threadId: "thread-steer",
+        turnId: "turn-1",
+        item: { type: "userMessage", id: "u2", clientId: null, content: [{ type: "text", text: "also two", text_elements: [] }] },
+      },
+    });
+    complete();
+    await expect(turn).resolves.toMatchObject({ text: "Done" });
+    expect(onToolUse).not.toHaveBeenCalled();
+    expect(onAssistantText).toHaveBeenCalledTimes(1);
+    await close();
+  });
+
+  it("waits for the turn id before steering", async () => {
+    const { session, requests, complete, waitForRequest, ack, close } = await steerableSession({ holdAck: true });
+    const turn = session.runTurn({ prompt: "one" });
+    await waitForRequest("turn/start");
+    const steered = session.steer({ prompt: "early" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(requests.some((request) => request.method === "turn/steer")).toBe(false);
+    ack();
+    await steered;
+    expect((await waitForRequest("turn/steer")).params).toMatchObject({ expectedTurnId: "turn-1" });
+    complete();
+    await turn;
+    await close();
+  });
+
+  it("rejects a steer the app-server refuses", async () => {
+    const { session, complete, waitForRequest, close } = await steerableSession({
+      steerError: { code: -32600, message: "no active turn to steer" },
+    });
+    const turn = session.runTurn({ prompt: "one" });
+    await waitForRequest("turn/start");
+    await expect(session.steer({ prompt: "late" })).rejects.toBeInstanceOf(SteerRejectedError);
+    complete();
+    await turn;
+    await close();
+  });
+
+  it("rejects a steer with no turn running", async () => {
+    const { session, complete, waitForRequest, close } = await steerableSession();
+    await expect(session.steer({ prompt: "hello" })).rejects.toBeInstanceOf(SteerRejectedError);
+    const turn = session.runTurn({ prompt: "one" });
+    await waitForRequest("turn/start");
+    complete();
+    await turn;
+    await expect(session.steer({ prompt: "after" })).rejects.toBeInstanceOf(SteerRejectedError);
+    await close();
+  });
+
+  it("rejects a steer waiting on a turn whose start the app-server refuses", async () => {
+    const { session, waitForRequest, ack, close } = await steerableSession({
+      holdAck: true,
+      startError: { code: -32602, message: "unknown model" },
+    });
+    const turn = session.runTurn({ prompt: "one" });
+    await waitForRequest("turn/start");
+    const steered = session.steer({ prompt: "early" });
+    ack();
+    await expect(turn).rejects.toThrow("unknown model");
+    await expect(steered).rejects.toBeInstanceOf(SteerRejectedError);
+    await close();
+  });
+
+  it("rejects a steer waiting on a turn that settles without an id", async () => {
+    const { session, child, waitForRequest, close } = await steerableSession({ holdAck: true });
+    const turn = session.runTurn({ prompt: "one" });
+    await waitForRequest("turn/start");
+    const steered = session.steer({ prompt: "early" });
+    send(child, { method: "error", params: { threadId: "thread-steer", error: { message: "boom" } } });
+    await expect(turn).rejects.toThrow("boom");
+    await expect(steered).rejects.toBeInstanceOf(SteerRejectedError);
+    await close();
   });
 });

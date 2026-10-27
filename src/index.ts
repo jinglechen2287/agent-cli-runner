@@ -10,6 +10,7 @@ export type {
   ClaudeQuery,
   ClaudeQueryFn,
   ClaudeSession,
+  ClaudeSessionSteerOptions,
   ClaudeSessionTurnOptions,
   CreateClaudeSessionOptions,
 } from "./claude-session.js";
@@ -36,6 +37,7 @@ export {
 export type {
   CodexAppServerClient,
   CodexAppServerSession,
+  CodexAppServerSteerOptions,
   CodexAppServerTurnOptions,
   CodexServerRequest,
   CodexServerRequestHandler,
@@ -46,6 +48,7 @@ export {
   AbortError,
   CodexTurnError,
   MissingCliError,
+  SteerRejectedError,
   TimeoutError,
 } from "./errors.js";
 export type {

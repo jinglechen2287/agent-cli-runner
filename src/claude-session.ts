@@ -11,7 +11,7 @@ import {
   type SpawnOptions as SdkSpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createClaudeTurnTranslator, type ClaudeTurnTranslator } from "./claude-messages.js";
-import { AbortError, MissingCliError, TimeoutError } from "./errors.js";
+import { AbortError, MissingCliError, SteerRejectedError, TimeoutError } from "./errors.js";
 import {
   createChunkDecoder,
   filterEnv,
@@ -123,6 +123,11 @@ export type ClaudeSessionTurnOptions = AgentCallbacks & {
   timeoutMs?: number;
 };
 
+export interface ClaudeSessionSteerOptions {
+  /** More input for the running turn, as the user would type it mid-turn. */
+  prompt: string;
+}
+
 export interface ClaudeSession {
   /** The Claude session id: the pre-assigned or resumed id. */
   readonly sessionId: string;
@@ -130,6 +135,12 @@ export interface ClaudeSession {
   readonly closed: boolean;
   /** Run one turn. Rejects when another turn is active or the session is closed. */
   runTurn(options: ClaudeSessionTurnOptions): Promise<RunResult>;
+  /** Hand more input to the running turn. The CLI reads it at the turn's next
+   * tool round, or answers it as a turn of its own right after — either way
+   * the running turn settles only once it is answered. Rejects with a
+   * {@link SteerRejectedError} when no turn is running or the turn is past
+   * taking more: interrupted, or its result already in. */
+  steer(options: ClaudeSessionSteerOptions): Promise<void>;
   /** Called once, with the reason, when the session closes for any reason. */
   onClose(handler: (error: Error) => void): () => void;
   /** Terminate the CLI process tree. Resolves once it has exited. */
@@ -530,6 +541,30 @@ export async function createClaudeSession(
           uuid: promptUuid,
         });
       });
+    },
+    steer({ prompt }: ClaudeSessionSteerOptions): Promise<void> {
+      if (closed) return Promise.reject(new SteerRejectedError("Claude session is closed"));
+      const turn = active;
+      if (!turn) return Promise.reject(new SteerRejectedError("Claude session has no active turn"));
+      if (turn.interruption) {
+        return Promise.reject(new SteerRejectedError("Claude turn is being interrupted"));
+      }
+      // Past its result the turn is wrapping up or only waiting on subagents;
+      // a steer now would wake the CLI into a turn nobody is waiting for.
+      if (turn.translator.resultSeen) {
+        return Promise.reject(new SteerRejectedError("Claude turn is already finishing"));
+      }
+      const uuid = randomUUID();
+      turn.translator.expectUserMessage(uuid);
+      input.push({
+        type: "user",
+        message: { role: "user", content: prompt },
+        parent_tool_use_id: null,
+        uuid,
+        // Read between tool rounds of the running turn, not held until it ends.
+        priority: "next",
+      });
+      return Promise.resolve();
     },
     onClose(handler) {
       if (closed) {

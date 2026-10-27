@@ -1,5 +1,11 @@
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { AbortError, CodexTurnError, MissingCliError, TimeoutError } from "./errors.js";
+import {
+  AbortError,
+  CodexTurnError,
+  MissingCliError,
+  SteerRejectedError,
+  TimeoutError,
+} from "./errors.js";
 import {
   createChunkDecoder,
   createLineSplitter,
@@ -94,8 +100,17 @@ export interface CodexAppServerSession {
   readonly cwd: string;
   readonly closed: boolean;
   runTurn(options: CodexAppServerTurnOptions): Promise<RunResult>;
+  /** Hand more input to the running turn through `turn/steer`, once the turn
+   * is identified. Rejects with a {@link SteerRejectedError} when no turn is
+   * running, the turn ends first, or the app-server refuses the steer. */
+  steer(options: CodexAppServerSteerOptions): Promise<void>;
   onClose(handler: (error: Error) => void): () => void;
   close(): Promise<void>;
+}
+
+export interface CodexAppServerSteerOptions {
+  /** More input for the running turn, as the user would type it mid-turn. */
+  prompt: string;
 }
 
 export interface CreateCodexAppServerSessionOptions {
@@ -690,6 +705,8 @@ function openedCodexThread(value: unknown, fallbackModel?: string): OpenedCodexT
 interface TurnContinuity {
   previousTurnIds?: ReadonlySet<string>;
   onTurnId?: (turnId: string) => void;
+  /** Handed the turn's steer function when it starts, and null when it ends. */
+  onSteerable?: (steer: ((prompt: string) => Promise<void>) | null) => void;
 }
 
 interface PendingCodexWebTool {
@@ -802,6 +819,50 @@ async function runCodexAppServerTurn(
 
   const raceLifecycle = <T>(operation: Promise<T>): Promise<T> =>
     Promise.race([operation, lifecycleFailure]);
+
+  /** Resolves true once the turn/start ack has named the turn — what
+   * `turn/steer` needs as its expected turn id — or false when the run ends
+   * without one (a refused start, an ack naming no turn). */
+  let resolveTurnKnown!: (known: boolean) => void;
+  const turnKnown = new Promise<boolean>((resolve) => {
+    resolveTurnKnown = resolve;
+  });
+
+  const steer = async (prompt: string): Promise<void> => {
+    if (settled || interruption) throw new SteerRejectedError("Codex turn is already finishing");
+    try {
+      const known = await Promise.race([
+        turnKnown,
+        completion.then(() => {
+          throw new SteerRejectedError("Codex turn ended before it could be steered");
+        }),
+        lifecycleFailure,
+      ]);
+      if (!known) throw new SteerRejectedError("Codex turn ended before it could be steered");
+    } catch (error) {
+      if (error instanceof SteerRejectedError) throw error;
+      throw new SteerRejectedError(
+        `Codex turn ended before it could be steered: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (settled || interruption || !threadId || !turnId) {
+      throw new SteerRejectedError("Codex turn is already finishing");
+    }
+    try {
+      await client.request("turn/steer", {
+        threadId,
+        expectedTurnId: turnId,
+        input: [{ type: "text", text: prompt, text_elements: [] }],
+      });
+    } catch (error) {
+      // No active turn, a different one, or one that takes no steering: the
+      // host sends the words as the next turn instead.
+      throw new SteerRejectedError(
+        `Codex refused the steer: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+  continuity?.onSteerable?.(steer);
 
   const settleError = (error: Error): void => {
     if (settled) return;
@@ -1198,6 +1259,7 @@ async function runCodexAppServerTurn(
       dispatchNotification(entry.method, entry.params);
     }
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
+    resolveTurnKnown(true);
     resolvePendingTurnError();
     if (interruption) requestInterrupt();
     const ackStatus = turnStatus(turnResult);
@@ -1225,6 +1287,9 @@ async function runCodexAppServerTurn(
       ...(latestUsage ? { usage: latestUsage } : {}),
     };
   } finally {
+    continuity?.onSteerable?.(null);
+    // A steer still waiting for the turn's id gets none.
+    resolveTurnKnown(false);
     if (timeout) clearTimeout(timeout);
     flushPendingWebTools();
     opts.signal?.removeEventListener("abort", abortHandler);
@@ -1260,6 +1325,7 @@ export async function createCodexAppServerSession(
 
   let closed = false;
   let running = false;
+  let steerRunning: ((prompt: string) => Promise<void>) | null = null;
   const previousTurnIds = new Set<string>();
   let closePromise: Promise<void> | undefined;
   client.onClose(() => {
@@ -1297,10 +1363,19 @@ export async function createCodexAppServerSession(
           onTurnId: (turnId) => {
             previousTurnIds.add(turnId);
           },
+          onSteerable: (steer) => {
+            steerRunning = steer;
+          },
         }, true);
       } finally {
         running = false;
+        steerRunning = null;
       }
+    },
+    async steer({ prompt }) {
+      if (closed) throw new SteerRejectedError("Codex app-server session is closed");
+      if (!steerRunning) throw new SteerRejectedError("Codex app-server session has no active turn");
+      return steerRunning(prompt);
     },
     onClose(handler) {
       return client.onClose(handler);

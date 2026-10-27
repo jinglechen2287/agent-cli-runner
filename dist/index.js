@@ -37,6 +37,9 @@ var CodexTurnError = class extends Error {
   /** Exit code of the Codex process, once known. */
   exitCode;
 };
+var SteerRejectedError = class extends Error {
+  name = "SteerRejectedError";
+};
 
 // src/internal.ts
 var SIGTERM_GRACE_MS = 2e3;
@@ -373,6 +376,8 @@ function namedPromptUuids(parsed) {
 }
 function createClaudeTurnTranslator(callbacks, options = {}) {
   const { promptUuid } = options;
+  const expected = promptUuid !== void 0 ? [promptUuid] : [];
+  let answeredCount = 0;
   let resultSeen = false;
   let followUpPending = false;
   let echoedPromptUuid = false;
@@ -398,7 +403,7 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
   const isForeignResult = (parsed) => {
     if (promptUuid === void 0) return false;
     const named = namedPromptUuids(parsed);
-    if (named) return !named.includes(promptUuid);
+    if (named) return !named.some((uuid) => expected.includes(uuid));
     if (resultSeen) return false;
     if (options.cliEchoesPromptUuid || echoedPromptUuid) return true;
     const failed = parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
@@ -558,6 +563,15 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       const followUp = resultSeen;
       resultSeen = true;
       followUpPending = false;
+      const named = namedPromptUuids(parsed);
+      if (named) {
+        const last = Math.max(...named.map((uuid) => expected.indexOf(uuid)));
+        answeredCount = Math.max(answeredCount, last + 1);
+      } else if (options.cliEchoesPromptUuid || echoedPromptUuid) {
+        answeredCount = Math.max(answeredCount, 1);
+      } else {
+        answeredCount = expected.length;
+      }
       if (parsed.session_id) emitSessionId(parsed.session_id);
       if (typeof parsed.result === "string" && (!followUp || parsed.result)) {
         resultText = parsed.result;
@@ -573,16 +587,20 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       }
     }
   };
+  const allAnswered = () => answeredCount >= expected.length;
   return {
     handle,
+    expectUserMessage(uuid) {
+      expected.push(uuid);
+    },
     get done() {
-      return resultSeen && liveAgentTaskIds.size === 0 && !followUpPending;
+      return resultSeen && allAnswered() && liveAgentTaskIds.size === 0 && !followUpPending;
     },
     get resultSeen() {
       return resultSeen;
     },
     get awaitingFollowUp() {
-      return resultSeen && liveAgentTaskIds.size === 0 && followUpPending;
+      return resultSeen && liveAgentTaskIds.size === 0 && (followUpPending || !allAnswered());
     },
     get echoedPromptUuid() {
       return echoedPromptUuid;
@@ -925,6 +943,28 @@ async function createClaudeSession(opts) {
           uuid: promptUuid
         });
       });
+    },
+    steer({ prompt }) {
+      if (closed) return Promise.reject(new SteerRejectedError("Claude session is closed"));
+      const turn = active;
+      if (!turn) return Promise.reject(new SteerRejectedError("Claude session has no active turn"));
+      if (turn.interruption) {
+        return Promise.reject(new SteerRejectedError("Claude turn is being interrupted"));
+      }
+      if (turn.translator.resultSeen) {
+        return Promise.reject(new SteerRejectedError("Claude turn is already finishing"));
+      }
+      const uuid = randomUUID();
+      turn.translator.expectUserMessage(uuid);
+      input.push({
+        type: "user",
+        message: { role: "user", content: prompt },
+        parent_tool_use_id: null,
+        uuid,
+        // Read between tool rounds of the running turn, not held until it ends.
+        priority: "next"
+      });
+      return Promise.resolve();
     },
     onClose(handler) {
       if (closed) {
@@ -1547,6 +1587,43 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     rejectLifecycle(error);
   };
   const raceLifecycle = (operation) => Promise.race([operation, lifecycleFailure]);
+  let resolveTurnKnown;
+  const turnKnown = new Promise((resolve) => {
+    resolveTurnKnown = resolve;
+  });
+  const steer = async (prompt) => {
+    if (settled || interruption) throw new SteerRejectedError("Codex turn is already finishing");
+    try {
+      const known = await Promise.race([
+        turnKnown,
+        completion.then(() => {
+          throw new SteerRejectedError("Codex turn ended before it could be steered");
+        }),
+        lifecycleFailure
+      ]);
+      if (!known) throw new SteerRejectedError("Codex turn ended before it could be steered");
+    } catch (error) {
+      if (error instanceof SteerRejectedError) throw error;
+      throw new SteerRejectedError(
+        `Codex turn ended before it could be steered: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    if (settled || interruption || !threadId || !turnId) {
+      throw new SteerRejectedError("Codex turn is already finishing");
+    }
+    try {
+      await client.request("turn/steer", {
+        threadId,
+        expectedTurnId: turnId,
+        input: [{ type: "text", text: prompt, text_elements: [] }]
+      });
+    } catch (error) {
+      throw new SteerRejectedError(
+        `Codex refused the steer: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  };
+  continuity?.onSteerable?.(steer);
   const settleError = (error) => {
     if (settled) return;
     settled = true;
@@ -1861,6 +1938,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
       dispatchNotification(entry.method, entry.params);
     }
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
+    resolveTurnKnown(true);
     resolvePendingTurnError();
     if (interruption) requestInterrupt();
     const ackStatus = turnStatus(turnResult);
@@ -1880,6 +1958,8 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
       ...latestUsage ? { usage: latestUsage } : {}
     };
   } finally {
+    continuity?.onSteerable?.(null);
+    resolveTurnKnown(false);
     if (timeout) clearTimeout(timeout);
     flushPendingWebTools();
     opts.signal?.removeEventListener("abort", abortHandler);
@@ -1908,6 +1988,7 @@ async function createCodexAppServerSession(options) {
   }
   let closed = false;
   let running = false;
+  let steerRunning = null;
   const previousTurnIds = /* @__PURE__ */ new Set();
   let closePromise;
   client.onClose(() => {
@@ -1938,11 +2019,20 @@ async function createCodexAppServerSession(options) {
           previousTurnIds,
           onTurnId: (turnId) => {
             previousTurnIds.add(turnId);
+          },
+          onSteerable: (steer) => {
+            steerRunning = steer;
           }
         }, true);
       } finally {
         running = false;
+        steerRunning = null;
       }
+    },
+    async steer({ prompt }) {
+      if (closed) throw new SteerRejectedError("Codex app-server session is closed");
+      if (!steerRunning) throw new SteerRejectedError("Codex app-server session has no active turn");
+      return steerRunning(prompt);
     },
     onClose(handler) {
       return client.onClose(handler);
@@ -2786,6 +2876,7 @@ export {
   CodexTurnError,
   KNOWN_CONTEXT_WINDOWS,
   MissingCliError,
+  SteerRejectedError,
   TimeoutError,
   collectCodexModels,
   contextWindowForModel,

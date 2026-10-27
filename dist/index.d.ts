@@ -259,6 +259,10 @@ type ClaudeSessionTurnOptions = AgentCallbacks & {
      * with a TimeoutError. */
     timeoutMs?: number;
 };
+interface ClaudeSessionSteerOptions {
+    /** More input for the running turn, as the user would type it mid-turn. */
+    prompt: string;
+}
 interface ClaudeSession {
     /** The Claude session id: the pre-assigned or resumed id. */
     readonly sessionId: string;
@@ -266,6 +270,12 @@ interface ClaudeSession {
     readonly closed: boolean;
     /** Run one turn. Rejects when another turn is active or the session is closed. */
     runTurn(options: ClaudeSessionTurnOptions): Promise<RunResult>;
+    /** Hand more input to the running turn. The CLI reads it at the turn's next
+     * tool round, or answers it as a turn of its own right after — either way
+     * the running turn settles only once it is answered. Rejects with a
+     * {@link SteerRejectedError} when no turn is running or the turn is past
+     * taking more: interrupted, or its result already in. */
+    steer(options: ClaudeSessionSteerOptions): Promise<void>;
     /** Called once, with the reason, when the session closes for any reason. */
     onClose(handler: (error: Error) => void): () => void;
     /** Terminate the CLI process tree. Resolves once it has exited. */
@@ -343,14 +353,20 @@ interface ClaudeTurnOutcome {
 interface ClaudeTurnTranslator {
     /** Feed one stream-json message (a CLI stdout line or an SDK message). */
     handle(message: unknown): void;
-    /** True once the turn's own `result` has arrived and no subagent it started
-     * is still owed a follow-up: every live one has settled and the CLI has
-     * answered its notification with a further `result`. */
+    /** A further user message (a steer) was sent into this turn under `uuid`;
+     * a `result` naming it is the turn's own, and the turn is not done until
+     * one has answered it. */
+    expectUserMessage(uuid: string): void;
+    /** True once the turn's own `result` has arrived, every steer has been
+     * answered, and no subagent it started is still owed a follow-up: every
+     * live one has settled and the CLI has answered its notification with a
+     * further `result`. */
     readonly done: boolean;
     /** The turn's own `result` has arrived, whether or not it is done. */
     readonly resultSeen: boolean;
-    /** Every subagent has settled since the turn's own `result`, but the CLI
-     * has not yet answered with a follow-up `result`. */
+    /** The turn's own `result` is in and every subagent has settled, but the
+     * CLI still owes a `result`: the answer to a subagent's notification, or to
+     * a steer it took up as a turn of its own. */
     readonly awaitingFollowUp: boolean;
     /** A `result` this turn named the prompts it answers, so the CLI echoes
      * prompt uuids. */
@@ -408,8 +424,16 @@ interface CodexAppServerSession {
     readonly cwd: string;
     readonly closed: boolean;
     runTurn(options: CodexAppServerTurnOptions): Promise<RunResult>;
+    /** Hand more input to the running turn through `turn/steer`, once the turn
+     * is identified. Rejects with a {@link SteerRejectedError} when no turn is
+     * running, the turn ends first, or the app-server refuses the steer. */
+    steer(options: CodexAppServerSteerOptions): Promise<void>;
     onClose(handler: (error: Error) => void): () => void;
     close(): Promise<void>;
+}
+interface CodexAppServerSteerOptions {
+    /** More input for the running turn, as the user would type it mid-turn. */
+    prompt: string;
 }
 interface CreateCodexAppServerSessionOptions {
     cwd: string;
@@ -502,6 +526,12 @@ declare class CodexTurnError extends Error {
     readonly name = "CodexTurnError";
     /** Exit code of the Codex process, once known. */
     exitCode?: number;
+}
+/** A steer the session could not hand to the running turn: none is running,
+ * or the turn is past the point of taking more input. The host can send the
+ * same words as the next turn instead. */
+declare class SteerRejectedError extends Error {
+    readonly name = "SteerRejectedError";
 }
 
 /**
@@ -664,4 +694,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
