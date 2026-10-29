@@ -236,6 +236,44 @@ var KNOWN_CONTEXT_WINDOWS = {
 };
 var CLAUDE_DEFAULT_CONTEXT_WINDOW = 2e5;
 var CLAUDE_1M_CONTEXT_WINDOW = 1e6;
+var CLAUDE_CONTEXT_WINDOWS = {
+  "claude-opus-4": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-0": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-1": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-5": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-6": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-7": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-opus-4-8": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-opus-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-opus-5-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-sonnet-4": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-sonnet-4-0": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-sonnet-4-5": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-sonnet-4-6": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-sonnet-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-sonnet-5-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-haiku-4-5": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-haiku-5-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-fable-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-fable-5-1": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-mythos-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-mythos-5-1": CLAUDE_1M_CONTEXT_WINDOW
+};
+var CLAUDE_MODEL_ID = /claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?(?!\d)/;
+function claudeContextWindow(id) {
+  if (/\[1m\]|[-_]1m\b/.test(id)) return CLAUDE_1M_CONTEXT_WINDOW;
+  const match = CLAUDE_MODEL_ID.exec(id);
+  if (!match) {
+    return /fable|mythos/.test(id) ? CLAUDE_1M_CONTEXT_WINDOW : CLAUDE_DEFAULT_CONTEXT_WINDOW;
+  }
+  const [, family, major, minor] = match;
+  const canonical = `claude-${family}-${major}${minor !== void 0 ? `-${minor}` : ""}`;
+  if (Object.prototype.hasOwnProperty.call(CLAUDE_CONTEXT_WINDOWS, canonical)) {
+    return CLAUDE_CONTEXT_WINDOWS[canonical];
+  }
+  if (family === "fable" || family === "mythos") return CLAUDE_1M_CONTEXT_WINDOW;
+  return Number(major) >= 5 ? CLAUDE_1M_CONTEXT_WINDOW : CLAUDE_DEFAULT_CONTEXT_WINDOW;
+}
 function contextWindowForModel(model) {
   if (!model) return void 0;
   const id = model.trim().toLowerCase();
@@ -243,10 +281,7 @@ function contextWindowForModel(model) {
   if (Object.prototype.hasOwnProperty.call(KNOWN_CONTEXT_WINDOWS, id)) {
     return KNOWN_CONTEXT_WINDOWS[id];
   }
-  if (id.includes("claude")) {
-    if (/fable|mythos/.test(id)) return CLAUDE_1M_CONTEXT_WINDOW;
-    return /\[1m\]|[-_]1m\b/.test(id) ? CLAUDE_1M_CONTEXT_WINDOW : CLAUDE_DEFAULT_CONTEXT_WINDOW;
-  }
+  if (id.includes("claude")) return claudeContextWindow(id);
   if (id.startsWith("gpt-5.6")) return 372e3;
   if (id.startsWith("gpt-5")) return 272e3;
   return void 0;
@@ -364,6 +399,9 @@ function countsTokens(usage) {
 function isTerminalTaskStatus(status) {
   return status === "completed" || status === "failed" || status === "stopped" || status === "killed";
 }
+function createClaudeSessionState() {
+  return { contextWindows: /* @__PURE__ */ new Map() };
+}
 function namedPromptUuids(parsed) {
   const named = [];
   if (typeof parsed.user_message_uuid === "string") named.push(parsed.user_message_uuid);
@@ -376,6 +414,8 @@ function namedPromptUuids(parsed) {
 }
 function createClaudeTurnTranslator(callbacks, options = {}) {
   const { promptUuid } = options;
+  const session = options.session ?? createClaudeSessionState();
+  const knownContextWindow = (model) => (model !== void 0 ? session.contextWindows.get(model) : void 0) ?? contextWindowForModel(model);
   const expected = promptUuid !== void 0 ? [promptUuid] : [];
   let answeredCount = 0;
   let resultSeen = false;
@@ -389,7 +429,6 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
   let lastAssistantText;
   let resultText;
   let lastAssistantModel;
-  let sessionModel;
   let lastMessageUsage;
   let lastUsage;
   const agentToolCallIds = /* @__PURE__ */ new Set();
@@ -436,7 +475,7 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       return;
     }
     if (parsed.type === "system" && parsed.subtype === "init") {
-      if (typeof parsed.model === "string" && parsed.model) sessionModel = parsed.model;
+      if (typeof parsed.model === "string" && parsed.model) session.model = parsed.model;
       if (parsed.session_id) emitSessionId(parsed.session_id);
       return;
     }
@@ -533,12 +572,12 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
         safeCallback(() => callbacks.onAssistantText?.(text2));
       }
       if (parsed.parent_tool_use_id) return;
-      const model = qualifyModel(parsed.message.model, sessionModel);
+      const model = qualifyModel(parsed.message.model, session.model);
       if (model) lastAssistantModel = model;
       if (parsed.message.usage) {
         lastMessageUsage = parsed.message.usage;
         emitUsage(
-          toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model))
+          toClaudeUsage(parsed.message.usage, model, knownContextWindow(model))
         );
       }
       return;
@@ -560,6 +599,11 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
     if (parsed.type === "result") {
       if (namedPromptUuids(parsed)) echoedPromptUuid = true;
       if (isForeignResult(parsed)) return;
+      for (const [key, entry] of Object.entries(parsed.modelUsage ?? {})) {
+        if (!entry || typeof entry !== "object") continue;
+        const window = toContextWindow(entry.contextWindow);
+        if (window !== void 0) session.contextWindows.set(key, window);
+      }
       const followUp = resultSeen;
       resultSeen = true;
       followUpPending = false;
@@ -580,9 +624,9 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       errors = Array.isArray(parsed.errors) ? parsed.errors.filter((entry) => typeof entry === "string") : [];
       const occupancy = lastMessageUsage ?? (parsed.usage && countsTokens(parsed.usage) ? parsed.usage : void 0);
       if (occupancy) {
-        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? sessionModel);
+        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? session.model);
         const model = primary?.model ?? lastAssistantModel;
-        const contextWindow = primary?.contextWindow ?? contextWindowForModel(model);
+        const contextWindow = primary?.contextWindow ?? knownContextWindow(model);
         emitUsage(toClaudeUsage(occupancy, model, contextWindow));
       }
     }
@@ -722,6 +766,7 @@ async function createClaudeSession(opts) {
   const interruptGraceMs = opts.interruptGraceMs ?? CLAUDE_INTERRUPT_GRACE_MS;
   const followUpGraceMs = opts.followUpGraceMs ?? CLAUDE_FOLLOW_UP_GRACE_MS;
   let cliEchoesPromptUuid = false;
+  const sessionState = createClaudeSessionState();
   let closed = false;
   let child;
   let childExited = false;
@@ -903,7 +948,11 @@ async function createClaudeSession(opts) {
         };
         const promptUuid = randomUUID();
         const turn = {
-          translator: createClaudeTurnTranslator(callbacks, { promptUuid, cliEchoesPromptUuid }),
+          translator: createClaudeTurnTranslator(callbacks, {
+            promptUuid,
+            cliEchoesPromptUuid,
+            session: sessionState
+          }),
           callbacks,
           interruption: null,
           timeoutMs,
@@ -2869,6 +2918,7 @@ ${command.stderr}` : command.stdout,
 }
 export {
   AbortError,
+  CLAUDE_CONTEXT_WINDOWS,
   CLAUDE_FOLLOW_UP_GRACE_MS,
   CLAUDE_INTERRUPT_GRACE_MS,
   CLAUDE_STRIPPED_ENV_VARS,
@@ -2881,6 +2931,7 @@ export {
   collectCodexModels,
   contextWindowForModel,
   createClaudeSession,
+  createClaudeSessionState,
   createClaudeTurnTranslator,
   createCodexAppServerClient,
   createCodexAppServerSession,

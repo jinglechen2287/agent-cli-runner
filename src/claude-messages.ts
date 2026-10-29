@@ -317,6 +317,25 @@ export interface ClaudeTurnTranslatorOptions {
   /** An earlier turn of the same process saw a `result` name its prompt, so
    * one that names none is never this turn's own. */
   cliEchoesPromptUuid?: boolean;
+  /** State shared by every turn of one Claude session. Without it, the
+   * translator keeps its own, as a one-turn run needs no more. */
+  session?: ClaudeSessionState;
+}
+
+/** What a Claude session learns in one turn and the next turn needs: the
+ * start-up line names the qualified model only once per process, and a
+ * `result` reports each model's real window only at the end of a turn. */
+export interface ClaudeSessionState {
+  /** The init line's fully-qualified model id, variant marker included. */
+  model?: string;
+  /** The window each model's `result` reported, keyed by its exact id, so
+   * a later turn's live usage matches what its result will report. */
+  contextWindows: Map<string, number>;
+}
+
+/** Fresh state for a new Claude session. */
+export function createClaudeSessionState(): ClaudeSessionState {
+  return { contextWindows: new Map() };
 }
 
 /** The prompt uuids a `result` names, or undefined when it names none. */
@@ -339,6 +358,12 @@ export function createClaudeTurnTranslator(
   options: ClaudeTurnTranslatorOptions = {},
 ): ClaudeTurnTranslator {
   const { promptUuid } = options;
+  const session = options.session ?? createClaudeSessionState();
+  /** The window a result reported for the model this session, else a guess
+   * from its id. */
+  const knownContextWindow = (model: string | undefined): number | undefined =>
+    (model !== undefined ? session.contextWindows.get(model) : undefined)
+      ?? contextWindowForModel(model);
   /** The prompt, then every steer, in the order the CLI received them. */
   const expected: string[] = promptUuid !== undefined ? [promptUuid] : [];
   /** How many of {@link expected} some `result` has answered. A result that
@@ -359,8 +384,6 @@ export function createClaudeTurnTranslator(
   let lastAssistantText: string | undefined;
   let resultText: string | undefined;
   let lastAssistantModel: string | undefined;
-  /** The init line's fully-qualified model id, variant marker included. */
-  let sessionModel: string | undefined;
   let lastMessageUsage: ClaudeUsage | undefined;
   let lastUsage: TokenUsage | undefined;
   const agentToolCallIds = new Set<string>();
@@ -425,7 +448,7 @@ const handle = (message: unknown): void => {
       return;
     }
     if (parsed.type === "system" && parsed.subtype === "init") {
-      if (typeof parsed.model === "string" && parsed.model) sessionModel = parsed.model;
+      if (typeof parsed.model === "string" && parsed.model) session.model = parsed.model;
       if (parsed.session_id) emitSessionId(parsed.session_id);
       return;
     }
@@ -575,17 +598,18 @@ const handle = (message: unknown): void => {
       // A subagent also runs on its own context window; its usage says
       // nothing about how full this turn's is.
       if (parsed.parent_tool_use_id) return;
-      const model = qualifyModel(parsed.message.model, sessionModel);
+      const model = qualifyModel(parsed.message.model, session.model);
       // Track the responding model even on messages without usage, so the
       // result event can attribute usage to it rather than the largest-window
       // model in a multi-model turn.
       if (model) lastAssistantModel = model;
       if (parsed.message.usage) {
-        // Live window is a best-effort guess from the model id; the `result`
-        // event corrects it with the authoritative modelUsage window.
+        // Live window is what an earlier result reported for the model, else
+        // a guess from its id; the `result` event corrects it with the
+        // authoritative modelUsage window.
         lastMessageUsage = parsed.message.usage;
         emitUsage(
-          toClaudeUsage(parsed.message.usage, model, contextWindowForModel(model)),
+          toClaudeUsage(parsed.message.usage, model, knownContextWindow(model)),
         );
       }
       return;
@@ -607,6 +631,13 @@ const handle = (message: unknown): void => {
     if (parsed.type === "result") {
       if (namedPromptUuids(parsed)) echoedPromptUuid = true;
       if (isForeignResult(parsed)) return;
+      // Remembered whether or not this result reports usage, so the next
+      // turn's live window is the one Claude Code really runs the model at.
+      for (const [key, entry] of Object.entries(parsed.modelUsage ?? {})) {
+        if (!entry || typeof entry !== "object") continue;
+        const window = toContextWindow(entry.contextWindow);
+        if (window !== undefined) session.contextWindows.set(key, window);
+      }
       // A follow-up that answers a notification with nothing to add leaves
       // the turn's last words in place.
       const followUp = resultSeen;
@@ -645,10 +676,10 @@ const handle = (message: unknown): void => {
         // Without a reply to name the model, the session's own beats the
         // largest-window guess: Claude Code's helper calls (Haiku) appear in
         // modelUsage too, first, and can tie on window.
-        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? sessionModel);
+        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? session.model);
         const model = primary?.model ?? lastAssistantModel;
         const contextWindow =
-          primary?.contextWindow ?? contextWindowForModel(model);
+          primary?.contextWindow ?? knownContextWindow(model);
         emitUsage(toClaudeUsage(occupancy, model, contextWindow));
       }
     }

@@ -44,15 +44,22 @@ interface TokenUsage {
  * Context-window sizes for models whose id doesn't follow a simple family rule.
  * Values are best-effort fallbacks for callers without a provider-reported
  * window; `runCodex` prefers app-server's authoritative effective window.
- * Anthropic models are handled by the family rules in
- * {@link contextWindowForModel} instead.
+ * Anthropic models are handled by {@link CLAUDE_CONTEXT_WINDOWS} instead.
  */
 declare const KNOWN_CONTEXT_WINDOWS: Readonly<Record<string, number>>;
 /**
+ * The window Claude Code runs each Claude model at by default, keyed by
+ * canonical id — the value it later reports in a turn's `modelUsage`. Copied
+ * from Claude Code 2.1.312's built-in model registry; to re-check after a CLI
+ * update, search the binary's strings for `context:{window:`. Claude Code also
+ * honors a `[1m]` marker on any model, handled before this table.
+ */
+declare const CLAUDE_CONTEXT_WINDOWS: Readonly<Record<string, number>>;
+/**
  * Best-effort context window (in tokens) for a model id, or `undefined` when it
- * can't be determined. Consults {@link KNOWN_CONTEXT_WINDOWS} first, then
- * falls back to family rules: Anthropic models get 200k (1M for the `[1m]` beta
- * variants and for the natively-1M Fable/Mythos family), and Codex `gpt-5.6*` /
+ * can't be determined. Consults {@link KNOWN_CONTEXT_WINDOWS} first. Claude ids
+ * resolve through {@link CLAUDE_CONTEXT_WINDOWS} (1M for any `[1m]` variant,
+ * and a generation guess for models newer than the table); Codex `gpt-5.6*` /
  * other `gpt-5*` models get 372k / 272k.
  */
 declare function contextWindowForModel(model: string | undefined): number | undefined;
@@ -386,7 +393,22 @@ interface ClaudeTurnTranslatorOptions {
     /** An earlier turn of the same process saw a `result` name its prompt, so
      * one that names none is never this turn's own. */
     cliEchoesPromptUuid?: boolean;
+    /** State shared by every turn of one Claude session. Without it, the
+     * translator keeps its own, as a one-turn run needs no more. */
+    session?: ClaudeSessionState;
 }
+/** What a Claude session learns in one turn and the next turn needs: the
+ * start-up line names the qualified model only once per process, and a
+ * `result` reports each model's real window only at the end of a turn. */
+interface ClaudeSessionState {
+    /** The init line's fully-qualified model id, variant marker included. */
+    model?: string;
+    /** The window each model's `result` reported, keyed by its exact id, so
+     * a later turn's live usage matches what its result will report. */
+    contextWindows: Map<string, number>;
+}
+/** Fresh state for a new Claude session. */
+declare function createClaudeSessionState(): ClaudeSessionState;
 /** Translate one Claude turn's stream-json messages into host callbacks. One
  * translator per turn: session-id deduplication, usage attribution, and task
  * tracking are all scoped to it. */
@@ -694,4 +716,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };

@@ -10,7 +10,11 @@ import {
   type SpawnedProcess,
   type SpawnOptions as SdkSpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
-import { createClaudeTurnTranslator, type ClaudeTurnTranslator } from "./claude-messages.js";
+import {
+  createClaudeSessionState,
+  createClaudeTurnTranslator,
+  type ClaudeTurnTranslator,
+} from "./claude-messages.js";
 import { AbortError, MissingCliError, SteerRejectedError, TimeoutError } from "./errors.js";
 import {
   createChunkDecoder,
@@ -283,6 +287,8 @@ export async function createClaudeSession(
   /** Some `result` of this process named its prompt, so one that names none
    * is never a turn's own. */
   let cliEchoesPromptUuid = false;
+  /** Carried across turns: the qualified model and the windows results reported. */
+  const sessionState = createClaudeSessionState();
 
   let closed = false;
   let child: ChildProcess | undefined;
@@ -498,7 +504,11 @@ export async function createClaudeSession(
         // writes for something else — a task an earlier process left running.
         const promptUuid = randomUUID();
         const turn: ActiveTurn = {
-          translator: createClaudeTurnTranslator(callbacks, { promptUuid, cliEchoesPromptUuid }),
+          translator: createClaudeTurnTranslator(callbacks, {
+            promptUuid,
+            cliEchoesPromptUuid,
+            session: sessionState,
+          }),
           callbacks,
           interruption: null,
           timeoutMs,

@@ -42,8 +42,7 @@ export interface TokenUsage {
  * Context-window sizes for models whose id doesn't follow a simple family rule.
  * Values are best-effort fallbacks for callers without a provider-reported
  * window; `runCodex` prefers app-server's authoritative effective window.
- * Anthropic models are handled by the family rules in
- * {@link contextWindowForModel} instead.
+ * Anthropic models are handled by {@link CLAUDE_CONTEXT_WINDOWS} instead.
  */
 export const KNOWN_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   "gpt-5.2": 272_000,
@@ -60,10 +59,65 @@ const CLAUDE_DEFAULT_CONTEXT_WINDOW = 200_000;
 const CLAUDE_1M_CONTEXT_WINDOW = 1_000_000;
 
 /**
+ * The window Claude Code runs each Claude model at by default, keyed by
+ * canonical id — the value it later reports in a turn's `modelUsage`. Copied
+ * from Claude Code 2.1.312's built-in model registry; to re-check after a CLI
+ * update, search the binary's strings for `context:{window:`. Claude Code also
+ * honors a `[1m]` marker on any model, handled before this table.
+ */
+export const CLAUDE_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
+  "claude-opus-4": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-0": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-1": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-5": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-6": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-opus-4-7": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-opus-4-8": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-opus-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-opus-5-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-sonnet-4": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-sonnet-4-0": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-sonnet-4-5": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-sonnet-4-6": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-sonnet-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-sonnet-5-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-haiku-4-5": CLAUDE_DEFAULT_CONTEXT_WINDOW,
+  "claude-haiku-5-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-fable-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-fable-5-1": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-mythos-5": CLAUDE_1M_CONTEXT_WINDOW,
+  "claude-mythos-5-1": CLAUDE_1M_CONTEXT_WINDOW,
+};
+
+/** Family and version inside any spelling of a Claude id: dated
+ * (`-20251101`), Bedrock (`us.anthropic.…-v1:0`) or Vertex (`@20251101`). A
+ * minor version is one or two digits, so a date is never read as one. */
+const CLAUDE_MODEL_ID = /claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?(?!\d)/;
+
+function claudeContextWindow(id: string): number {
+  if (/\[1m\]|[-_]1m\b/.test(id)) return CLAUDE_1M_CONTEXT_WINDOW;
+  const match = CLAUDE_MODEL_ID.exec(id);
+  if (!match) {
+    // Fable and Mythos ship only at 1M, unversioned previews included.
+    return /fable|mythos/.test(id) ? CLAUDE_1M_CONTEXT_WINDOW : CLAUDE_DEFAULT_CONTEXT_WINDOW;
+  }
+  const [, family, major, minor] = match;
+  const canonical = `claude-${family}-${major}${minor !== undefined ? `-${minor}` : ""}`;
+  if (Object.prototype.hasOwnProperty.call(CLAUDE_CONTEXT_WINDOWS, canonical)) {
+    return CLAUDE_CONTEXT_WINDOWS[canonical]!;
+  }
+  // A model newer than the table: a best-effort guess. Fable and Mythos ship
+  // only at 1M, and every Claude 5 model is natively 1M; the turn's result
+  // reports the real window either way.
+  if (family === "fable" || family === "mythos") return CLAUDE_1M_CONTEXT_WINDOW;
+  return Number(major) >= 5 ? CLAUDE_1M_CONTEXT_WINDOW : CLAUDE_DEFAULT_CONTEXT_WINDOW;
+}
+
+/**
  * Best-effort context window (in tokens) for a model id, or `undefined` when it
- * can't be determined. Consults {@link KNOWN_CONTEXT_WINDOWS} first, then
- * falls back to family rules: Anthropic models get 200k (1M for the `[1m]` beta
- * variants and for the natively-1M Fable/Mythos family), and Codex `gpt-5.6*` /
+ * can't be determined. Consults {@link KNOWN_CONTEXT_WINDOWS} first. Claude ids
+ * resolve through {@link CLAUDE_CONTEXT_WINDOWS} (1M for any `[1m]` variant,
+ * and a generation guess for models newer than the table); Codex `gpt-5.6*` /
  * other `gpt-5*` models get 372k / 272k.
  */
 export function contextWindowForModel(model: string | undefined): number | undefined {
@@ -73,15 +127,7 @@ export function contextWindowForModel(model: string | undefined): number | undef
   if (Object.prototype.hasOwnProperty.call(KNOWN_CONTEXT_WINDOWS, id)) {
     return KNOWN_CONTEXT_WINDOWS[id];
   }
-  if (id.includes("claude")) {
-    // Fable and Mythos ship a 1M window as the default and maximum — there is
-    // no 200k mode and no `[1m]` variant to opt into, unlike Opus/Sonnet whose
-    // 1M window in Claude Code is gated behind the `[1m]` model id.
-    if (/fable|mythos/.test(id)) return CLAUDE_1M_CONTEXT_WINDOW;
-    return /\[1m\]|[-_]1m\b/.test(id)
-      ? CLAUDE_1M_CONTEXT_WINDOW
-      : CLAUDE_DEFAULT_CONTEXT_WINDOW;
-  }
+  if (id.includes("claude")) return claudeContextWindow(id);
   if (id.startsWith("gpt-5.6")) return 372_000;
   if (id.startsWith("gpt-5")) return 272_000;
   return undefined;

@@ -503,8 +503,26 @@ describe("createClaudeTurnTranslator", () => {
       cachedInputTokens: 15099,
       outputTokens: 6,
       model: "claude-opus-4-8",
-      contextWindow: 200_000,
+      contextWindow: 1_000_000,
     });
+  });
+
+  it("gives a bare natively-1M model its 1M window while the turn runs", () => {
+    const onUsage = vi.fn();
+    feed({ onUsage }, [
+      { type: "system", subtype: "init", session_id: "sess-1", model: "claude-opus-5-5" },
+      {
+        type: "assistant",
+        message: {
+          model: "claude-opus-5-5",
+          content: [{ type: "text", text: "hi" }],
+          usage: { input_tokens: 2, cache_read_input_tokens: 221_000, output_tokens: 6 },
+        },
+      },
+    ]);
+    expect(onUsage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ contextTokens: 221_002, model: "claude-opus-5-5", contextWindow: 1_000_000 }),
+    );
   });
 
   it("re-attaches the init line's variant marker to live per-message usage", () => {
@@ -694,12 +712,12 @@ describe("createClaudeTurnTranslator", () => {
     });
   });
 
-  it("ignores a malformed modelUsage contextWindow and falls back to the family rule", () => {
+  it("ignores a malformed modelUsage contextWindow and falls back to the model's table window", () => {
     const t = feed({}, [
       {
         type: "assistant",
         message: {
-          model: "claude-opus-4-8",
+          model: "claude-opus-4-6",
           content: [{ type: "text", text: "hi" }],
           usage: { input_tokens: 5, output_tokens: 3 },
         },
@@ -708,10 +726,17 @@ describe("createClaudeTurnTranslator", () => {
         type: "result",
         result: "hi",
         usage: { input_tokens: 5, output_tokens: 3 },
-        modelUsage: { "claude-opus-4-8": { contextWindow: "huge" } },
+        modelUsage: { "claude-opus-4-6": { contextWindow: "huge" } },
       },
     ]);
-    expect(t.finish().usage).toMatchObject({ model: "claude-opus-4-8", contextWindow: 200_000 });
+    expect(t.finish().usage).toMatchObject({ model: "claude-opus-4-6", contextWindow: 200_000 });
+  });
+
+  it("skips a modelUsage entry that is not an object", () => {
+    const t = feed({}, [
+      { type: "result", result: "hi", modelUsage: { "claude-opus-4-6": null } },
+    ]);
+    expect(t.finish().text).toBe("hi");
   });
 
   it("attributes result usage to the responding model even when its message carried no usage", () => {

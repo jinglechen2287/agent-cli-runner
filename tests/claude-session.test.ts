@@ -470,6 +470,109 @@ describe("createClaudeSession", () => {
   });
 });
 
+describe("ClaudeSession context window", () => {
+  const reply = (model: string, text = "ok") => ({
+    type: "assistant",
+    parent_tool_use_id: null,
+    message: {
+      model,
+      content: [{ type: "text", text }],
+      usage: { input_tokens: 5, cache_read_input_tokens: 300_000, output_tokens: 3 },
+    },
+  });
+
+  /** Runs one turn that a single reply and result answer. */
+  async function turn(
+    fake: FakeQuery,
+    session: Awaited<ReturnType<typeof startSession>>,
+    count: number,
+    lines: unknown[],
+  ) {
+    const onUsage = vi.fn();
+    const running = session.runTurn({ prompt: `turn ${count}`, onUsage });
+    await fake.waitForPrompt(count);
+    for (const line of lines) fake.emit(line);
+    return { result: await running, onUsage };
+  }
+
+  it("keeps the init line's [1m] marker for turns after the first", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    await turn(fake, session, 1, [
+      { ...init(), model: "claude-sonnet-4-6[1m]" },
+      reply("claude-sonnet-4-6"),
+      result("ok"),
+    ]);
+    const second = await turn(fake, session, 2, [reply("claude-sonnet-4-6"), result("ok")]);
+    expect(second.onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "claude-sonnet-4-6[1m]", contextWindow: 1_000_000 }),
+    );
+  });
+
+  it("uses the window an earlier result reported while a later turn runs", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    await turn(fake, session, 1, [
+      init(),
+      reply("claude-opus-5-5"),
+      result("ok", { modelUsage: { "claude-opus-5-5": { contextWindow: 500_000 } } }),
+    ]);
+    const second = await turn(fake, session, 2, [
+      reply("claude-opus-5-5"),
+      result("ok", { modelUsage: { "claude-opus-5-5": { contextWindow: "huge" } } }),
+    ]);
+    expect(second.onUsage).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ model: "claude-opus-5-5", contextWindow: 500_000 }),
+    );
+    expect(second.result.usage).toMatchObject({ model: "claude-opus-5-5", contextWindow: 500_000 });
+  });
+
+  it("keeps each session's reported windows to itself", async () => {
+    const fakeA = makeFakeQuery();
+    const fakeB = makeFakeQuery();
+    const a = await startSession(fakeA);
+    const b = await startSession(fakeB, { newSessionId: "22222222-2222-4222-8222-222222222222" });
+    const learn = (contextWindow: number) => [
+      init(),
+      reply("claude-opus-5-5"),
+      result("ok", { modelUsage: { "claude-opus-5-5": { contextWindow } } }),
+    ];
+    await turn(fakeA, a, 1, learn(500_000));
+    await turn(fakeB, b, 1, learn(300_000));
+    const secondA = await turn(fakeA, a, 2, [reply("claude-opus-5-5"), result("ok")]);
+    const secondB = await turn(fakeB, b, 2, [reply("claude-opus-5-5"), result("ok")]);
+    expect(secondA.onUsage).toHaveBeenNthCalledWith(1, expect.objectContaining({ contextWindow: 500_000 }));
+    expect(secondB.onUsage).toHaveBeenNthCalledWith(1, expect.objectContaining({ contextWindow: 300_000 }));
+  });
+
+  it("learns nothing from a result that answers another prompt", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const onUsage = vi.fn();
+    const first = session.runTurn({ prompt: "turn 1", onUsage });
+    await fake.waitForPrompt(1);
+    const uuid = fake.uuids[0];
+    fake.emit(init());
+    fake.emit(result("other", {
+      user_message_uuid: "other",
+      user_message_uuids: ["other"],
+      modelUsage: { "claude-opus-5-5": { contextWindow: 500_000 } },
+    }));
+    fake.emit(reply("claude-opus-5-5"));
+    fake.emit(result("ok", { user_message_uuid: uuid, user_message_uuids: [uuid] }));
+    await first;
+    const onSecondUsage = vi.fn();
+    const second = session.runTurn({ prompt: "turn 2", onUsage: onSecondUsage });
+    await fake.waitForPrompt(2);
+    const secondUuid = fake.uuids[1];
+    fake.emit(reply("claude-opus-5-5"));
+    fake.emit(result("ok", { user_message_uuid: secondUuid, user_message_uuids: [secondUuid] }));
+    await second;
+    expect(onSecondUsage).toHaveBeenNthCalledWith(1, expect.objectContaining({ contextWindow: 1_000_000 }));
+  });
+});
+
 describe("ClaudeSession.steer", () => {
   it("sends the steer into the running turn, to be read at the next tool round", async () => {
     const fake = makeFakeQuery();

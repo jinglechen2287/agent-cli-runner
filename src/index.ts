@@ -14,8 +14,9 @@ export type {
   ClaudeSessionTurnOptions,
   CreateClaudeSessionOptions,
 } from "./claude-session.js";
-export { createClaudeTurnTranslator } from "./claude-messages.js";
+export { createClaudeSessionState, createClaudeTurnTranslator } from "./claude-messages.js";
 export type {
+  ClaudeSessionState,
   ClaudeTurnOutcome,
   ClaudeTurnTranslator,
   ClaudeTurnTranslatorOptions,
@@ -64,6 +65,7 @@ export type {
   ToolUseInfo,
 } from "./types.js";
 export {
+  CLAUDE_CONTEXT_WINDOWS,
   contextWindowForModel,
   KNOWN_CONTEXT_WINDOWS,
   type TokenUsage,
