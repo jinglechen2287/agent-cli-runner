@@ -1224,6 +1224,7 @@ async function runCodexAppServerTurn(
         client.request("turn/start", {
           threadId,
           input,
+          cwd: opts.turnCwd ?? opts.cwd,
           ...(opts.model ? { model: opts.model } : {}),
           ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
           ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),

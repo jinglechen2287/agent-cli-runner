@@ -975,6 +975,58 @@ describe("Codex app-server runner", () => {
     await session.close();
   });
 
+  it("moves one turn to turnCwd and returns the next to the session cwd", async () => {
+    const child = makeFakeChild();
+    let turnNumber = 0;
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-cwd" } } });
+      } else if (message.method === "turn/start") {
+        turnNumber += 1;
+        const turnId = `turn-${turnNumber}`;
+        // The first turn fails: the cwd still has to come back afterwards.
+        if (turnNumber === 1) {
+          send(child, { id: message.id, result: { turn: completedTurn(turnId, "failed") } });
+          return;
+        }
+        send(child, { id: message.id, result: { turn: completedTurn(turnId, "inProgress") } });
+        send(child, {
+          method: "item/completed",
+          params: {
+            threadId: "thread-cwd",
+            turnId,
+            completedAtMs: turnNumber,
+            item: { type: "agentMessage", id: `message-${turnNumber}`, text: `Done ${turnNumber}` },
+          },
+        });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-cwd", turn: completedTurn(turnId) },
+        });
+      }
+    });
+
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      dangerouslyBypassApprovalsAndSandbox: true,
+      spawnFn: (() => child) as never,
+    });
+
+    await expect(session.runTurn({ prompt: "draw it", turnCwd: "/tmp/canvas" }))
+      .resolves.toMatchObject({ exitCode: 1 });
+    await session.runTurn({ prompt: "draw more", turnCwd: "/tmp/canvas" });
+    await session.runTurn({ prompt: "build it" });
+
+    const turnParams = requests
+      .filter(({ method }) => method === "turn/start")
+      .map(({ params }) => params);
+    expect(turnParams.map((params) => params?.cwd))
+      .toEqual(["/tmp/canvas", "/tmp/canvas", "/tmp/project"]);
+    await session.close();
+  });
+
   it("opens a thread once and reuses it for sequential session turns", async () => {
     const child = makeFakeChild();
     let turnNumber = 0;

@@ -1961,6 +1961,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
         client.request("turn/start", {
           threadId,
           input,
+          cwd: opts.turnCwd ?? opts.cwd,
           ...opts.model ? { model: opts.model } : {},
           ...opts.reasoningEffort ? { effort: opts.reasoningEffort } : {},
           ...opts.serviceTier !== void 0 ? { serviceTier: opts.serviceTier } : {},
@@ -2319,6 +2320,9 @@ async function runCodex(opts) {
   }
   if (opts.sandboxPolicy) {
     throw new Error("isolated Codex runs cannot override the sandbox policy");
+  }
+  if (opts.turnCwd !== void 0) {
+    throw new Error("isolated Codex runs cannot set a turn cwd");
   }
   if (opts.serviceTier !== void 0) {
     throw new Error("isolated Codex runs cannot set a service tier \u2014 codex exec has no equivalent");

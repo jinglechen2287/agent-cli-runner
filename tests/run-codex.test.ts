@@ -112,6 +112,12 @@ describe("runCodex isolated mode", () => {
       isolated: true,
       serviceTier: "priority",
     })).rejects.toThrow(/service tier/i);
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      isolated: true,
+      turnCwd: "/tmp/canvas",
+    })).rejects.toThrow(/turn cwd/i);
   });
 
   it("reports isolated usage from the exec turn summary", async () => {

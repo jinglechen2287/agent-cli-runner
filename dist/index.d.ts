@@ -499,6 +499,10 @@ interface RunCodexOptions extends CommonRunOptions {
     /** Sandbox override passed directly to app-server's `turn/start`. Sticky
      * across turns on the same thread — see {@link CodexSandboxPolicy}. */
     sandboxPolicy?: CodexSandboxPolicy;
+    /** Working directory for this turn alone, sent as `turn/start`'s `cwd`.
+     * That override is sticky too, so every turn sends `turnCwd ?? cwd` and a
+     * turn without one returns the thread to `cwd`. App-server runs only. */
+    turnCwd?: string;
     /** Text applied as developer instructions for the thread. */
     developerInstructions?: string;
     /** Resume an existing app-server thread by id. */
