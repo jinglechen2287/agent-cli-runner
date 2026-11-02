@@ -689,6 +689,9 @@ function validateSessionOptions(opts) {
   if (opts.isolated && opts.tools) {
     throw new Error("isolated Claude runs cannot set tools \u2014 isolated already disables them all");
   }
+  if (opts.isolated && opts.mcpServers) {
+    throw new Error("isolated Claude runs cannot set MCP servers \u2014 isolated already disables MCP");
+  }
 }
 function sdkTools(tools) {
   if (!tools) return void 0;
@@ -721,6 +724,7 @@ function claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeC
     ...opts.settingSources ? { settingSources: [...opts.settingSources] } : {},
     ...opts.settings !== void 0 ? { settings: opts.settings } : {},
     ...opts.hooks ? { hooks: opts.hooks } : {},
+    ...opts.mcpServers ? { mcpServers: { ...opts.mcpServers } } : {},
     ...opts.isolated ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } } : {}
   };
 }
@@ -1569,7 +1573,8 @@ function requestCodexThread(client, opts) {
     experimentalRawEvents: true,
     ...opts.model ? { model: opts.model } : {},
     ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
-    ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}
+    ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {},
+    ...opts.config ? { config: opts.config } : {}
   };
   return opts.resumeSessionId ? client.request("thread/resume", { threadId: opts.resumeSessionId, ...params }) : client.request("thread/start", params);
 }

@@ -123,7 +123,20 @@ export interface CreateCodexAppServerSessionOptions {
   model?: string;
   developerInstructions?: string;
   dangerouslyBypassApprovalsAndSandbox?: boolean;
+  /** Config overrides for the thread, sent on `thread/start` and
+   * `thread/resume` — e.g. `{ mcp_servers: { name: { url } } }`. */
+  config?: CodexConfigOverrides;
 }
+
+/** app-server's `config` map: dotted or nested config.toml keys to values. */
+export type CodexConfigOverrides = { [key: string]: CodexJsonValue };
+export type CodexJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | CodexJsonValue[]
+  | { [key: string]: CodexJsonValue };
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 /** `turn/start` is acked immediately in normal operation, but a busy
@@ -672,7 +685,7 @@ function requestCodexThread(
     | "developerInstructions"
     | "model"
     | "resumeSessionId"
-  >,
+  > & { config?: CodexConfigOverrides },
 ): Promise<unknown> {
   // One shared params object so resumed threads can never silently diverge
   // from fresh ones (e.g. losing raw events, and with them WebFetch URLs).
@@ -686,6 +699,7 @@ function requestCodexThread(
     ...(opts.dangerouslyBypassApprovalsAndSandbox
       ? { approvalPolicy: "never", sandbox: "danger-full-access" }
       : {}),
+    ...(opts.config ? { config: opts.config } : {}),
   };
   return opts.resumeSessionId
     ? client.request("thread/resume", { threadId: opts.resumeSessionId, ...params })

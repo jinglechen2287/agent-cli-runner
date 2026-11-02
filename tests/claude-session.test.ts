@@ -753,8 +753,25 @@ describe("createClaudeSession options", () => {
     expect(fake.options().sessionId).toMatch(/^[0-9a-f-]{36}$/);
   });
 
+  it("passes MCP servers through to the SDK", async () => {
+    const fake = makeFakeQuery();
+    const mcpServers = { "agent-remote": { type: "http" as const, url: "http://127.0.0.1:1/mcp" } };
+    await startSession(fake, { mcpServers });
+    expect(fake.options().mcpServers).toEqual(mcpServers);
+  });
+
+  it("leaves MCP servers out when none are given", async () => {
+    const fake = makeFakeQuery();
+    await startSession(fake);
+    expect(fake.options()).not.toHaveProperty("mcpServers");
+  });
+
   it.each([
     [{ newSessionId: "a", resumeSessionId: "b" }, "mutually exclusive"],
+    [
+      { isolated: true, mcpServers: { x: { type: "http" as const, url: "http://127.0.0.1:1" } } },
+      "cannot set MCP servers",
+    ],
     [{ newSessionId: undefined, isolated: true, resumeSessionId: "b" }, "cannot resume"],
     [{ isolated: true, permissionMode: "plan" as const }, "cannot set a permission mode"],
     [{ isolated: true, tools: ["Read"] }, "cannot set tools"],

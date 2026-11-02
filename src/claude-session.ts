@@ -5,6 +5,7 @@ import {
   type EffortLevel,
   type HookCallbackMatcher,
   type HookEvent,
+  type McpServerConfig,
   type Options,
   type SDKUserMessage,
   type SpawnedProcess,
@@ -105,6 +106,9 @@ export interface CreateClaudeSessionOptions {
   appendSystemPrompt?: string;
   /** In-process hook callbacks (e.g. a PreToolUse guard). */
   hooks?: ClaudeHooks;
+  /** MCP servers for the session, by name, on top of those the settings
+   * sources configure. */
+  mcpServers?: Record<string, McpServerConfig>;
   /** A non-persistent session with customizations, tools, and MCP disabled,
    * for small metadata tasks such as chat titles. */
   isolated?: boolean;
@@ -184,6 +188,9 @@ function validateSessionOptions(opts: CreateClaudeSessionOptions): void {
   if (opts.isolated && opts.tools) {
     throw new Error("isolated Claude runs cannot set tools — isolated already disables them all");
   }
+  if (opts.isolated && opts.mcpServers) {
+    throw new Error("isolated Claude runs cannot set MCP servers — isolated already disables MCP");
+  }
 }
 
 function sdkTools(tools: string[] | undefined): Options["tools"] | undefined {
@@ -226,6 +233,7 @@ export function claudeSessionQueryOptions(
     ...(opts.settingSources ? { settingSources: [...opts.settingSources] } : {}),
     ...(opts.settings !== undefined ? { settings: opts.settings as NonNullable<Options["settings"]> } : {}),
     ...(opts.hooks ? { hooks: opts.hooks } : {}),
+    ...(opts.mcpServers ? { mcpServers: { ...opts.mcpServers } } : {}),
     ...(opts.isolated
       ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } }
       : {}),

@@ -26,6 +26,7 @@ export type {
   HookCallbackMatcher as ClaudeHookCallbackMatcher,
   HookInput as ClaudeHookInput,
   HookJSONOutput as ClaudeHookOutput,
+  McpServerConfig as ClaudeMcpServerConfig,
   PreToolUseHookInput as ClaudePreToolUseHookInput,
   PreToolUseHookSpecificOutput as ClaudePreToolUseHookOutput,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -40,6 +41,8 @@ export type {
   CodexAppServerSession,
   CodexAppServerSteerOptions,
   CodexAppServerTurnOptions,
+  CodexConfigOverrides,
+  CodexJsonValue,
   CodexServerRequest,
   CodexServerRequestHandler,
   CreateCodexAppServerClientOptions,

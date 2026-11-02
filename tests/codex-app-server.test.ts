@@ -1208,6 +1208,48 @@ describe("Codex app-server runner", () => {
     expect(runTurn).not.toHaveBeenCalled();
   });
 
+  it.each([undefined, "thread-old"])("sends config overrides on the thread request (resume: %s)", async (resumeSessionId) => {
+    const config = { mcp_servers: { "agent-remote": { url: "http://127.0.0.1:1/mcp" } } };
+    {
+      const child = makeFakeChild();
+      const requests = captureRequests(child, (message) => {
+        if (message.method === "initialize") {
+          send(child, { id: message.id, result: {} });
+        } else if (message.method === "thread/start" || message.method === "thread/resume") {
+          send(child, { id: message.id, result: { thread: { id: "thread-config" } } });
+        }
+      });
+      const session = await createCodexAppServerSession({
+        cwd: "/tmp/project",
+        config,
+        ...(resumeSessionId ? { resumeSessionId } : {}),
+        spawnFn: (() => child) as never,
+      });
+      const method = resumeSessionId ? "thread/resume" : "thread/start";
+      expect(requests.find((request) => request.method === method)?.params)
+        .toMatchObject({ cwd: "/tmp/project", config });
+      await session.close();
+    }
+  });
+
+  it("leaves config out of the thread request when none is given", async () => {
+    const child = makeFakeChild();
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-plain" } } });
+      }
+    });
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      spawnFn: (() => child) as never,
+    });
+    expect(requests.find(({ method }) => method === "thread/start")?.params)
+      .not.toHaveProperty("config");
+    await session.close();
+  });
+
   it("marks a session closed and notifies its owner when app-server exits", async () => {
     const child = makeFakeChild();
     captureRequests(child, (message) => {
