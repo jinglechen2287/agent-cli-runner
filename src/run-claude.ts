@@ -53,9 +53,9 @@ export interface RunClaudeOptions extends CommonRunOptions {
   /** Run a non-persistent one-shot request with customizations, tools, and MCP
    * disabled. Intended for small metadata tasks such as chat titles. */
   isolated?: boolean;
-  /** Fork this existing session for an isolated side run: it sees that
-   * session's history, writes nothing back, and may use no tool. Requires
-   * `isolated`. */
+  /** Fork this existing session for a side run: it sees that session's
+   * history and writes nothing back. With `isolated` it may use no tool;
+   * without, it keeps the tools, permissions and hooks given here. */
   forkSessionId?: string;
   /** Test seam: replaces the Agent SDK's `query()`. */
   queryFn?: ClaudeQueryFn;

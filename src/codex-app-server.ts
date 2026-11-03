@@ -719,8 +719,25 @@ function requestCodexThread(
     | "model"
     | "resumeSessionId"
     | "forkSessionId"
+    | "isolated"
   > & { config?: CodexConfigOverrides },
 ): Promise<unknown> {
+  if (opts.forkSessionId && !opts.isolated) {
+    // A guarded fork keeps Codex's tools: the turn's sandbox policy bounds them.
+    return client.request("thread/fork", {
+      threadId: opts.forkSessionId,
+      cwd: opts.cwd,
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.developerInstructions
+        ? { developerInstructions: opts.developerInstructions }
+        : {}),
+      ephemeral: true,
+      excludeTurns: true,
+      sandbox: "read-only",
+      approvalPolicy: "never",
+      experimentalRawEvents: true,
+    });
+  }
   if (opts.forkSessionId) {
     const forkSessionId = opts.forkSessionId;
     // The user's MCP servers can only be switched off by name — an empty
@@ -1164,7 +1181,7 @@ async function runCodexAppServerTurn(
       return;
     }
     if (method === "item/started" || method === "item/completed") {
-      if (opts.forkSessionId && method === "item/started" && refuseForkedTool(params)) return;
+      if (opts.forkSessionId && opts.isolated && method === "item/started" && refuseForkedTool(params)) return;
       handleItem(method, params);
       return;
     }

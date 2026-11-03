@@ -82,11 +82,12 @@ export interface RunCodexOptions extends CommonRunOptions {
    * Codex app-server cannot currently reproduce both ignore flags per thread,
    * so this narrow metadata path intentionally remains on `codex exec`. */
   isolated?: boolean;
-  /** Fork this existing app-server thread for an isolated side run: an
-   * ephemeral, read-only copy with Codex's tools and MCP servers turned off
-   * (see {@link CODEX_FORK_CONFIG}). It sees the thread's history and writes
-   * nothing back; a tool it starts anyway interrupts the run, which rejects.
-   * Requires `isolated`; runs on a one-off app-server, not `codex exec`. */
+  /** Fork this existing app-server thread for a side run, on a one-off
+   * app-server: an ephemeral copy that sees the thread's history and writes
+   * nothing back. With `isolated`, its tools and MCP servers are turned off
+   * (see {@link CODEX_FORK_CONFIG}) and one it starts anyway interrupts the
+   * run, which rejects. Without, it keeps Codex's tools under the caller's
+   * `sandboxPolicy`. */
   forkSessionId?: string;
 }
 
@@ -371,7 +372,6 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
 }
 
 function runForkedCodex(opts: RunCodexOptions): Promise<RunResult> {
-  if (!opts.isolated) throw new Error("forkSessionId runs only isolated — pass isolated: true");
   if (opts.appServerSession || opts.appServerClient) {
     throw new Error("forked Codex runs cannot reuse app-server state");
   }
@@ -381,8 +381,13 @@ function runForkedCodex(opts: RunCodexOptions): Promise<RunResult> {
   if (opts.dangerouslyBypassApprovalsAndSandbox) {
     throw new Error("forked Codex runs cannot bypass approvals and sandboxing");
   }
-  if (opts.sandboxPolicy) {
+  // A guarded fork may tune its read-only sandbox (network, say) but never
+  // widen it. An isolated one keeps the read-only thread it forked into.
+  if (opts.isolated && opts.sandboxPolicy) {
     throw new Error("forked Codex runs cannot override the sandbox policy");
+  }
+  if (opts.sandboxPolicy && opts.sandboxPolicy.type !== "readOnly") {
+    throw new Error("forked Codex runs keep a read-only sandbox");
   }
   if (opts.turnCwd !== undefined) {
     throw new Error("forked Codex runs cannot set a turn cwd");

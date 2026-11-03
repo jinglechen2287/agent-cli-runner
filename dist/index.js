@@ -681,7 +681,6 @@ function validateSessionOptions(opts) {
     );
   }
   if (opts.forkSessionId) {
-    if (!opts.isolated) throw new Error("forkSessionId runs only isolated \u2014 pass isolated: true");
     if (opts.newSessionId || opts.resumeSessionId) {
       throw new Error(
         "forkSessionId is mutually exclusive with newSessionId and resumeSessionId"
@@ -744,9 +743,11 @@ function claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeC
     ...opts.disallowedTools?.length ? { disallowedTools: [...opts.disallowedTools] } : {},
     ...opts.settingSources ? { settingSources: [...opts.settingSources] } : {},
     ...opts.settings !== void 0 ? { settings: opts.settings } : {},
-    ...opts.forkSessionId ? { hooks: { ...opts.hooks, PreToolUse: [DENY_EVERY_TOOL, ...opts.hooks?.PreToolUse ?? []] } } : opts.hooks ? { hooks: opts.hooks } : {},
+    // An isolated fork has no tools, and refuses any it reaches for anyway; a
+    // guarded fork keeps the caller's tools and guard as they are.
+    ...opts.forkSessionId && opts.isolated ? { hooks: { ...opts.hooks, PreToolUse: [DENY_EVERY_TOOL, ...opts.hooks?.PreToolUse ?? []] } } : opts.hooks ? { hooks: opts.hooks } : {},
     ...opts.mcpServers ? { mcpServers: { ...opts.mcpServers } } : {},
-    ...opts.isolated ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } } : {}
+    ...opts.isolated ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } } : opts.forkSessionId ? { persistSession: false } : {}
   };
 }
 function createInputQueue() {
@@ -1616,6 +1617,19 @@ var FORK_ALLOWED_ITEMS = /* @__PURE__ */ new Set([
   "contextCompaction"
 ]);
 function requestCodexThread(client, opts) {
+  if (opts.forkSessionId && !opts.isolated) {
+    return client.request("thread/fork", {
+      threadId: opts.forkSessionId,
+      cwd: opts.cwd,
+      ...opts.model ? { model: opts.model } : {},
+      ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
+      ephemeral: true,
+      excludeTurns: true,
+      sandbox: "read-only",
+      approvalPolicy: "never",
+      experimentalRawEvents: true
+    });
+  }
   if (opts.forkSessionId) {
     const forkSessionId = opts.forkSessionId;
     return client.request("config/read", { cwd: opts.cwd }).then((read) => client.request("thread/fork", {
@@ -1940,7 +1954,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
       return;
     }
     if (method === "item/started" || method === "item/completed") {
-      if (opts.forkSessionId && method === "item/started" && refuseForkedTool(params)) return;
+      if (opts.forkSessionId && opts.isolated && method === "item/started" && refuseForkedTool(params)) return;
       handleItem(method, params);
       return;
     }
@@ -2419,7 +2433,6 @@ async function runCodex(opts) {
   return runIsolatedCodex(opts);
 }
 function runForkedCodex(opts) {
-  if (!opts.isolated) throw new Error("forkSessionId runs only isolated \u2014 pass isolated: true");
   if (opts.appServerSession || opts.appServerClient) {
     throw new Error("forked Codex runs cannot reuse app-server state");
   }
@@ -2429,8 +2442,11 @@ function runForkedCodex(opts) {
   if (opts.dangerouslyBypassApprovalsAndSandbox) {
     throw new Error("forked Codex runs cannot bypass approvals and sandboxing");
   }
-  if (opts.sandboxPolicy) {
+  if (opts.isolated && opts.sandboxPolicy) {
     throw new Error("forked Codex runs cannot override the sandbox policy");
+  }
+  if (opts.sandboxPolicy && opts.sandboxPolicy.type !== "readOnly") {
+    throw new Error("forked Codex runs keep a read-only sandbox");
   }
   if (opts.turnCwd !== void 0) {
     throw new Error("forked Codex runs cannot set a turn cwd");

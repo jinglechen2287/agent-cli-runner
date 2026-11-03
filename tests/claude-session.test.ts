@@ -792,6 +792,34 @@ describe("createClaudeSession options", () => {
     });
   });
 
+  it("forks a guarded session with the caller's tools, permissions and guard, saving nothing", async () => {
+    const fake = makeFakeQuery();
+    const guard = { matcher: "*", hooks: [async () => ({})] };
+    await startSession(fake, {
+      newSessionId: undefined,
+      forkSessionId: "22222222-2222-4222-8222-222222222222",
+      tools: ["default"],
+      allowedTools: ["Glob", "Grep"],
+      permissionMode: "auto",
+      settingSources: ["user", "project", "local"],
+      settings: { disableAllHooks: false },
+      hooks: { PreToolUse: [guard] },
+    });
+    expect(fake.options()).toMatchObject({
+      resume: "22222222-2222-4222-8222-222222222222",
+      forkSession: true,
+      persistSession: false,
+      tools: { type: "preset", preset: "claude_code" },
+      allowedTools: ["Glob", "Grep"],
+      permissionMode: "auto",
+      settingSources: ["user", "project", "local"],
+      settings: { disableAllHooks: false },
+    });
+    // The caller's guard alone decides: nothing is put in front of it.
+    expect(fake.options().hooks?.PreToolUse).toEqual([guard]);
+    expect(fake.options().sessionId).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
   it("passes MCP servers through to the SDK", async () => {
     const fake = makeFakeQuery();
     const mcpServers = { "agent-remote": { type: "http" as const, url: "http://127.0.0.1:1/mcp" } };
@@ -814,7 +842,6 @@ describe("createClaudeSession options", () => {
     [{ newSessionId: undefined, isolated: true, resumeSessionId: "b" }, "cannot resume"],
     [{ isolated: true, permissionMode: "plan" as const }, "cannot set a permission mode"],
     [{ isolated: true, tools: ["Read"] }, "cannot set tools"],
-    [{ newSessionId: undefined, forkSessionId: "p" }, "only isolated"],
     [{ isolated: true, forkSessionId: "p" }, "mutually exclusive"],
     [{ newSessionId: undefined, isolated: true, forkSessionId: "p", resumeSessionId: "b" }, "mutually exclusive"],
   ])("rejects invalid option combinations %#", async (overrides, message) => {

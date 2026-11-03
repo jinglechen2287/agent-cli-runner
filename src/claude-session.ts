@@ -112,9 +112,11 @@ export interface CreateClaudeSessionOptions {
   /** A non-persistent session with customizations, tools, and MCP disabled,
    * for small metadata tasks such as chat titles. */
   isolated?: boolean;
-  /** Fork this existing session for an isolated side run: it sees that
-   * session's history, writes nothing back, and may use no tool. Requires
-   * `isolated`; mutually exclusive with newSessionId and resumeSessionId. */
+  /** Fork this existing session for a side run: it sees that session's
+   * history and writes nothing back. With `isolated` it may use no tool;
+   * without, it keeps the tools, permission mode, settings and hooks given
+   * here, as any guarded session would. Mutually exclusive with
+   * newSessionId and resumeSessionId. */
   forkSessionId?: string;
   /** Override {@link CLAUDE_INTERRUPT_GRACE_MS}. */
   interruptGraceMs?: number;
@@ -184,7 +186,6 @@ function validateSessionOptions(opts: CreateClaudeSessionOptions): void {
     );
   }
   if (opts.forkSessionId) {
-    if (!opts.isolated) throw new Error("forkSessionId runs only isolated — pass isolated: true");
     if (opts.newSessionId || opts.resumeSessionId) {
       throw new Error(
         "forkSessionId is mutually exclusive with newSessionId and resumeSessionId",
@@ -262,13 +263,15 @@ export function claudeSessionQueryOptions(
     ...(opts.disallowedTools?.length ? { disallowedTools: [...opts.disallowedTools] } : {}),
     ...(opts.settingSources ? { settingSources: [...opts.settingSources] } : {}),
     ...(opts.settings !== undefined ? { settings: opts.settings as NonNullable<Options["settings"]> } : {}),
-    ...(opts.forkSessionId
+    // An isolated fork has no tools, and refuses any it reaches for anyway; a
+    // guarded fork keeps the caller's tools and guard as they are.
+    ...(opts.forkSessionId && opts.isolated
       ? { hooks: { ...opts.hooks, PreToolUse: [DENY_EVERY_TOOL, ...(opts.hooks?.PreToolUse ?? [])] } }
       : opts.hooks ? { hooks: opts.hooks } : {}),
     ...(opts.mcpServers ? { mcpServers: { ...opts.mcpServers } } : {}),
     ...(opts.isolated
       ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } }
-      : {}),
+      : opts.forkSessionId ? { persistSession: false } : {}),
   };
 }
 

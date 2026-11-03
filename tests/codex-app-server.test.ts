@@ -214,9 +214,75 @@ describe("forked Codex side runs", () => {
     expect(requests.map(({ method }) => method)).toEqual(["initialize", "initialized", "config/read"]);
   });
 
+  it("forks a guarded side run with the caller's sandbox, leaving its tools on", async () => {
+    const child = makeFakeChild();
+    const requests = forkServer(child, (id) => {
+      send(child, { id, result: { turn: completedTurn("turn-1", "inProgress") } });
+      for (const method of ["item/started", "item/completed"]) {
+        send(child, {
+          method,
+          params: {
+            threadId: "fork-1",
+            turnId: "turn-1",
+            item: {
+              type: "commandExecution",
+              id: "command-1",
+              command: "head -1 notes.txt",
+              cwd: "/tmp/project",
+              status: method === "item/started" ? "inProgress" : "completed",
+              aggregatedOutput: "first line",
+              exitCode: 0,
+            },
+          },
+        });
+      }
+      send(child, {
+        method: "item/completed",
+        params: { threadId: "fork-1", turnId: "turn-1", item: { type: "agentMessage", id: "m-1", text: "first line" } },
+      });
+      send(child, { method: "turn/completed", params: { threadId: "fork-1", turn: completedTurn("turn-1") } });
+    });
+
+    const result = await runCodex({
+      prompt: "what's the first line of notes.txt?",
+      cwd: "/tmp/project",
+      forkSessionId: "parent-1",
+      model: "gpt-test",
+      developerInstructions: "answer once",
+      sandboxPolicy: { type: "readOnly", networkAccess: true },
+      spawnFn: (() => child) as never,
+    });
+
+    expect(requests.find(({ method }) => method === "thread/fork")?.params).toEqual({
+      threadId: "parent-1",
+      cwd: "/tmp/project",
+      model: "gpt-test",
+      developerInstructions: "answer once",
+      ephemeral: true,
+      excludeTurns: true,
+      sandbox: "read-only",
+      approvalPolicy: "never",
+      experimentalRawEvents: true,
+    });
+    expect(requests.find(({ method }) => method === "turn/start")?.params).toMatchObject({
+      threadId: "fork-1",
+      sandboxPolicy: { type: "readOnly", networkAccess: true },
+    });
+    expect(result).toMatchObject({ text: "first line", exitCode: 0 });
+  });
+
+  it("rejects options a guarded fork cannot take", async () => {
+    const base = { prompt: "x", cwd: "/tmp", forkSessionId: "parent-1" };
+    await expect(runCodex({ ...base, resumeSessionId: "thread-1" })).rejects.toThrow(/mutually exclusive/i);
+    await expect(runCodex({ ...base, dangerouslyBypassApprovalsAndSandbox: true })).rejects.toThrow(/cannot bypass/i);
+    await expect(runCodex({ ...base, turnCwd: "/tmp/canvas" })).rejects.toThrow(/turn cwd/i);
+    for (const sandboxPolicy of [{ type: "workspaceWrite" }, { type: "dangerFullAccess" }] as const) {
+      await expect(runCodex({ ...base, sandboxPolicy })).rejects.toThrow(/read-only sandbox/i);
+    }
+  });
+
   it("rejects fork options a side run cannot take", async () => {
     const base = { prompt: "x", cwd: "/tmp", forkSessionId: "parent-1" };
-    await expect(runCodex(base)).rejects.toThrow(/only isolated/i);
     await expect(runCodex({ ...base, isolated: true, resumeSessionId: "thread-1" }))
       .rejects.toThrow(/mutually exclusive/i);
     await expect(runCodex({ ...base, isolated: true, dangerouslyBypassApprovalsAndSandbox: true }))

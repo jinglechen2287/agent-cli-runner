@@ -252,9 +252,11 @@ interface CreateClaudeSessionOptions {
     /** A non-persistent session with customizations, tools, and MCP disabled,
      * for small metadata tasks such as chat titles. */
     isolated?: boolean;
-    /** Fork this existing session for an isolated side run: it sees that
-     * session's history, writes nothing back, and may use no tool. Requires
-     * `isolated`; mutually exclusive with newSessionId and resumeSessionId. */
+    /** Fork this existing session for a side run: it sees that session's
+     * history and writes nothing back. With `isolated` it may use no tool;
+     * without, it keeps the tools, permission mode, settings and hooks given
+     * here, as any guarded session would. Mutually exclusive with
+     * newSessionId and resumeSessionId. */
     forkSessionId?: string;
     /** Override {@link CLAUDE_INTERRUPT_GRACE_MS}. */
     interruptGraceMs?: number;
@@ -343,9 +345,9 @@ interface RunClaudeOptions extends CommonRunOptions {
     /** Run a non-persistent one-shot request with customizations, tools, and MCP
      * disabled. Intended for small metadata tasks such as chat titles. */
     isolated?: boolean;
-    /** Fork this existing session for an isolated side run: it sees that
-     * session's history, writes nothing back, and may use no tool. Requires
-     * `isolated`. */
+    /** Fork this existing session for a side run: it sees that session's
+     * history and writes nothing back. With `isolated` it may use no tool;
+     * without, it keeps the tools, permissions and hooks given here. */
     forkSessionId?: string;
     /** Test seam: replaces the Agent SDK's `query()`. */
     queryFn?: ClaudeQueryFn;
@@ -570,11 +572,12 @@ interface RunCodexOptions extends CommonRunOptions {
      * Codex app-server cannot currently reproduce both ignore flags per thread,
      * so this narrow metadata path intentionally remains on `codex exec`. */
     isolated?: boolean;
-    /** Fork this existing app-server thread for an isolated side run: an
-     * ephemeral, read-only copy with Codex's tools and MCP servers turned off
-     * (see {@link CODEX_FORK_CONFIG}). It sees the thread's history and writes
-     * nothing back; a tool it starts anyway interrupts the run, which rejects.
-     * Requires `isolated`; runs on a one-off app-server, not `codex exec`. */
+    /** Fork this existing app-server thread for a side run, on a one-off
+     * app-server: an ephemeral copy that sees the thread's history and writes
+     * nothing back. With `isolated`, its tools and MCP servers are turned off
+     * (see {@link CODEX_FORK_CONFIG}) and one it starts anyway interrupts the
+     * run, which rejects. Without, it keeps Codex's tools under the caller's
+     * `sandboxPolicy`. */
     forkSessionId?: string;
 }
 /** Run a Codex turn. Regular work uses app-server; only isolated metadata
