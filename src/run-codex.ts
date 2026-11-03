@@ -82,6 +82,12 @@ export interface RunCodexOptions extends CommonRunOptions {
    * Codex app-server cannot currently reproduce both ignore flags per thread,
    * so this narrow metadata path intentionally remains on `codex exec`. */
   isolated?: boolean;
+  /** Fork this existing app-server thread for an isolated side run: an
+   * ephemeral, read-only copy with Codex's tools and MCP servers turned off
+   * (see {@link CODEX_FORK_CONFIG}). It sees the thread's history and writes
+   * nothing back; a tool it starts anyway interrupts the run, which rejects.
+   * Requires `isolated`; runs on a one-off app-server, not `codex exec`. */
+  forkSessionId?: string;
 }
 
 interface CodexExecEvent {
@@ -320,6 +326,7 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
 /** Run a Codex turn. Regular work uses app-server; only isolated metadata
  * requests retain the legacy non-interactive `codex exec` path. */
 export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
+  if (opts.forkSessionId) return runForkedCodex(opts);
   if (!opts.isolated) {
     if (opts.appServerClient && opts.appServerSession) {
       throw new Error("Codex runs cannot use both appServerClient and appServerSession");
@@ -361,4 +368,24 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
     throw new Error("isolated Codex runs cannot set a service tier — codex exec has no equivalent");
   }
   return runIsolatedCodex(opts);
+}
+
+function runForkedCodex(opts: RunCodexOptions): Promise<RunResult> {
+  if (!opts.isolated) throw new Error("forkSessionId runs only isolated — pass isolated: true");
+  if (opts.appServerSession || opts.appServerClient) {
+    throw new Error("forked Codex runs cannot reuse app-server state");
+  }
+  if (opts.resumeSessionId) {
+    throw new Error("forkSessionId and resumeSessionId are mutually exclusive");
+  }
+  if (opts.dangerouslyBypassApprovalsAndSandbox) {
+    throw new Error("forked Codex runs cannot bypass approvals and sandboxing");
+  }
+  if (opts.sandboxPolicy) {
+    throw new Error("forked Codex runs cannot override the sandbox policy");
+  }
+  if (opts.turnCwd !== undefined) {
+    throw new Error("forked Codex runs cannot set a turn cwd");
+  }
+  return runCodexAppServer(opts);
 }

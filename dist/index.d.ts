@@ -252,6 +252,10 @@ interface CreateClaudeSessionOptions {
     /** A non-persistent session with customizations, tools, and MCP disabled,
      * for small metadata tasks such as chat titles. */
     isolated?: boolean;
+    /** Fork this existing session for an isolated side run: it sees that
+     * session's history, writes nothing back, and may use no tool. Requires
+     * `isolated`; mutually exclusive with newSessionId and resumeSessionId. */
+    forkSessionId?: string;
     /** Override {@link CLAUDE_INTERRUPT_GRACE_MS}. */
     interruptGraceMs?: number;
     /** Override {@link CLAUDE_FOLLOW_UP_GRACE_MS}. */
@@ -339,6 +343,10 @@ interface RunClaudeOptions extends CommonRunOptions {
     /** Run a non-persistent one-shot request with customizations, tools, and MCP
      * disabled. Intended for small metadata tasks such as chat titles. */
     isolated?: boolean;
+    /** Fork this existing session for an isolated side run: it sees that
+     * session's history, writes nothing back, and may use no tool. Requires
+     * `isolated`. */
+    forkSessionId?: string;
     /** Test seam: replaces the Agent SDK's `query()`. */
     queryFn?: ClaudeQueryFn;
 }
@@ -443,7 +451,7 @@ interface CreateCodexAppServerClientOptions {
     spawnFn?: RunCodexOptions["spawnFn"];
     requestTimeoutMs?: number;
 }
-type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "spawnFn">;
+type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "forkSessionId" | "spawnFn">;
 interface CodexAppServerSession {
     readonly threadId: string;
     readonly cwd: string;
@@ -482,6 +490,26 @@ type CodexJsonValue = string | number | boolean | null | CodexJsonValue[] | {
     [key: string]: CodexJsonValue;
 };
 declare function createCodexAppServerClient(options: CreateCodexAppServerClientOptions): Promise<CodexAppServerClient>;
+/** Thread config for a forked side run: no web search, and every tool
+ * feature off, so the copy can only answer from its history. The run adds
+ * each configured MCP server, switched off by name, and still fails closed
+ * on any item beyond a message or reasoning that starts anyway. */
+declare const CODEX_FORK_CONFIG: {
+    readonly web_search: "disabled";
+    readonly features: {
+        readonly multi_agent: false;
+        readonly multi_agent_v2: false;
+        readonly goals: false;
+        readonly shell_tool: false;
+        readonly unified_exec: false;
+        readonly apps: false;
+        readonly image_generation: false;
+        readonly view_image: false;
+        readonly sleep_tool: false;
+        readonly browser_use: false;
+        readonly computer_use: false;
+    };
+};
 declare function createCodexAppServerSession(options: CreateCodexAppServerSessionOptions): Promise<CodexAppServerSession>;
 
 /** Stripped so a Codex turn spawned from within another Codex session does
@@ -542,6 +570,12 @@ interface RunCodexOptions extends CommonRunOptions {
      * Codex app-server cannot currently reproduce both ignore flags per thread,
      * so this narrow metadata path intentionally remains on `codex exec`. */
     isolated?: boolean;
+    /** Fork this existing app-server thread for an isolated side run: an
+     * ephemeral, read-only copy with Codex's tools and MCP servers turned off
+     * (see {@link CODEX_FORK_CONFIG}). It sees the thread's history and writes
+     * nothing back; a tool it starts anyway interrupts the run, which rejects.
+     * Requires `isolated`; runs on a one-off app-server, not `codex exec`. */
+    forkSessionId?: string;
 }
 /** Run a Codex turn. Regular work uses app-server; only isolated metadata
  * requests retain the legacy non-interactive `codex exec` path. */
@@ -733,4 +767,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };

@@ -753,6 +753,45 @@ describe("createClaudeSession options", () => {
     expect(fake.options().sessionId).toMatch(/^[0-9a-f-]{36}$/);
   });
 
+  it("forks a session as an isolated, non-persistent side run", async () => {
+    const fake = makeFakeQuery();
+    await startSession(fake, {
+      newSessionId: undefined,
+      isolated: true,
+      forkSessionId: "22222222-2222-4222-8222-222222222222",
+    });
+    expect(fake.options()).toMatchObject({
+      resume: "22222222-2222-4222-8222-222222222222",
+      forkSession: true,
+      tools: [],
+      strictMcpConfig: true,
+      persistSession: false,
+      extraArgs: { "safe-mode": null },
+    });
+    // The fork gets an id of its own, never the parent's.
+    expect(fake.options().sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(fake.options().sessionId).not.toBe("22222222-2222-4222-8222-222222222222");
+  });
+
+  it("denies every tool a forked run reaches for", async () => {
+    const fake = makeFakeQuery();
+    await startSession(fake, {
+      newSessionId: undefined,
+      isolated: true,
+      forkSessionId: "22222222-2222-4222-8222-222222222222",
+    });
+    const [matcher] = fake.options().hooks?.PreToolUse ?? [];
+    expect(matcher?.matcher).toBe("*");
+    const decision = await matcher!.hooks[0]!(
+      { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" } } as never,
+      "tool-1",
+      { signal: new AbortController().signal },
+    );
+    expect(decision).toMatchObject({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
+    });
+  });
+
   it("passes MCP servers through to the SDK", async () => {
     const fake = makeFakeQuery();
     const mcpServers = { "agent-remote": { type: "http" as const, url: "http://127.0.0.1:1/mcp" } };
@@ -775,6 +814,9 @@ describe("createClaudeSession options", () => {
     [{ newSessionId: undefined, isolated: true, resumeSessionId: "b" }, "cannot resume"],
     [{ isolated: true, permissionMode: "plan" as const }, "cannot set a permission mode"],
     [{ isolated: true, tools: ["Read"] }, "cannot set tools"],
+    [{ newSessionId: undefined, forkSessionId: "p" }, "only isolated"],
+    [{ isolated: true, forkSessionId: "p" }, "mutually exclusive"],
+    [{ newSessionId: undefined, isolated: true, forkSessionId: "p", resumeSessionId: "b" }, "mutually exclusive"],
   ])("rejects invalid option combinations %#", async (overrides, message) => {
     const fake = makeFakeQuery();
     await expect(startSession(fake, overrides)).rejects.toThrow(message);

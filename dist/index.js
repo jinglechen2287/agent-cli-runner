@@ -680,6 +680,14 @@ function validateSessionOptions(opts) {
       "newSessionId and resumeSessionId are mutually exclusive \u2014 pass one or the other"
     );
   }
+  if (opts.forkSessionId) {
+    if (!opts.isolated) throw new Error("forkSessionId runs only isolated \u2014 pass isolated: true");
+    if (opts.newSessionId || opts.resumeSessionId) {
+      throw new Error(
+        "forkSessionId is mutually exclusive with newSessionId and resumeSessionId"
+      );
+    }
+  }
   if (opts.isolated && opts.resumeSessionId) {
     throw new Error("isolated Claude runs cannot resume a session");
   }
@@ -693,6 +701,18 @@ function validateSessionOptions(opts) {
     throw new Error("isolated Claude runs cannot set MCP servers \u2014 isolated already disables MCP");
   }
 }
+var DENY_EVERY_TOOL = {
+  matcher: "*",
+  hooks: [
+    async () => ({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: "A forked side run may not use tools."
+      }
+    })
+  ]
+};
 function sdkTools(tools) {
   if (!tools) return void 0;
   if (tools.length === 1 && tools[0] === "default") return { type: "preset", preset: "claude_code" };
@@ -706,7 +726,8 @@ function claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeC
     env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
     pathToClaudeCodeExecutable: executablePath,
     spawnClaudeCodeProcess,
-    ...opts.resumeSessionId ? { resume: opts.resumeSessionId } : { sessionId },
+    // A fork names its own id alongside the session it copies.
+    ...opts.forkSessionId ? { resume: opts.forkSessionId, forkSession: true, sessionId } : opts.resumeSessionId ? { resume: opts.resumeSessionId } : { sessionId },
     // Omitting systemPrompt sends an empty one, not Claude Code's.
     systemPrompt: {
       type: "preset",
@@ -723,7 +744,7 @@ function claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeC
     ...opts.disallowedTools?.length ? { disallowedTools: [...opts.disallowedTools] } : {},
     ...opts.settingSources ? { settingSources: [...opts.settingSources] } : {},
     ...opts.settings !== void 0 ? { settings: opts.settings } : {},
-    ...opts.hooks ? { hooks: opts.hooks } : {},
+    ...opts.forkSessionId ? { hooks: { ...opts.hooks, PreToolUse: [DENY_EVERY_TOOL, ...opts.hooks?.PreToolUse ?? []] } } : opts.hooks ? { hooks: opts.hooks } : {},
     ...opts.mcpServers ? { mcpServers: { ...opts.mcpServers } } : {},
     ...opts.isolated ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } } : {}
   };
@@ -1058,6 +1079,7 @@ async function runClaude(opts) {
     newSessionId,
     resumeSessionId,
     isolated,
+    forkSessionId,
     ...callbacks
   } = opts;
   if (signal?.aborted) throw new AbortError("claude run aborted");
@@ -1079,7 +1101,8 @@ async function runClaude(opts) {
     ...hooks !== void 0 ? { hooks } : {},
     ...newSessionId !== void 0 ? { newSessionId } : {},
     ...resumeSessionId !== void 0 ? { resumeSessionId } : {},
-    ...isolated !== void 0 ? { isolated } : {}
+    ...isolated !== void 0 ? { isolated } : {},
+    ...forkSessionId !== void 0 ? { forkSessionId } : {}
   });
   try {
     return await session.runTurn({
@@ -1567,7 +1590,53 @@ function turnIdFrom(value) {
 function turnStatus(value) {
   return text(record(record(value)?.turn)?.status);
 }
+var CODEX_FORK_CONFIG = {
+  web_search: "disabled",
+  features: {
+    multi_agent: false,
+    multi_agent_v2: false,
+    goals: false,
+    shell_tool: false,
+    unified_exec: false,
+    apps: false,
+    image_generation: false,
+    view_image: false,
+    sleep_tool: false,
+    browser_use: false,
+    computer_use: false
+  }
+};
+var FORK_ALLOWED_ITEMS = /* @__PURE__ */ new Set([
+  "userMessage",
+  "user_message",
+  "agentMessage",
+  "agent_message",
+  "reasoning",
+  "plan",
+  "contextCompaction"
+]);
 function requestCodexThread(client, opts) {
+  if (opts.forkSessionId) {
+    const forkSessionId = opts.forkSessionId;
+    return client.request("config/read", { cwd: opts.cwd }).then((read) => client.request("thread/fork", {
+      threadId: forkSessionId,
+      cwd: opts.cwd,
+      ...opts.model ? { model: opts.model } : {},
+      ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
+      ephemeral: true,
+      // Ephemeral forks of paginated threads must skip hydrating history.
+      excludeTurns: true,
+      sandbox: "read-only",
+      approvalPolicy: "never",
+      experimentalRawEvents: true,
+      config: {
+        ...CODEX_FORK_CONFIG,
+        mcp_servers: Object.fromEntries(
+          Object.keys(record(record(record(read)?.config)?.mcp_servers) ?? {}).map((name) => [name, { enabled: false }])
+        )
+      }
+    }));
+  }
   const params = {
     cwd: opts.cwd,
     experimentalRawEvents: true,
@@ -1687,6 +1756,19 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (!interruption || !threadId || !turnId) return;
     void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
     }).finally(() => failLifecycle(interruption));
+  };
+  const refuseForkedTool = (params) => {
+    if (params.threadId !== threadId || !matchTurn(text(params.turnId))) return false;
+    const item = record(params.item);
+    const type = item ? text(item.type) : void 0;
+    if (!item || !type || FORK_ALLOWED_ITEMS.has(type)) return false;
+    const name = toolName(item) ?? type;
+    if (threadId && turnId) {
+      void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
+      });
+    }
+    settleError(new CodexTurnError(`A forked side run tried to use ${name}`));
+    return true;
   };
   const interrupt = (error) => {
     if (interruption || settled) return;
@@ -1858,6 +1940,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
       return;
     }
     if (method === "item/started" || method === "item/completed") {
+      if (opts.forkSessionId && method === "item/started" && refuseForkedTool(params)) return;
       handleItem(method, params);
       return;
     }
@@ -2298,6 +2381,7 @@ async function runIsolatedCodex(opts) {
   });
 }
 async function runCodex(opts) {
+  if (opts.forkSessionId) return runForkedCodex(opts);
   if (!opts.isolated) {
     if (opts.appServerClient && opts.appServerSession) {
       throw new Error("Codex runs cannot use both appServerClient and appServerSession");
@@ -2333,6 +2417,25 @@ async function runCodex(opts) {
     throw new Error("isolated Codex runs cannot set a service tier \u2014 codex exec has no equivalent");
   }
   return runIsolatedCodex(opts);
+}
+function runForkedCodex(opts) {
+  if (!opts.isolated) throw new Error("forkSessionId runs only isolated \u2014 pass isolated: true");
+  if (opts.appServerSession || opts.appServerClient) {
+    throw new Error("forked Codex runs cannot reuse app-server state");
+  }
+  if (opts.resumeSessionId) {
+    throw new Error("forkSessionId and resumeSessionId are mutually exclusive");
+  }
+  if (opts.dangerouslyBypassApprovalsAndSandbox) {
+    throw new Error("forked Codex runs cannot bypass approvals and sandboxing");
+  }
+  if (opts.sandboxPolicy) {
+    throw new Error("forked Codex runs cannot override the sandbox policy");
+  }
+  if (opts.turnCwd !== void 0) {
+    throw new Error("forked Codex runs cannot set a turn cwd");
+  }
+  return runCodexAppServer(opts);
 }
 
 // src/model-catalog.ts
@@ -2931,6 +3034,7 @@ export {
   CLAUDE_FOLLOW_UP_GRACE_MS,
   CLAUDE_INTERRUPT_GRACE_MS,
   CLAUDE_STRIPPED_ENV_VARS,
+  CODEX_FORK_CONFIG,
   CODEX_STRIPPED_ENV_VARS,
   CodexTurnError,
   KNOWN_CONTEXT_WINDOWS,

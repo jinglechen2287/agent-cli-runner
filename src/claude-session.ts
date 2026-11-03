@@ -112,6 +112,10 @@ export interface CreateClaudeSessionOptions {
   /** A non-persistent session with customizations, tools, and MCP disabled,
    * for small metadata tasks such as chat titles. */
   isolated?: boolean;
+  /** Fork this existing session for an isolated side run: it sees that
+   * session's history, writes nothing back, and may use no tool. Requires
+   * `isolated`; mutually exclusive with newSessionId and resumeSessionId. */
+  forkSessionId?: string;
   /** Override {@link CLAUDE_INTERRUPT_GRACE_MS}. */
   interruptGraceMs?: number;
   /** Override {@link CLAUDE_FOLLOW_UP_GRACE_MS}. */
@@ -179,6 +183,14 @@ function validateSessionOptions(opts: CreateClaudeSessionOptions): void {
       "newSessionId and resumeSessionId are mutually exclusive — pass one or the other",
     );
   }
+  if (opts.forkSessionId) {
+    if (!opts.isolated) throw new Error("forkSessionId runs only isolated — pass isolated: true");
+    if (opts.newSessionId || opts.resumeSessionId) {
+      throw new Error(
+        "forkSessionId is mutually exclusive with newSessionId and resumeSessionId",
+      );
+    }
+  }
   if (opts.isolated && opts.resumeSessionId) {
     throw new Error("isolated Claude runs cannot resume a session");
   }
@@ -192,6 +204,21 @@ function validateSessionOptions(opts: CreateClaudeSessionOptions): void {
     throw new Error("isolated Claude runs cannot set MCP servers — isolated already disables MCP");
   }
 }
+
+/** A forked side run's backstop. Its tool list is already empty, but the
+ * copied history names tools the model may still reach for: refuse them all. */
+const DENY_EVERY_TOOL: HookCallbackMatcher = {
+  matcher: "*",
+  hooks: [
+    async () => ({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse" as const,
+        permissionDecision: "deny" as const,
+        permissionDecisionReason: "A forked side run may not use tools.",
+      },
+    }),
+  ],
+};
 
 function sdkTools(tools: string[] | undefined): Options["tools"] | undefined {
   if (!tools) return undefined;
@@ -215,7 +242,10 @@ export function claudeSessionQueryOptions(
     env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
     pathToClaudeCodeExecutable: executablePath,
     spawnClaudeCodeProcess,
-    ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : { sessionId }),
+    // A fork names its own id alongside the session it copies.
+    ...(opts.forkSessionId
+      ? { resume: opts.forkSessionId, forkSession: true, sessionId }
+      : opts.resumeSessionId ? { resume: opts.resumeSessionId } : { sessionId }),
     // Omitting systemPrompt sends an empty one, not Claude Code's.
     systemPrompt: {
       type: "preset",
@@ -232,7 +262,9 @@ export function claudeSessionQueryOptions(
     ...(opts.disallowedTools?.length ? { disallowedTools: [...opts.disallowedTools] } : {}),
     ...(opts.settingSources ? { settingSources: [...opts.settingSources] } : {}),
     ...(opts.settings !== undefined ? { settings: opts.settings as NonNullable<Options["settings"]> } : {}),
-    ...(opts.hooks ? { hooks: opts.hooks } : {}),
+    ...(opts.forkSessionId
+      ? { hooks: { ...opts.hooks, PreToolUse: [DENY_EVERY_TOOL, ...(opts.hooks?.PreToolUse ?? [])] } }
+      : opts.hooks ? { hooks: opts.hooks } : {}),
     ...(opts.mcpServers ? { mcpServers: { ...opts.mcpServers } } : {}),
     ...(opts.isolated
       ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } }

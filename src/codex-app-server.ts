@@ -92,6 +92,7 @@ export type CodexAppServerTurnOptions = Omit<
   | "executablePath"
   | "isolated"
   | "resumeSessionId"
+  | "forkSessionId"
   | "spawnFn"
 >;
 
@@ -671,6 +672,38 @@ function turnStatus(value: unknown): string | undefined {
   return text(record(record(value)?.turn)?.status);
 }
 
+/** Thread config for a forked side run: no web search, and every tool
+ * feature off, so the copy can only answer from its history. The run adds
+ * each configured MCP server, switched off by name, and still fails closed
+ * on any item beyond a message or reasoning that starts anyway. */
+export const CODEX_FORK_CONFIG = {
+  web_search: "disabled",
+  features: {
+    multi_agent: false,
+    multi_agent_v2: false,
+    goals: false,
+    shell_tool: false,
+    unified_exec: false,
+    apps: false,
+    image_generation: false,
+    view_image: false,
+    sleep_tool: false,
+    browser_use: false,
+    computer_use: false,
+  },
+} as const;
+
+/** What a forked side run may produce: talk and thought, nothing that acts. */
+const FORK_ALLOWED_ITEMS: ReadonlySet<string> = new Set([
+  "userMessage",
+  "user_message",
+  "agentMessage",
+  "agent_message",
+  "reasoning",
+  "plan",
+  "contextCompaction",
+]);
+
 interface OpenedCodexThread {
   threadId: string;
   model?: string;
@@ -685,8 +718,36 @@ function requestCodexThread(
     | "developerInstructions"
     | "model"
     | "resumeSessionId"
+    | "forkSessionId"
   > & { config?: CodexConfigOverrides },
 ): Promise<unknown> {
+  if (opts.forkSessionId) {
+    const forkSessionId = opts.forkSessionId;
+    // The user's MCP servers can only be switched off by name — an empty
+    // table merges with their config and leaves every one running — so read
+    // what applies here first. A config that can't be read forks nothing.
+    return client.request("config/read", { cwd: opts.cwd }).then((read) => client.request("thread/fork", {
+      threadId: forkSessionId,
+      cwd: opts.cwd,
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.developerInstructions
+        ? { developerInstructions: opts.developerInstructions }
+        : {}),
+      ephemeral: true,
+      // Ephemeral forks of paginated threads must skip hydrating history.
+      excludeTurns: true,
+      sandbox: "read-only",
+      approvalPolicy: "never",
+      experimentalRawEvents: true,
+      config: {
+        ...CODEX_FORK_CONFIG,
+        mcp_servers: Object.fromEntries(
+          Object.keys(record(record(record(read)?.config)?.mcp_servers) ?? {})
+            .map((name) => [name, { enabled: false }]),
+        ),
+      },
+    }));
+  }
   // One shared params object so resumed threads can never silently diverge
   // from fresh ones (e.g. losing raw events, and with them WebFetch URLs).
   const params = {
@@ -891,6 +952,23 @@ async function runCodexAppServerTurn(
       .finally(() => failLifecycle(interruption as AbortError | TimeoutError));
   };
 
+  /** A forked side run that starts anything beyond a message or reasoning —
+   * a tool, a subagent, whatever a later Codex adds — is stopped and fails:
+   * its config turns every tool off, so one starting means isolation did
+   * not hold. An allow-list, so an item type nobody knew of fails closed. */
+  const refuseForkedTool = (params: Record<string, unknown>): boolean => {
+    if (params.threadId !== threadId || !matchTurn(text(params.turnId))) return false;
+    const item = record(params.item);
+    const type = item ? text(item.type) : undefined;
+    if (!item || !type || FORK_ALLOWED_ITEMS.has(type)) return false;
+    const name = toolName(item) ?? type;
+    if (threadId && turnId) {
+      void client.request("turn/interrupt", { threadId, turnId }).catch(() => {});
+    }
+    settleError(new CodexTurnError(`A forked side run tried to use ${name}`));
+    return true;
+  };
+
   const interrupt = (error: AbortError | TimeoutError): void => {
     if (interruption || settled) return;
     interruption = error;
@@ -1086,6 +1164,7 @@ async function runCodexAppServerTurn(
       return;
     }
     if (method === "item/started" || method === "item/completed") {
+      if (opts.forkSessionId && method === "item/started" && refuseForkedTool(params)) return;
       handleItem(method, params);
       return;
     }

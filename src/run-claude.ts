@@ -53,6 +53,10 @@ export interface RunClaudeOptions extends CommonRunOptions {
   /** Run a non-persistent one-shot request with customizations, tools, and MCP
    * disabled. Intended for small metadata tasks such as chat titles. */
   isolated?: boolean;
+  /** Fork this existing session for an isolated side run: it sees that
+   * session's history, writes nothing back, and may use no tool. Requires
+   * `isolated`. */
+  forkSessionId?: string;
   /** Test seam: replaces the Agent SDK's `query()`. */
   queryFn?: ClaudeQueryFn;
 }
@@ -84,6 +88,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     newSessionId,
     resumeSessionId,
     isolated,
+    forkSessionId,
     ...callbacks
   } = opts;
   // Checked before the session exists, so an aborted run never spawns.
@@ -107,6 +112,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     ...(newSessionId !== undefined ? { newSessionId } : {}),
     ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
     ...(isolated !== undefined ? { isolated } : {}),
+    ...(forkSessionId !== undefined ? { forkSessionId } : {}),
   });
   try {
     return await session.runTurn({

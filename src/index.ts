@@ -33,6 +33,7 @@ export type {
 export { runCodex, CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
 export type { CodexSandboxPolicy, RunCodexOptions } from "./run-codex.js";
 export {
+  CODEX_FORK_CONFIG,
   createCodexAppServerClient,
   createCodexAppServerSession,
 } from "./codex-app-server.js";

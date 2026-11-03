@@ -104,6 +104,8 @@ A hook callback that throws counts as "no opinion" to the CLI, so a guard hook m
 
 `isolated: true` is for non-persistent one-shot metadata requests. It requires Claude Code 2.1.169 or newer because it enables `--safe-mode`; it also disables built-in tools and MCP servers and prevents session persistence. It cannot resume a session.
 
+`forkSessionId` (with `isolated: true`) forks an existing session for a side run, such as a question asked while that session is mid-turn. The fork sees the session's whole history, including the current turn's completed tool results; it has no tools, a PreToolUse hook denies any it reaches for, and nothing is persisted, so the original session never sees the exchange. The fork must run from the original session's `cwd`, because Claude finds sessions by project directory. It is mutually exclusive with `newSessionId` and `resumeSessionId`.
+
 `runClaude` starts a session, runs one turn, and closes it. To keep the CLI up between turns, hold a session instead:
 
 ```ts
@@ -134,6 +136,8 @@ An abort or timeout while `turn/start` is still unacknowledged cannot be unwound
 For new threads, the runner opts into Codex raw response items so hosted web page operations can retain their resolved URL even when the public `webSearch` completion reports only `action: "other"`. It correlates only a single unambiguous `web__run` invocation, extracts the page-header URL, and discards the raw payload. Ambiguous calls fall back to the ordinary completed item without inventing details. Resumed threads created without raw events still receive correct search/fetch classification and any URL or find pattern present in their completed items.
 
 `isolated: true` remains on `codex exec` because app-server cannot currently reproduce both per-run ignore flags. It uses an ephemeral session, ignores user config and exec-policy rules, and enforces a read-only sandbox. `model` and `reasoningEffort` are honored (effort maps to the `model_reasoning_effort` config override), and usage is reported from the exec turn summary. It cannot resume a thread, set a `serviceTier` or `sandboxPolicy`, or be combined with `dangerouslyBypassApprovalsAndSandbox`.
+
+`forkSessionId` (with `isolated: true`) forks an existing thread for a side run on a one-off app-server, not `codex exec`. It sends `thread/fork` with `ephemeral: true`, a read-only sandbox, `approvalPolicy: "never"`, and `CODEX_FORK_CONFIG`, which turns off MCP servers, web search, and every tool feature. The fork sees the thread's history, including the current turn's completed items, and writes nothing back. If a tool item starts anyway, the run sends `turn/interrupt` and rejects with `CodexTurnError`. It cannot be combined with `resumeSessionId`, `appServerClient`, `appServerSession`, `sandboxPolicy`, `turnCwd`, or `dangerouslyBypassApprovalsAndSandbox`.
 
 ### Errors
 

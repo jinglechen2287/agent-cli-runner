@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
+  CODEX_FORK_CONFIG,
   createCodexAppServerClient,
   createCodexAppServerSession,
   runCodex,
@@ -68,6 +69,164 @@ function completedTurn(id: string, status = "completed") {
     durationMs: 1_000,
   };
 }
+
+describe("forked Codex side runs", () => {
+  function forkServer(child: FakeChild, onTurnStart: (id: number | undefined) => void) {
+    return captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "config/read") {
+        send(child, {
+          id: message.id,
+          result: { config: { mcp_servers: { linear: { url: "https://mcp.example" }, probe: { command: "probe" } } } },
+        });
+      } else if (message.method === "thread/fork") {
+        send(child, { id: message.id, result: { thread: { id: "fork-1" }, model: "gpt-test" } });
+      } else if (message.method === "turn/start") {
+        onTurnStart(message.id);
+      } else if (message.method === "turn/interrupt") {
+        send(child, { id: message.id, result: {} });
+      }
+    });
+  }
+
+  it("forks the thread ephemerally, read-only and tool-less, and answers on the fork", async () => {
+    const child = makeFakeChild();
+    const requests = forkServer(child, (id) => {
+      send(child, { id, result: { turn: completedTurn("turn-1", "inProgress") } });
+      send(child, {
+        method: "item/completed",
+        params: {
+          threadId: "fork-1",
+          turnId: "turn-1",
+          item: { type: "agentMessage", id: "message-1", text: "ZEBRA-4471" },
+        },
+      });
+      send(child, {
+        method: "turn/completed",
+        params: { threadId: "fork-1", turn: completedTurn("turn-1") },
+      });
+    });
+
+    const result = await runCodex({
+      prompt: "what token?",
+      cwd: "/tmp/project",
+      isolated: true,
+      forkSessionId: "parent-1",
+      model: "gpt-test",
+      spawnFn: (() => child) as never,
+    });
+
+    expect(requests.find(({ method }) => method === "config/read")?.params).toEqual({ cwd: "/tmp/project" });
+    expect(requests.find(({ method }) => method === "thread/fork")?.params).toEqual({
+      threadId: "parent-1",
+      cwd: "/tmp/project",
+      model: "gpt-test",
+      ephemeral: true,
+      excludeTurns: true,
+      sandbox: "read-only",
+      approvalPolicy: "never",
+      experimentalRawEvents: true,
+      // Every configured MCP server is switched off by name: an empty table
+      // would merge with the user's config and leave them all running.
+      config: {
+        ...CODEX_FORK_CONFIG,
+        mcp_servers: { linear: { enabled: false }, probe: { enabled: false } },
+      },
+    });
+    expect(requests.find(({ method }) => method === "turn/start")?.params)
+      .toMatchObject({ threadId: "fork-1" });
+    expect(result).toMatchObject({ text: "ZEBRA-4471", exitCode: 0, sessionId: "fork-1" });
+  });
+
+  it("interrupts and rejects a fork that starts a tool", async () => {
+    const child = makeFakeChild();
+    const requests = forkServer(child, (id) => {
+      send(child, { id, result: { turn: completedTurn("turn-1", "inProgress") } });
+      send(child, {
+        method: "item/started",
+        params: {
+          threadId: "fork-1",
+          turnId: "turn-1",
+          item: { type: "commandExecution", id: "command-1", command: "ls", status: "inProgress" },
+        },
+      });
+    });
+
+    await expect(runCodex({
+      prompt: "run ls",
+      cwd: "/tmp/project",
+      isolated: true,
+      forkSessionId: "parent-1",
+      spawnFn: (() => child) as never,
+    })).rejects.toThrow(/Bash/);
+    expect(requests.find(({ method }) => method === "turn/interrupt")?.params).toEqual({
+      threadId: "fork-1",
+      turnId: "turn-1",
+    });
+  });
+
+  it("interrupts and rejects a fork that starts any item beyond a message or reasoning", async () => {
+    const child = makeFakeChild();
+    const requests = forkServer(child, (id) => {
+      send(child, { id, result: { turn: completedTurn("turn-1", "inProgress") } });
+      send(child, {
+        method: "item/started",
+        params: {
+          threadId: "fork-1",
+          turnId: "turn-1",
+          item: { type: "collabAgentToolCall", id: "agent-1", tool: "spawnAgent", status: "inProgress" },
+        },
+      });
+      send(child, {
+        method: "turn/completed",
+        params: { threadId: "fork-1", turn: completedTurn("turn-1") },
+      });
+    });
+
+    await expect(runCodex({
+      prompt: "spawn",
+      cwd: "/tmp/project",
+      isolated: true,
+      forkSessionId: "parent-1",
+      spawnFn: (() => child) as never,
+    })).rejects.toThrow(/collabAgentToolCall/);
+    expect(requests.some(({ method }) => method === "turn/interrupt")).toBe(true);
+  });
+
+  it("forks nothing when the config the fork must switch off can't be read", async () => {
+    const child = makeFakeChild();
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "config/read") {
+        send(child, { id: message.id, error: { code: -32603, message: "config unreadable" } });
+      }
+    });
+
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp/project",
+      isolated: true,
+      forkSessionId: "parent-1",
+      spawnFn: (() => child) as never,
+    })).rejects.toThrow(/config unreadable/);
+    expect(requests.map(({ method }) => method)).toEqual(["initialize", "initialized", "config/read"]);
+  });
+
+  it("rejects fork options a side run cannot take", async () => {
+    const base = { prompt: "x", cwd: "/tmp", forkSessionId: "parent-1" };
+    await expect(runCodex(base)).rejects.toThrow(/only isolated/i);
+    await expect(runCodex({ ...base, isolated: true, resumeSessionId: "thread-1" }))
+      .rejects.toThrow(/mutually exclusive/i);
+    await expect(runCodex({ ...base, isolated: true, dangerouslyBypassApprovalsAndSandbox: true }))
+      .rejects.toThrow(/cannot bypass/i);
+    await expect(runCodex({ ...base, isolated: true, sandboxPolicy: { type: "dangerFullAccess" } }))
+      .rejects.toThrow(/sandbox policy/i);
+    await expect(runCodex({ ...base, isolated: true, turnCwd: "/tmp/canvas" }))
+      .rejects.toThrow(/turn cwd/i);
+  });
+});
 
 describe("Codex app-server runner", () => {
   it("runs a new thread through app-server while preserving runner callbacks", async () => {
