@@ -1627,7 +1627,8 @@ function requestCodexThread(client, opts) {
       excludeTurns: true,
       sandbox: "read-only",
       approvalPolicy: "never",
-      experimentalRawEvents: true
+      experimentalRawEvents: true,
+      ...opts.forkConfig ? { config: opts.forkConfig } : {}
     });
   }
   if (opts.forkSessionId) {
@@ -2395,6 +2396,9 @@ async function runIsolatedCodex(opts) {
   });
 }
 async function runCodex(opts) {
+  if (opts.forkConfig && (!opts.forkSessionId || opts.isolated)) {
+    throw new Error("only a guarded fork can take fork config");
+  }
   if (opts.forkSessionId) return runForkedCodex(opts);
   if (!opts.isolated) {
     if (opts.appServerClient && opts.appServerSession) {

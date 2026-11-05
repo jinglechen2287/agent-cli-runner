@@ -93,6 +93,7 @@ export type CodexAppServerTurnOptions = Omit<
   | "isolated"
   | "resumeSessionId"
   | "forkSessionId"
+  | "forkConfig"
   | "spawnFn"
 >;
 
@@ -719,6 +720,7 @@ function requestCodexThread(
     | "model"
     | "resumeSessionId"
     | "forkSessionId"
+    | "forkConfig"
     | "isolated"
   > & { config?: CodexConfigOverrides },
 ): Promise<unknown> {
@@ -736,6 +738,7 @@ function requestCodexThread(
       sandbox: "read-only",
       approvalPolicy: "never",
       experimentalRawEvents: true,
+      ...(opts.forkConfig ? { config: opts.forkConfig } : {}),
     });
   }
   if (opts.forkSessionId) {

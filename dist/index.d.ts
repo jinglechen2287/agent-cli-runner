@@ -453,7 +453,7 @@ interface CreateCodexAppServerClientOptions {
     spawnFn?: RunCodexOptions["spawnFn"];
     requestTimeoutMs?: number;
 }
-type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "forkSessionId" | "spawnFn">;
+type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "forkSessionId" | "forkConfig" | "spawnFn">;
 interface CodexAppServerSession {
     readonly threadId: string;
     readonly cwd: string;
@@ -579,6 +579,10 @@ interface RunCodexOptions extends CommonRunOptions {
      * run, which rejects. Without, it keeps Codex's tools under the caller's
      * `sandboxPolicy`. */
     forkSessionId?: string;
+    /** Config overrides for a guarded fork, sent on `thread/fork` — e.g.
+     * `{ mcp_servers: { name: { url } } }`. Only a guarded fork takes them: an
+     * isolated one's config is what keeps its tools off. */
+    forkConfig?: CodexConfigOverrides;
 }
 /** Run a Codex turn. Regular work uses app-server; only isolated metadata
  * requests retain the legacy non-interactive `codex exec` path. */

@@ -271,6 +271,38 @@ describe("forked Codex side runs", () => {
     expect(result).toMatchObject({ text: "first line", exitCode: 0 });
   });
 
+  it("sends a guarded fork's config on thread/fork", async () => {
+    const child = makeFakeChild();
+    const requests = forkServer(child, (id) => {
+      send(child, { id, result: { turn: completedTurn("turn-1", "inProgress") } });
+      send(child, { method: "turn/completed", params: { threadId: "fork-1", turn: completedTurn("turn-1") } });
+    });
+    const forkConfig = { mcp_servers: { tools: { url: "http://127.0.0.1:1/mcp" } } };
+
+    await runCodex({
+      prompt: "x",
+      cwd: "/tmp/project",
+      forkSessionId: "parent-1",
+      forkConfig,
+      sandboxPolicy: { type: "readOnly", networkAccess: true },
+      spawnFn: (() => child) as never,
+    });
+
+    expect(requests.find(({ method }) => method === "thread/fork")?.params).toMatchObject({
+      threadId: "parent-1",
+      sandbox: "read-only",
+      config: forkConfig,
+    });
+  });
+
+  it("takes fork config only on a guarded fork", async () => {
+    const forkConfig = { mcp_servers: {} };
+    await expect(runCodex({ prompt: "x", cwd: "/tmp", forkConfig })).rejects.toThrow(/guarded fork/i);
+    await expect(runCodex({ prompt: "x", cwd: "/tmp", isolated: true, forkConfig })).rejects.toThrow(/guarded fork/i);
+    await expect(runCodex({ prompt: "x", cwd: "/tmp", forkSessionId: "parent-1", isolated: true, forkConfig }))
+      .rejects.toThrow(/guarded fork/i);
+  });
+
   it("rejects options a guarded fork cannot take", async () => {
     const base = { prompt: "x", cwd: "/tmp", forkSessionId: "parent-1" };
     await expect(runCodex({ ...base, resumeSessionId: "thread-1" })).rejects.toThrow(/mutually exclusive/i);

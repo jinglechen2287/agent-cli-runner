@@ -7,6 +7,7 @@ import {
   toolName,
   type CodexAppServerClient,
   type CodexAppServerSession,
+  type CodexConfigOverrides,
 } from "./codex-app-server.js";
 import {
   createChunkDecoder,
@@ -89,6 +90,10 @@ export interface RunCodexOptions extends CommonRunOptions {
    * run, which rejects. Without, it keeps Codex's tools under the caller's
    * `sandboxPolicy`. */
   forkSessionId?: string;
+  /** Config overrides for a guarded fork, sent on `thread/fork` — e.g.
+   * `{ mcp_servers: { name: { url } } }`. Only a guarded fork takes them: an
+   * isolated one's config is what keeps its tools off. */
+  forkConfig?: CodexConfigOverrides;
 }
 
 interface CodexExecEvent {
@@ -327,6 +332,9 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
 /** Run a Codex turn. Regular work uses app-server; only isolated metadata
  * requests retain the legacy non-interactive `codex exec` path. */
 export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
+  if (opts.forkConfig && (!opts.forkSessionId || opts.isolated)) {
+    throw new Error("only a guarded fork can take fork config");
+  }
   if (opts.forkSessionId) return runForkedCodex(opts);
   if (!opts.isolated) {
     if (opts.appServerClient && opts.appServerSession) {
