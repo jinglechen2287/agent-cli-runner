@@ -121,6 +121,30 @@ interface BackgroundAgentInfo {
     updatedAt: number;
     endedAt?: number;
 }
+/** Where one MCP server stands, normalized across providers. */
+interface McpServerStatusInfo {
+    name: string;
+    status: "connecting" | "connected" | "failed" | "needs-auth" | "disabled";
+    /** Why it failed, when the provider says. */
+    error?: string;
+}
+/** An MCP server asking the user for something mid-tool-call. Provider-specific
+ * forms a host could not answer never reach it: the runner declines those. */
+type McpElicitationRequest = {
+    serverName: string;
+    message: string;
+} & ({
+    mode: "form";
+    requestedSchema: Record<string, unknown>;
+} | {
+    mode: "url";
+    url: string;
+});
+interface McpElicitationResponse {
+    action: "accept" | "decline" | "cancel";
+    /** The form's values, on `accept` of a form. */
+    content?: Record<string, unknown>;
+}
 interface AgentCallbacks {
     /** Fired once with the CLI's session/thread id as soon as it is known. */
     onSessionId?: (id: string) => void;
@@ -157,6 +181,24 @@ interface AgentCallbacks {
      * authoritative last request and model context window, and isolated Codex
      * once from the exec turn summary. Each call supersedes the last. */
     onUsage?: (usage: TokenUsage) => void;
+    /** Fired with the MCP servers' status at the start of each turn on a
+     * long-lived session and whenever one changes during it. Each call is a
+     * snapshot that replaces the last, of every server the CLI reports: Claude
+     * lists disabled ones, while Codex only reports servers it starts. Claude runs and Codex sessions:
+     * a one-off Codex run does not report status. */
+    onMcpStatus?: (servers: McpServerStatusInfo[]) => void;
+    /** Answers an MCP server's request for user input while the tool call waits.
+     * Without it a request is declined. A throw cancels it, and `signal` fires
+     * when the request stops mattering (the turn ended, the session closed, or
+     * the CLI gave up), at which point the answer is ignored. Claude runs and
+     * Codex sessions: a one-off Codex run leaves requests to Codex.
+     *
+     * Codex decides first: under approval policy `never` it answers most
+     * requests itself, so only forms with fields in a full-access turn get here.
+     * See the README. */
+    onMcpElicitation?: (request: McpElicitationRequest, context: {
+        signal: AbortSignal;
+    }) => Promise<McpElicitationResponse>;
 }
 interface CommonRunOptions extends AgentCallbacks {
     prompt: string;
@@ -198,6 +240,12 @@ type ClaudeHooks = Partial<Record<HookEvent, HookCallbackMatcher[]>>;
 interface ClaudeQuery extends AsyncIterable<unknown> {
     interrupt(): Promise<unknown>;
     close(): void;
+    /** Absent on a scripted query that doesn't model it. */
+    mcpServerStatus?(): Promise<ReadonlyArray<{
+        name: string;
+        status: string;
+        error?: string;
+    }>>;
 }
 /** The Agent SDK's `query()`, narrowed to the streaming-input form a session
  * uses. Injectable so tests can script the message stream. */
@@ -427,6 +475,11 @@ declare function createClaudeSessionState(): ClaudeSessionState;
  * tracking are all scoped to it. */
 declare function createClaudeTurnTranslator(callbacks: AgentCallbacks, options?: ClaudeTurnTranslatorOptions): ClaudeTurnTranslator;
 
+/** Thrown by a {@link CodexServerRequestHandler} for a method it does not
+ * take: the server gets "method not found", as if nothing were registered. */
+declare class UnsupportedServerRequestError extends Error {
+    constructor(method: string);
+}
 interface CodexServerRequest {
     id: number | string;
     method: string;
@@ -452,6 +505,10 @@ interface CreateCodexAppServerClientOptions {
     env?: NodeJS.ProcessEnv;
     spawnFn?: RunCodexOptions["spawnFn"];
     requestTimeoutMs?: number;
+    /** MCP extensions this client supports, declared at `initialize`. */
+    extensions?: {
+        [id: string]: CodexJsonValue;
+    };
 }
 type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "forkSessionId" | "forkConfig" | "spawnFn">;
 interface CodexAppServerSession {
@@ -774,4 +831,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };

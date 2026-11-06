@@ -43,6 +43,21 @@ var SteerRejectedError = class extends Error {
 
 // src/internal.ts
 var SIGTERM_GRACE_MS = 2e3;
+function answerMcpElicitation(callback, request, signals) {
+  if (!callback) return Promise.resolve({ action: "decline" });
+  const controller = new AbortController();
+  const fire = () => controller.abort();
+  for (const signal of signals) {
+    if (signal.aborted) return Promise.resolve({ action: "cancel" });
+    signal.addEventListener("abort", fire, { once: true });
+  }
+  return new Promise((resolve) => {
+    controller.signal.addEventListener("abort", () => resolve({ action: "cancel" }), { once: true });
+    Promise.resolve().then(() => callback(request, { signal: controller.signal })).then(resolve, () => resolve({ action: "cancel" }));
+  }).finally(() => {
+    for (const signal of signals) signal.removeEventListener("abort", fire);
+  });
+}
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -672,6 +687,41 @@ var CLAUDE_STRIPPED_ENV_VARS = [
 ];
 var CLAUDE_INTERRUPT_GRACE_MS = 5e3;
 var CLAUDE_FOLLOW_UP_GRACE_MS = 6e4;
+var MCP_STATUS_TIMEOUT_MS = 5e3;
+var MCP_STATUS_POLL_MS = 2e3;
+var MCP_STATUS_POLL_LIMIT_MS = 3e4;
+var CLAUDE_MCP_STATUSES = {
+  pending: "connecting",
+  connected: "connected",
+  failed: "failed",
+  "needs-auth": "needs-auth",
+  disabled: "disabled"
+};
+function claudeMcpStatuses(servers, known = []) {
+  return servers.flatMap((server) => {
+    if (!isRecord(server) || typeof server.name !== "string" || typeof server.status !== "string") {
+      return [];
+    }
+    const status = CLAUDE_MCP_STATUSES[server.status];
+    if (!status) return [];
+    const stated = typeof server.error === "string" && server.error ? server.error : void 0;
+    const previous = known.find((entry) => entry.name === server.name && entry.status === status);
+    const error = stated ?? previous?.error;
+    return [{ name: server.name, status, ...error ? { error } : {} }];
+  });
+}
+function claudeElicitationRequest(request) {
+  const { serverName, message } = request;
+  if (request.mode === "url") {
+    return request.url ? { serverName, message, mode: "url", url: request.url } : void 0;
+  }
+  return {
+    serverName,
+    message,
+    mode: "form",
+    requestedSchema: request.requestedSchema ?? { type: "object", properties: {} }
+  };
+}
 var TURN_MESSAGE_TYPES = /* @__PURE__ */ new Set(["assistant", "user", "stream_event", "result"]);
 var STDERR_TAIL_CHARS = 2e3;
 function validateSessionOptions(opts) {
@@ -852,8 +902,67 @@ async function createClaudeSession(opts) {
       off: spawned.off.bind(spawned)
     };
   };
-  const options = claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeCodeProcess);
+  const onElicitation = (request, { signal }) => {
+    const turn = active;
+    const elicitation = claudeElicitationRequest(request);
+    if (!turn || !elicitation) return Promise.resolve({ action: "decline" });
+    return answerMcpElicitation(turn.callbacks.onMcpElicitation, elicitation, [
+      signal,
+      turn.elicitations.signal
+    ]);
+  };
+  const options = {
+    ...claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeCodeProcess),
+    ...opts.isolated ? {} : { onElicitation }
+  };
   const runtime = queryFn({ prompt: input.iterable, options });
+  let mcpStatuses;
+  let mcpStatusInFlight = false;
+  let mcpPollTimer;
+  const emitMcpStatus = () => {
+    const callbacks = active?.callbacks;
+    const snapshot = mcpStatuses;
+    if (!callbacks?.onMcpStatus || !snapshot) return;
+    safeCallback(() => callbacks.onMcpStatus?.(snapshot.map((status) => ({ ...status }))));
+  };
+  const updateMcpStatus = (next) => {
+    if (JSON.stringify(next) === JSON.stringify(mcpStatuses)) return;
+    mcpStatuses = next;
+    emitMcpStatus();
+  };
+  const stopMcpPoll = () => {
+    if (mcpPollTimer) clearTimeout(mcpPollTimer);
+    mcpPollTimer = void 0;
+  };
+  const refreshMcpStatus = async () => {
+    const turn = active;
+    if (!turn?.callbacks.onMcpStatus || !runtime.mcpServerStatus || mcpStatusInFlight) return;
+    mcpStatusInFlight = true;
+    let stall;
+    try {
+      const servers = await Promise.race([
+        runtime.mcpServerStatus(),
+        new Promise((_resolve, reject) => {
+          stall = setTimeout(() => reject(new Error("timed out")), MCP_STATUS_TIMEOUT_MS);
+          stall.unref?.();
+        })
+      ]);
+      if (active === turn) updateMcpStatus(claudeMcpStatuses(servers, mcpStatuses));
+    } catch {
+    } finally {
+      if (stall) clearTimeout(stall);
+      mcpStatusInFlight = false;
+    }
+    if (active && active !== turn) {
+      void refreshMcpStatus();
+      return;
+    }
+    if (active === turn && Date.now() < turn.mcpPollDeadline && mcpStatuses?.some(({ status }) => status === "connecting")) {
+      stopMcpPoll();
+      mcpPollTimer = setTimeout(() => void refreshMcpStatus(), MCP_STATUS_POLL_MS);
+      mcpPollTimer.unref?.();
+    }
+  };
   const killTree = () => {
     const current = child;
     if (!current || childExited) return Promise.resolve();
@@ -935,6 +1044,10 @@ async function createClaudeSession(opts) {
           }
           continue;
         }
+        if (isRecord(message) && message.type === "system" && message.subtype === "init" && Array.isArray(message.mcp_servers)) {
+          updateMcpStatus(claudeMcpStatuses(message.mcp_servers, mcpStatuses));
+          void refreshMcpStatus();
+        }
         turn.translator.handle(message);
         if (turn.translator.echoedPromptUuid) cliEchoesPromptUuid = true;
         if (turn.translator.done) {
@@ -971,6 +1084,8 @@ async function createClaudeSession(opts) {
           if (graceTimer) clearTimeout(graceTimer);
           if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
           signal?.removeEventListener("abort", onAbort);
+          stopMcpPoll();
+          turn.elicitations.abort();
         };
         const promptUuid = randomUUID();
         const turn = {
@@ -983,6 +1098,8 @@ async function createClaudeSession(opts) {
           interruption: null,
           timeoutMs,
           followUpTimer: void 0,
+          elicitations: new AbortController(),
+          mcpPollDeadline: Date.now() + MCP_STATUS_POLL_LIMIT_MS,
           resolve: (result) => {
             cleanup();
             resolve(result);
@@ -1011,6 +1128,10 @@ async function createClaudeSession(opts) {
           timeoutTimer = setTimeout(() => interrupt("timeout"), timeoutMs);
         }
         active = turn;
+        if (mcpStatuses) {
+          emitMcpStatus();
+          void refreshMcpStatus();
+        }
         input.push({
           type: "user",
           message: { role: "user", content: prompt },
@@ -1122,6 +1243,12 @@ import { spawn } from "child_process";
 
 // src/codex-app-server.ts
 import { spawn as nodeSpawn3 } from "child_process";
+var UnsupportedServerRequestError = class extends Error {
+  constructor(method) {
+    super(`Unsupported server request: ${method}`);
+    this.name = "UnsupportedServerRequestError";
+  }
+};
 var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;
 var TURN_START_TIMEOUT_MS = 6e4;
 var MAX_PRE_ACK_NOTIFICATIONS = 1e4;
@@ -1206,6 +1333,10 @@ async function createCodexAppServerClient(options) {
       const result = await handler({ id, method, params: message.params });
       send({ id, result: result ?? null });
     } catch (error) {
+      if (error instanceof UnsupportedServerRequestError) {
+        send({ id, error: { code: -32601, message: error.message } });
+        return;
+      }
       send({
         id,
         error: {
@@ -1331,7 +1462,10 @@ async function createCodexAppServerClient(options) {
   try {
     await client.request("initialize", {
       clientInfo: CLIENT_INFO,
-      capabilities: { experimentalApi: true }
+      capabilities: {
+        experimentalApi: true,
+        ...options.extensions ? { extensions: options.extensions } : {}
+      }
     });
     client.notify("initialized", {});
     return client;
@@ -1377,8 +1511,11 @@ function toolName(item) {
     case "file_change":
       return "Edit";
     case "mcpToolCall":
-    case "mcp_tool_call":
-      return text(item.tool) ?? "MCP";
+    case "mcp_tool_call": {
+      const tool = text(item.tool);
+      const server = text(item.server);
+      return tool && server ? `mcp__${server}__${tool}` : tool ?? "MCP";
+    }
     case "dynamicToolCall":
       return text(item.tool) ?? "Tool";
     case "webSearch":
@@ -1660,7 +1797,10 @@ function requestCodexThread(client, opts) {
     ...opts.dangerouslyBypassApprovalsAndSandbox ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {},
     ...opts.config ? { config: opts.config } : {}
   };
-  return opts.resumeSessionId ? client.request("thread/resume", { threadId: opts.resumeSessionId, ...params }) : client.request("thread/start", params);
+  return opts.resumeSessionId ? client.request("thread/resume", { threadId: opts.resumeSessionId, ...params }) : client.request("thread/start", {
+    ...params,
+    ...opts.threadSource ? { threadSource: opts.threadSource } : {}
+  });
 }
 function openedCodexThread(value, fallbackModel) {
   const threadId = threadIdFrom(value);
@@ -2124,28 +2264,131 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (ownedClient) client.close();
   }
 }
+var FORM_INPUT_EXTENSION = "openai/standard-form-input";
+function codexMcpStatus(params) {
+  const name = text(params.name);
+  if (!name) return void 0;
+  const error = text(params.error);
+  const failed = (status) => ({
+    name,
+    status,
+    ...error ? { error } : {}
+  });
+  switch (params.status) {
+    case "starting":
+      return { name, status: "connecting" };
+    case "ready":
+      return { name, status: "connected" };
+    case "failed":
+      return failed(params.failureReason === "reauthenticationRequired" ? "needs-auth" : "failed");
+    case "cancelled":
+      return failed("failed");
+    default:
+      return void 0;
+  }
+}
+function codexElicitationRequest(params) {
+  const serverName = text(params.serverName);
+  const message = typeof params.message === "string" ? params.message : void 0;
+  if (!serverName || message === void 0) return void 0;
+  if (params.mode === "form") {
+    const requestedSchema = record(params.requestedSchema);
+    return requestedSchema ? { serverName, message, mode: "form", requestedSchema } : void 0;
+  }
+  if (params.mode === "url") {
+    const url = text(params.url);
+    return url ? { serverName, message, mode: "url", url } : void 0;
+  }
+  return void 0;
+}
 async function createCodexAppServerSession(options) {
   const client = await createCodexAppServerClient({
     cwd: options.cwd,
     ...options.executablePath ? { executablePath: options.executablePath } : {},
     ...options.env ? { env: options.env } : {},
     ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
-    ...options.requestTimeoutMs !== void 0 ? { requestTimeoutMs: options.requestTimeoutMs } : {}
+    ...options.requestTimeoutMs !== void 0 ? { requestTimeoutMs: options.requestTimeoutMs } : {},
+    extensions: { [FORM_INPUT_EXTENSION]: {} }
+  });
+  let activeTurn;
+  let threadId;
+  const previousTurnIds = /* @__PURE__ */ new Set();
+  const openElicitations = /* @__PURE__ */ new Map();
+  const mcpStatuses = /* @__PURE__ */ new Map();
+  const earlyStatus = [];
+  const emitMcpStatus = () => {
+    const callbacks = activeTurn?.callbacks;
+    if (!callbacks?.onMcpStatus || mcpStatuses.size === 0) return;
+    const snapshot = [...mcpStatuses.values()].map((status) => ({ ...status }));
+    safeCallback(() => callbacks.onMcpStatus?.(snapshot));
+  };
+  const applyMcpStatus = (params) => {
+    const tagged = text(params.threadId);
+    if (tagged && tagged !== threadId) return false;
+    const status = codexMcpStatus(params);
+    if (!status) return false;
+    const previous = mcpStatuses.get(status.name);
+    if (previous && JSON.stringify(previous) === JSON.stringify(status)) return false;
+    mcpStatuses.set(status.name, status);
+    return true;
+  };
+  client.onNotification((method, rawParams) => {
+    const params = record(rawParams);
+    if (!params) return;
+    if (method === "serverRequest/resolved") {
+      if (params.threadId !== threadId) return;
+      const requestId = params.requestId;
+      if (typeof requestId === "string" || typeof requestId === "number") {
+        openElicitations.get(requestId)?.abort();
+      }
+      return;
+    }
+    if (method !== "mcpServer/startupStatus/updated") return;
+    if (threadId === void 0) {
+      earlyStatus.push(params);
+      return;
+    }
+    if (applyMcpStatus(params)) emitMcpStatus();
+  });
+  client.onServerRequest(async (request) => {
+    if (request.method !== "mcpServer/elicitation/request") {
+      throw new UnsupportedServerRequestError(request.method);
+    }
+    const params = record(request.params);
+    const turn = activeTurn;
+    const stale = typeof params?.turnId === "string" && previousTurnIds.has(params.turnId);
+    const elicitation = params && params.threadId === threadId && turn && !stale ? codexElicitationRequest(params) : void 0;
+    if (!turn || !elicitation) return { action: "decline" };
+    const resolved = new AbortController();
+    openElicitations.set(request.id, resolved);
+    try {
+      return await answerMcpElicitation(turn.callbacks.onMcpElicitation, elicitation, [
+        turn.elicitations.signal,
+        resolved.signal
+      ]);
+    } finally {
+      openElicitations.delete(request.id);
+    }
   });
   let opened;
   try {
-    opened = openedCodexThread(await requestCodexThread(client, options), options.model);
+    opened = openedCodexThread(
+      await requestCodexThread(client, { ...options, threadSource: "user" }),
+      options.model
+    );
   } catch (error) {
     client.close();
     throw error;
   }
+  threadId = opened.threadId;
+  for (const params of earlyStatus.splice(0)) applyMcpStatus(params);
   let closed = false;
   let running = false;
   let steerRunning = null;
-  const previousTurnIds = /* @__PURE__ */ new Set();
   let closePromise;
   client.onClose(() => {
     closed = true;
+    activeTurn?.elicitations.abort();
   });
   return {
     threadId: opened.threadId,
@@ -2157,6 +2400,9 @@ async function createCodexAppServerSession(options) {
       if (closed) throw new Error("Codex app-server session is closed");
       if (running) throw new Error("Codex app-server session already has an active turn");
       running = true;
+      const turn = { callbacks: turnOptions, elicitations: new AbortController() };
+      activeTurn = turn;
+      emitMcpStatus();
       try {
         return await runCodexAppServerTurn({
           ...turnOptions,
@@ -2180,6 +2426,8 @@ async function createCodexAppServerSession(options) {
       } finally {
         running = false;
         steerRunning = null;
+        activeTurn = void 0;
+        turn.elicitations.abort();
       }
     },
     async steer({ prompt }) {
@@ -3061,6 +3309,7 @@ export {
   MissingCliError,
   SteerRejectedError,
   TimeoutError,
+  UnsupportedServerRequestError,
   collectCodexModels,
   contextWindowForModel,
   createClaudeSession,

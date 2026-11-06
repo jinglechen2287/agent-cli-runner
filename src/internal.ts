@@ -3,8 +3,34 @@ import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, join, resolve as resolvePath } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { AbortError, TimeoutError } from "./errors.js";
+import type { AgentCallbacks, McpElicitationRequest, McpElicitationResponse } from "./types.js";
 
 export const SIGTERM_GRACE_MS = 2000;
+
+/** Asks a turn's callback for an MCP server's answer. Always settles: no
+ * callback declines, a throw or any of `signals` firing cancels, and a late
+ * answer from the callback is ignored. */
+export function answerMcpElicitation(
+  callback: AgentCallbacks["onMcpElicitation"],
+  request: McpElicitationRequest,
+  signals: readonly AbortSignal[],
+): Promise<McpElicitationResponse> {
+  if (!callback) return Promise.resolve({ action: "decline" });
+  const controller = new AbortController();
+  const fire = (): void => controller.abort();
+  for (const signal of signals) {
+    if (signal.aborted) return Promise.resolve({ action: "cancel" });
+    signal.addEventListener("abort", fire, { once: true });
+  }
+  return new Promise<McpElicitationResponse>((resolve) => {
+    controller.signal.addEventListener("abort", () => resolve({ action: "cancel" }), { once: true });
+    Promise.resolve()
+      .then(() => callback(request, { signal: controller.signal }))
+      .then(resolve, () => resolve({ action: "cancel" }));
+  }).finally(() => {
+    for (const signal of signals) signal.removeEventListener("abort", fire);
+  });
+}
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);

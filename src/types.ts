@@ -74,6 +74,27 @@ export interface BackgroundAgentInfo {
   endedAt?: number;
 }
 
+/** Where one MCP server stands, normalized across providers. */
+export interface McpServerStatusInfo {
+  name: string;
+  status: "connecting" | "connected" | "failed" | "needs-auth" | "disabled";
+  /** Why it failed, when the provider says. */
+  error?: string;
+}
+
+/** An MCP server asking the user for something mid-tool-call. Provider-specific
+ * forms a host could not answer never reach it: the runner declines those. */
+export type McpElicitationRequest = { serverName: string; message: string } & (
+  | { mode: "form"; requestedSchema: Record<string, unknown> }
+  | { mode: "url"; url: string }
+);
+
+export interface McpElicitationResponse {
+  action: "accept" | "decline" | "cancel";
+  /** The form's values, on `accept` of a form. */
+  content?: Record<string, unknown>;
+}
+
 export interface AgentCallbacks {
   /** Fired once with the CLI's session/thread id as soon as it is known. */
   onSessionId?: (id: string) => void;
@@ -110,6 +131,25 @@ export interface AgentCallbacks {
    * authoritative last request and model context window, and isolated Codex
    * once from the exec turn summary. Each call supersedes the last. */
   onUsage?: (usage: TokenUsage) => void;
+  /** Fired with the MCP servers' status at the start of each turn on a
+   * long-lived session and whenever one changes during it. Each call is a
+   * snapshot that replaces the last, of every server the CLI reports: Claude
+   * lists disabled ones, while Codex only reports servers it starts. Claude runs and Codex sessions:
+   * a one-off Codex run does not report status. */
+  onMcpStatus?: (servers: McpServerStatusInfo[]) => void;
+  /** Answers an MCP server's request for user input while the tool call waits.
+   * Without it a request is declined. A throw cancels it, and `signal` fires
+   * when the request stops mattering (the turn ended, the session closed, or
+   * the CLI gave up), at which point the answer is ignored. Claude runs and
+   * Codex sessions: a one-off Codex run leaves requests to Codex.
+   *
+   * Codex decides first: under approval policy `never` it answers most
+   * requests itself, so only forms with fields in a full-access turn get here.
+   * See the README. */
+  onMcpElicitation?: (
+    request: McpElicitationRequest,
+    context: { signal: AbortSignal },
+  ) => Promise<McpElicitationResponse>;
 }
 
 export interface CommonRunOptions extends AgentCallbacks {

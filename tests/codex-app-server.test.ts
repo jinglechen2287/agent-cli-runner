@@ -9,6 +9,7 @@ import {
   SteerRejectedError,
   type CodexAppServerSession,
 } from "../src/index.js";
+import { toolName } from "../src/codex-app-server.js";
 
 interface FakeChild extends EventEmitter {
   stdin: PassThrough;
@@ -2524,5 +2525,343 @@ describe("CodexAppServerSession.steer", () => {
     await expect(turn).rejects.toThrow("boom");
     await expect(steered).rejects.toBeInstanceOf(SteerRejectedError);
     await close();
+  });
+});
+
+describe("Codex MCP tool names", () => {
+  it("prefixes a tool with its server, in both item spellings", () => {
+    expect(toolName({ type: "mcpToolCall", server: "probe", tool: "ask" })).toBe("mcp__probe__ask");
+    expect(toolName({ type: "mcp_tool_call", server: "probe", tool: "ask" })).toBe("mcp__probe__ask");
+  });
+
+  it("falls back to the bare tool when no server is named", () => {
+    expect(toolName({ type: "mcpToolCall", tool: "ask" })).toBe("ask");
+    expect(toolName({ type: "mcpToolCall" })).toBe("MCP");
+  });
+});
+
+describe("createCodexAppServerSession MCP", () => {
+  const THREAD = "thread-mcp";
+  const status = (name: string, state: string, extra: Record<string, unknown> = {}) => ({
+    method: "mcpServer/startupStatus/updated",
+    params: { threadId: THREAD, name, status: state, error: null, failureReason: null, ...extra },
+  });
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+  /** A session whose turns stay open until `finish()`. */
+  async function startSession(
+    onThreadStart?: (child: FakeChild) => void,
+    extra: Record<string, unknown> = {},
+  ) {
+    const child = makeFakeChild();
+    child.kill = vi.fn(() => {
+      child.emit("exit", 0, null);
+      child.emit("close", 0, null);
+      return true;
+    });
+    let turnNumber = 0;
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start" || message.method === "thread/resume") {
+        onThreadStart?.(child);
+        send(child, { id: message.id, result: { thread: { id: THREAD } } });
+      } else if (message.method === "turn/start") {
+        turnNumber += 1;
+        send(child, { id: message.id, result: { turn: completedTurn(`turn-${turnNumber}`, "inProgress") } });
+      }
+    });
+    const session = await createCodexAppServerSession({
+      cwd: "/tmp/project",
+      dangerouslyBypassApprovalsAndSandbox: true,
+      spawnFn: (() => child) as never,
+      ...extra,
+    });
+    const finish = () => send(child, {
+      method: "turn/completed",
+      params: { threadId: THREAD, turn: completedTurn(`turn-${turnNumber}`) },
+    });
+    const turnStarted = () => vi.waitFor(() => {
+      expect(requests.some(({ method }) => method === "turn/start")).toBe(true);
+    });
+    const answerTo = (id: number) => vi.waitFor(() => {
+      const found = requests.find((message) => message.id === id && message.method === undefined);
+      if (!found) throw new Error("no answer yet");
+      return found;
+    });
+    return { child, requests, session, finish, turnStarted, answerTo };
+  }
+
+  const elicitation = (id: number, params: Record<string, unknown> = {}) => ({
+    id,
+    method: "mcpServer/elicitation/request",
+    params: {
+      threadId: THREAD,
+      turnId: "turn-1",
+      serverName: "probe",
+      _meta: null,
+      message: "Who are you?",
+      mode: "form",
+      requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+      ...params,
+    },
+  });
+
+  it("asks Codex to surface forms, on the session's own thread and client only", async () => {
+    const { requests, session } = await startSession();
+    expect(requests.find(({ method }) => method === "initialize")?.params?.capabilities).toEqual({
+      experimentalApi: true,
+      extensions: { "openai/standard-form-input": {} },
+    });
+    expect(requests.find(({ method }) => method === "thread/start")?.params?.threadSource).toBe("user");
+    await session.close();
+
+    const resumed = await startSession(undefined, { resumeSessionId: THREAD });
+    expect(resumed.requests.find(({ method }) => method === "thread/resume")?.params)
+      .not.toHaveProperty("threadSource");
+    await resumed.session.close();
+  });
+
+  it("leaves a plain run's capabilities alone", async () => {
+    const child = makeFakeChild();
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "t" } } });
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("u", "inProgress") } });
+        send(child, { method: "turn/completed", params: { threadId: "t", turn: completedTurn("u") } });
+      }
+    });
+    await runCodex({ prompt: "x", cwd: "/tmp", spawnFn: (() => child) as never });
+    expect(requests.find(({ method }) => method === "initialize")?.params?.capabilities)
+      .toEqual({ experimentalApi: true });
+    expect(requests.find(({ method }) => method === "thread/start")?.params)
+      .not.toHaveProperty("threadSource");
+  });
+
+  it("applies startup status that arrived before the thread id, and ignores other threads", async () => {
+    const { child, session, finish, turnStarted } = await startSession((c) => {
+      send(c, status("early", "starting"));
+      send(c, status("other", "failed", { threadId: "someone-else", error: "no" }));
+    });
+    await flush();
+    const snapshots: unknown[] = [];
+    const turn = session.runTurn({ prompt: "x", onMcpStatus: (servers) => snapshots.push(servers) });
+    await turnStarted();
+    expect(snapshots[0]).toEqual([{ name: "early", status: "connecting" }]);
+
+    send(child, status("early", "ready"));
+    send(child, status("bad", "failed", { error: "failed to start" }));
+    send(child, status("gone", "cancelled"));
+    send(child, status("other", "ready", { threadId: "someone-else" }));
+    await vi.waitFor(() => {
+      expect(snapshots.at(-1)).toEqual([
+        { name: "early", status: "connected" },
+        { name: "bad", status: "failed", error: "failed to start" },
+        { name: "gone", status: "failed" },
+      ]);
+    });
+    finish();
+    await turn;
+    await session.close();
+  });
+
+  it("reports a server that needs signing in again as needs-auth", async () => {
+    const { child, session, finish, turnStarted } = await startSession();
+    const snapshots: unknown[] = [];
+    const turn = session.runTurn({ prompt: "x", onMcpStatus: (servers) => snapshots.push(servers) });
+    await turnStarted();
+    send(child, status("linear", "failed", {
+      error: "token expired",
+      failureReason: "reauthenticationRequired",
+    }));
+    await vi.waitFor(() => {
+      expect(snapshots.at(-1)).toEqual([{ name: "linear", status: "needs-auth", error: "token expired" }]);
+    });
+    finish();
+    await turn;
+    await session.close();
+  });
+
+  it("sends the current snapshot at the start of a later turn", async () => {
+    const { child, session, finish } = await startSession();
+    const first = session.runTurn({ prompt: "x", onMcpStatus: () => {} });
+    send(child, status("a", "ready"));
+    await flush();
+    await vi.waitFor(() => finish());
+    await first;
+
+    const snapshots: unknown[] = [];
+    const second = session.runTurn({ prompt: "y", onMcpStatus: (servers) => snapshots.push(servers) });
+    expect(snapshots[0]).toEqual([{ name: "a", status: "connected" }]);
+    await flush();
+    await vi.waitFor(() => finish());
+    await second;
+    await session.close();
+  });
+
+  it("hands a form to the running turn and answers Codex with the result", async () => {
+    const { child, session, finish, turnStarted, answerTo } = await startSession();
+    const onMcpElicitation = vi.fn(async () => ({ action: "accept" as const, content: { name: "Ada" } }));
+    const turn = session.runTurn({ prompt: "x", onMcpElicitation });
+    await turnStarted();
+    send(child, elicitation(41));
+    expect(await answerTo(41)).toMatchObject({ result: { action: "accept", content: { name: "Ada" } } });
+    expect(onMcpElicitation).toHaveBeenCalledWith(
+      {
+        serverName: "probe",
+        message: "Who are you?",
+        mode: "form",
+        requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+      },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    finish();
+    await turn;
+    await session.close();
+  });
+
+  it("hands over a URL request", async () => {
+    const { child, session, finish, turnStarted, answerTo } = await startSession();
+    const onMcpElicitation = vi.fn(async () => ({ action: "decline" as const }));
+    const turn = session.runTurn({ prompt: "x", onMcpElicitation });
+    await turnStarted();
+    send(child, elicitation(42, { mode: "url", url: "https://example.com/x", elicitationId: "e" }));
+    expect(await answerTo(42)).toMatchObject({ result: { action: "decline" } });
+    expect(onMcpElicitation).toHaveBeenCalledWith(
+      { serverName: "probe", message: "Who are you?", mode: "url", url: "https://example.com/x" },
+      expect.anything(),
+    );
+    finish();
+    await turn;
+    await session.close();
+  });
+
+  it("declines other threads, unknown modes, and requests with no running turn", async () => {
+    const { child, session, finish, turnStarted, answerTo } = await startSession();
+    send(child, elicitation(43));
+    expect(await answerTo(43)).toMatchObject({ result: { action: "decline" } });
+
+    const onMcpElicitation = vi.fn(async () => ({ action: "accept" as const }));
+    const turn = session.runTurn({ prompt: "x", onMcpElicitation });
+    await turnStarted();
+    send(child, elicitation(44, { threadId: "someone-else" }));
+    expect(await answerTo(44)).toMatchObject({ result: { action: "decline" } });
+    send(child, elicitation(45, { mode: "openaiForm" }));
+    expect(await answerTo(45)).toMatchObject({ result: { action: "decline" } });
+    send(child, elicitation(46, { mode: "openai/form" }));
+    expect(await answerTo(46)).toMatchObject({ result: { action: "decline" } });
+    expect(onMcpElicitation).not.toHaveBeenCalled();
+    finish();
+    await turn;
+    await session.close();
+  });
+
+  it("declines with no callback, and cancels when it throws", async () => {
+    const { child, session, finish, turnStarted, answerTo } = await startSession();
+    const first = session.runTurn({ prompt: "x" });
+    await turnStarted();
+    send(child, elicitation(47));
+    expect(await answerTo(47)).toMatchObject({ result: { action: "decline" } });
+    finish();
+    await first;
+
+    const second = session.runTurn({
+      prompt: "y",
+      onMcpElicitation: async () => {
+        throw new Error("boom");
+      },
+    });
+    await flush();
+    send(child, elicitation(48, { turnId: "turn-2" }));
+    expect(await answerTo(48)).toMatchObject({ result: { action: "cancel" } });
+    finish();
+    await second;
+    await session.close();
+  });
+
+  it("declines a late request from a turn that already ended", async () => {
+    const { child, session, finish, turnStarted, answerTo, requests } = await startSession();
+    const first = session.runTurn({ prompt: "x" });
+    await turnStarted();
+    finish();
+    await first;
+
+    const onMcpElicitation = vi.fn(async () => ({ action: "accept" as const }));
+    const second = session.runTurn({ prompt: "y", onMcpElicitation });
+    await vi.waitFor(() => {
+      expect(requests.filter(({ method }) => method === "turn/start")).toHaveLength(2);
+    });
+    send(child, elicitation(53, { turnId: "turn-1" }));
+    expect(await answerTo(53)).toMatchObject({ result: { action: "decline" } });
+    expect(onMcpElicitation).not.toHaveBeenCalled();
+    send(child, elicitation(54, { turnId: "turn-2" }));
+    expect(await answerTo(54)).toMatchObject({ result: { action: "accept" } });
+    finish();
+    await second;
+    await session.close();
+  });
+
+  it("cancels and aborts an open request when the turn settles", async () => {
+    const { child, session, finish, turnStarted, answerTo } = await startSession();
+    let seen: AbortSignal | undefined;
+    const turn = session.runTurn({
+      prompt: "x",
+      onMcpElicitation: (_request, { signal }) => {
+        seen = signal;
+        return new Promise(() => {});
+      },
+    });
+    await turnStarted();
+    send(child, elicitation(49));
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    finish();
+    await turn;
+    expect(await answerTo(49)).toMatchObject({ result: { action: "cancel" } });
+    expect(seen?.aborted).toBe(true);
+    await session.close();
+  });
+
+  it("ends a request Codex says is already resolved, leaving others open", async () => {
+    const { child, session, finish, turnStarted, answerTo, requests } = await startSession();
+    const signals = new Map<string, AbortSignal>();
+    const turn = session.runTurn({
+      prompt: "x",
+      onMcpElicitation: (request, { signal }) => {
+        signals.set(request.message, signal);
+        return new Promise(() => {});
+      },
+    });
+    await turnStarted();
+    send(child, elicitation(51, { message: "first" }));
+    send(child, elicitation(52, { message: "second" }));
+    await vi.waitFor(() => expect(signals.size).toBe(2));
+
+    send(child, {
+      method: "serverRequest/resolved",
+      params: { threadId: "someone-else", requestId: 51 },
+    });
+    await flush();
+    expect(signals.get("first")?.aborted).toBe(false);
+
+    send(child, { method: "serverRequest/resolved", params: { threadId: THREAD, requestId: 51 } });
+    expect(await answerTo(51)).toMatchObject({ result: { action: "cancel" } });
+    expect(signals.get("first")?.aborted).toBe(true);
+    expect(signals.get("second")?.aborted).toBe(false);
+    expect(requests.some((message) => message.id === 52 && message.method === undefined)).toBe(false);
+    finish();
+    await turn;
+    await session.close();
+  });
+
+  it("keeps -32601 for every other server request", async () => {
+    const { child, session, answerTo } = await startSession();
+    send(child, { id: 50, method: "item/tool/requestUserInput", params: {} });
+    expect(await answerTo(50)).toMatchObject({
+      error: { code: -32601, message: "Unsupported server request: item/tool/requestUserInput" },
+    });
+    await session.close();
   });
 });

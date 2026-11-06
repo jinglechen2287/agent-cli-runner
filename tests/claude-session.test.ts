@@ -38,6 +38,7 @@ interface FakeQuery {
   fail(error: Error): void;
   interrupt: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
+  mcpServerStatus: ReturnType<typeof vi.fn>;
 }
 
 function makeFakeQuery(): FakeQuery {
@@ -63,6 +64,7 @@ function makeFakeQuery(): FakeQuery {
       ended = true;
       notify();
     }),
+    mcpServerStatus: vi.fn(async () => []),
     queryFn: (params) => {
       captured = params;
       void (async () => {
@@ -82,6 +84,7 @@ function makeFakeQuery(): FakeQuery {
       const runtime: ClaudeQuery = {
         interrupt: fake.interrupt,
         close: fake.close,
+        mcpServerStatus: fake.mcpServerStatus as never,
         async *[Symbol.asyncIterator]() {
           while (true) {
             const next = messages.shift();
@@ -1034,5 +1037,362 @@ describe("runClaude", () => {
     fake.emit({ type: "result", subtype: "error_during_execution", is_error: true, errors: [] });
     await expect(run).rejects.toBeInstanceOf(AbortError);
     expect(fake.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createClaudeSession MCP status", () => {
+  const initWith = (servers: Array<{ name: string; status: string }>) => ({
+    ...init(),
+    mcp_servers: servers,
+  });
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports the init line's servers, with pending as connecting", async () => {
+    const fake = makeFakeQuery();
+    fake.mcpServerStatus.mockImplementation(async () => {
+      throw new Error("status unavailable");
+    });
+    const session = await startSession(fake);
+    const snapshots: unknown[] = [];
+    const turn = session.runTurn({
+      prompt: "x",
+      onMcpStatus: (servers) => snapshots.push(servers),
+    });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([
+      { name: "a", status: "connected" },
+      { name: "b", status: "pending" },
+      { name: "c", status: "needs-auth" },
+      { name: "d", status: "disabled" },
+      { name: "e", status: "failed" },
+      { name: "f", status: "something-new" },
+    ]));
+    fake.emit(result("done"));
+    await expect(turn).resolves.toMatchObject({ exitCode: 0 });
+    expect(snapshots[0]).toEqual([
+      { name: "a", status: "connected" },
+      { name: "b", status: "connecting" },
+      { name: "c", status: "needs-auth" },
+      { name: "d", status: "disabled" },
+      { name: "e", status: "failed" },
+    ]);
+    await session.close();
+  });
+
+  it("gets error details from mcpServerStatus and keeps them when init repeats", async () => {
+    const fake = makeFakeQuery();
+    fake.mcpServerStatus.mockResolvedValue([
+      { name: "bad", status: "failed", error: "Connection closed" },
+    ]);
+    const session = await startSession(fake);
+    const snapshots: unknown[] = [];
+    const onMcpStatus = (servers: unknown) => snapshots.push(servers);
+    const first = session.runTurn({ prompt: "x", onMcpStatus });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([{ name: "bad", status: "failed" }]));
+    await vi.waitFor(() => {
+      expect(snapshots.at(-1)).toEqual([{ name: "bad", status: "failed", error: "Connection closed" }]);
+    });
+    fake.emit(result("done"));
+    await first;
+
+    snapshots.length = 0;
+    const second = session.runTurn({ prompt: "y", onMcpStatus });
+    await fake.waitForPrompt(2);
+    fake.emit(initWith([{ name: "bad", status: "failed" }]));
+    fake.emit(result("done"));
+    await second;
+    expect(snapshots[0]).toEqual([{ name: "bad", status: "failed", error: "Connection closed" }]);
+    expect(snapshots.every((snapshot) => JSON.stringify(snapshot).includes("Connection closed"))).toBe(true);
+    await session.close();
+  });
+
+  it("sends the cached snapshot at the start of a later turn even with no new init", async () => {
+    const fake = makeFakeQuery();
+    fake.mcpServerStatus.mockResolvedValue([{ name: "a", status: "connected" }]);
+    const session = await startSession(fake);
+    const first = session.runTurn({ prompt: "x", onMcpStatus: () => {} });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([{ name: "a", status: "connected" }]));
+    fake.emit(result("done"));
+    await first;
+
+    const snapshots: unknown[] = [];
+    const second = session.runTurn({ prompt: "y", onMcpStatus: (servers) => snapshots.push(servers) });
+    await fake.waitForPrompt(2);
+    expect(snapshots[0]).toEqual([{ name: "a", status: "connected" }]);
+    fake.emit(result("done"));
+    await second;
+    await session.close();
+  });
+
+  it("re-polls while a server is connecting, then stops once it settles", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const fake = makeFakeQuery();
+    fake.mcpServerStatus
+      .mockResolvedValueOnce([{ name: "slow", status: "pending" }])
+      .mockResolvedValueOnce([{ name: "slow", status: "connected" }]);
+    const session = await startSession(fake);
+    const snapshots: unknown[] = [];
+    const turn = session.runTurn({ prompt: "x", onMcpStatus: (servers) => snapshots.push(servers) });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([{ name: "slow", status: "pending" }]));
+    await vi.waitFor(() => expect(fake.mcpServerStatus).toHaveBeenCalledTimes(1));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(snapshots.at(-1)).toEqual([{ name: "slow", status: "connected" }]);
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fake.mcpServerStatus).toHaveBeenCalledTimes(2);
+    fake.emit(result("done"));
+    await turn;
+    await session.close();
+  });
+
+  it("gives up polling after 30 seconds", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const fake = makeFakeQuery();
+    fake.mcpServerStatus.mockResolvedValue([{ name: "slow", status: "pending" }]);
+    const session = await startSession(fake);
+    const turn = session.runTurn({ prompt: "x", onMcpStatus: () => {} });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([{ name: "slow", status: "pending" }]));
+    await vi.waitFor(() => expect(fake.mcpServerStatus).toHaveBeenCalled());
+    await vi.advanceTimersByTimeAsync(60_000);
+    const calls = fake.mcpServerStatus.mock.calls.length;
+    expect(calls).toBeLessThanOrEqual(17);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fake.mcpServerStatus.mock.calls.length).toBe(calls);
+    fake.emit(result("done"));
+    await turn;
+    await session.close();
+  });
+
+  it("asks again for the new turn when a status call outlives the turn that made it", async () => {
+    const fake = makeFakeQuery();
+    let finishFirst: (servers: unknown) => void = () => {};
+    fake.mcpServerStatus
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        finishFirst = resolve;
+      }))
+      .mockResolvedValue([{ name: "slow", status: "connected" }]);
+    const session = await startSession(fake);
+    const first = session.runTurn({ prompt: "x", onMcpStatus: () => {} });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([{ name: "slow", status: "pending" }]));
+    await vi.waitFor(() => expect(fake.mcpServerStatus).toHaveBeenCalledTimes(1));
+    fake.emit(result("done"));
+    await first;
+
+    const snapshots: unknown[] = [];
+    const second = session.runTurn({ prompt: "y", onMcpStatus: (servers) => snapshots.push(servers) });
+    await fake.waitForPrompt(2);
+    finishFirst([{ name: "slow", status: "pending" }]);
+    await vi.waitFor(() => {
+      expect(snapshots.at(-1)).toEqual([{ name: "slow", status: "connected" }]);
+    });
+    fake.emit(result("done"));
+    await second;
+    await session.close();
+  });
+
+  it("keeps the last snapshot when a status call fails, and the turn is unaffected", async () => {
+    const fake = makeFakeQuery();
+    fake.mcpServerStatus.mockRejectedValue(new Error("nope"));
+    const session = await startSession(fake);
+    const snapshots: unknown[] = [];
+    const turn = session.runTurn({ prompt: "x", onMcpStatus: (servers) => snapshots.push(servers) });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([{ name: "a", status: "connected" }]));
+    await vi.waitFor(() => expect(fake.mcpServerStatus).toHaveBeenCalled());
+    await flush();
+    fake.emit(result("done"));
+    await expect(turn).resolves.toMatchObject({ exitCode: 0 });
+    expect(snapshots).toEqual([[{ name: "a", status: "connected" }]]);
+    await session.close();
+  });
+
+  it("never asks for status when the turn has no status callback", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.runTurn({ prompt: "x" });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([{ name: "a", status: "pending" }]));
+    fake.emit(result("done"));
+    await turn;
+    expect(fake.mcpServerStatus).not.toHaveBeenCalled();
+    await session.close();
+  });
+});
+
+describe("createClaudeSession MCP elicitation", () => {
+  const form = {
+    serverName: "probe",
+    message: "Who are you?",
+    mode: "form" as const,
+    requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+  };
+  const elicit = (
+    fake: FakeQuery,
+    request: Record<string, unknown>,
+    signal = new AbortController().signal,
+  ) => {
+    const onElicitation = fake.options().onElicitation;
+    if (!onElicitation) throw new Error("no onElicitation");
+    return onElicitation(request as never, { signal, requestId: "r1" });
+  };
+
+  it("hands a form to the running turn and returns its answer", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const onMcpElicitation = vi.fn(async () => ({
+      action: "accept" as const,
+      content: { name: "Ada" },
+    }));
+    const turn = session.runTurn({ prompt: "x", onMcpElicitation });
+    await fake.waitForPrompt(1);
+    await expect(elicit(fake, form)).resolves.toEqual({ action: "accept", content: { name: "Ada" } });
+    expect(onMcpElicitation).toHaveBeenCalledWith(
+      { serverName: "probe", message: "Who are you?", mode: "form", requestedSchema: form.requestedSchema },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    fake.emit(result("done"));
+    await turn;
+    await session.close();
+  });
+
+  it("treats a missing mode as a form", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const onMcpElicitation = vi.fn(async () => ({ action: "decline" as const }));
+    const turn = session.runTurn({ prompt: "x", onMcpElicitation });
+    await fake.waitForPrompt(1);
+    await elicit(fake, { serverName: "probe", message: "Sure?" });
+    expect(onMcpElicitation).toHaveBeenCalledWith(
+      { serverName: "probe", message: "Sure?", mode: "form", requestedSchema: { type: "object", properties: {} } },
+      expect.anything(),
+    );
+    fake.emit(result("done"));
+    await turn;
+    await session.close();
+  });
+
+  it("hands over a URL request, and declines one with no URL", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const onMcpElicitation = vi.fn(async () => ({ action: "accept" as const }));
+    const turn = session.runTurn({ prompt: "x", onMcpElicitation });
+    await fake.waitForPrompt(1);
+    await expect(elicit(fake, { serverName: "probe", message: "Go", mode: "url" }))
+      .resolves.toEqual({ action: "decline" });
+    expect(onMcpElicitation).not.toHaveBeenCalled();
+    await expect(elicit(fake, {
+      serverName: "probe",
+      message: "Go",
+      mode: "url",
+      url: "https://example.com/signin",
+    })).resolves.toEqual({ action: "accept" });
+    expect(onMcpElicitation).toHaveBeenCalledWith(
+      { serverName: "probe", message: "Go", mode: "url", url: "https://example.com/signin" },
+      expect.anything(),
+    );
+    fake.emit(result("done"));
+    await turn;
+    await session.close();
+  });
+
+  it("declines with no running turn or no callback", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    await expect(elicit(fake, form)).resolves.toEqual({ action: "decline" });
+    const turn = session.runTurn({ prompt: "x" });
+    await fake.waitForPrompt(1);
+    await expect(elicit(fake, form)).resolves.toEqual({ action: "decline" });
+    fake.emit(result("done"));
+    await turn;
+    await session.close();
+  });
+
+  it("cancels when the callback throws", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.runTurn({
+      prompt: "x",
+      onMcpElicitation: async () => {
+        throw new Error("boom");
+      },
+    });
+    await fake.waitForPrompt(1);
+    await expect(elicit(fake, form)).resolves.toEqual({ action: "cancel" });
+    fake.emit(result("done"));
+    await turn;
+    await session.close();
+  });
+
+  it("cancels and aborts when the SDK's signal fires", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    let seen: AbortSignal | undefined;
+    const turn = session.runTurn({
+      prompt: "x",
+      onMcpElicitation: (_request, { signal }) => {
+        seen = signal;
+        return new Promise(() => {});
+      },
+    });
+    await fake.waitForPrompt(1);
+    const sdk = new AbortController();
+    const answer = elicit(fake, form, sdk.signal);
+    sdk.abort();
+    await expect(answer).resolves.toEqual({ action: "cancel" });
+    expect(seen?.aborted).toBe(true);
+    fake.emit(result("done"));
+    await turn;
+    await session.close();
+  });
+
+  it("cancels and aborts an open request when the turn settles", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    let seen: AbortSignal | undefined;
+    const turn = session.runTurn({
+      prompt: "x",
+      onMcpElicitation: (_request, { signal }) => {
+        seen = signal;
+        return new Promise(() => {});
+      },
+    });
+    await fake.waitForPrompt(1);
+    const answer = elicit(fake, form);
+    fake.emit(result("done"));
+    await turn;
+    await expect(answer).resolves.toEqual({ action: "cancel" });
+    expect(seen?.aborted).toBe(true);
+    await session.close();
+  });
+
+  it("cancels an open request when the session closes", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.runTurn({
+      prompt: "x",
+      onMcpElicitation: () => new Promise(() => {}),
+    });
+    await fake.waitForPrompt(1);
+    const answer = elicit(fake, form);
+    fake.fail(new Error("cli died"));
+    await expect(turn).rejects.toThrow();
+    await expect(answer).resolves.toEqual({ action: "cancel" });
+  });
+
+  it("gives isolated sessions no elicitation path", async () => {
+    const fake = makeFakeQuery();
+    await startSession(fake, { isolated: true });
+    expect(fake.options().onElicitation).toBeUndefined();
   });
 });

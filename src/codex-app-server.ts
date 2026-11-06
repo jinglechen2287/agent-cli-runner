@@ -7,6 +7,7 @@ import {
   TimeoutError,
 } from "./errors.js";
 import {
+  answerMcpElicitation,
   createChunkDecoder,
   createLineSplitter,
   filterEnv,
@@ -23,8 +24,11 @@ import {
 } from "./internal.js";
 import type { RunCodexOptions } from "./run-codex.js";
 import type {
+  AgentCallbacks,
   BackgroundAgentInfo,
   BackgroundAgentStatus,
+  McpElicitationRequest,
+  McpServerStatusInfo,
   RunResult,
   ToolPlanItem,
   ToolUseInfo,
@@ -43,6 +47,15 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+/** Thrown by a {@link CodexServerRequestHandler} for a method it does not
+ * take: the server gets "method not found", as if nothing were registered. */
+export class UnsupportedServerRequestError extends Error {
+  constructor(method: string) {
+    super(`Unsupported server request: ${method}`);
+    this.name = "UnsupportedServerRequestError";
+  }
 }
 
 export interface CodexServerRequest {
@@ -79,6 +92,8 @@ export interface CreateCodexAppServerClientOptions {
   env?: NodeJS.ProcessEnv;
   spawnFn?: RunCodexOptions["spawnFn"];
   requestTimeoutMs?: number;
+  /** MCP extensions this client supports, declared at `initialize`. */
+  extensions?: { [id: string]: CodexJsonValue };
 }
 
 export type CodexAppServerTurnOptions = Omit<
@@ -242,6 +257,10 @@ export async function createCodexAppServerClient(
       const result = await handler({ id, method, params: message.params });
       send({ id, result: result ?? null });
     } catch (error) {
+      if (error instanceof UnsupportedServerRequestError) {
+        send({ id, error: { code: -32601, message: error.message } });
+        return;
+      }
       send({
         id,
         error: {
@@ -371,7 +390,10 @@ export async function createCodexAppServerClient(
   try {
     await client.request("initialize", {
       clientInfo: CLIENT_INFO,
-      capabilities: { experimentalApi: true },
+      capabilities: {
+        experimentalApi: true,
+        ...(options.extensions ? { extensions: options.extensions } : {}),
+      },
     });
     client.notify("initialized", {});
     return client;
@@ -428,8 +450,12 @@ export function toolName(item: Record<string, unknown>): string | null {
     case "file_change":
       return "Edit";
     case "mcpToolCall":
-    case "mcp_tool_call":
-      return text(item.tool) ?? "MCP";
+    case "mcp_tool_call": {
+      const tool = text(item.tool);
+      const server = text(item.server);
+      // The form Claude reports, so a host reads one name for an MCP tool.
+      return tool && server ? `mcp__${server}__${tool}` : tool ?? "MCP";
+    }
     case "dynamicToolCall":
       return text(item.tool) ?? "Tool";
     case "webSearch":
@@ -722,7 +748,7 @@ function requestCodexThread(
     | "forkSessionId"
     | "forkConfig"
     | "isolated"
-  > & { config?: CodexConfigOverrides },
+  > & { config?: CodexConfigOverrides; threadSource?: "user" },
 ): Promise<unknown> {
   if (opts.forkSessionId && !opts.isolated) {
     // A guarded fork keeps Codex's tools: the turn's sandbox policy bounds them.
@@ -784,7 +810,10 @@ function requestCodexThread(
   };
   return opts.resumeSessionId
     ? client.request("thread/resume", { threadId: opts.resumeSessionId, ...params })
-    : client.request("thread/start", params);
+    : client.request("thread/start", {
+        ...params,
+        ...(opts.threadSource ? { threadSource: opts.threadSource } : {}),
+      });
 }
 
 function openedCodexThread(value: unknown, fallbackModel?: string): OpenedCodexThread {
@@ -1416,6 +1445,51 @@ async function runCodexAppServerTurn(
   }
 }
 
+/** Declared so Codex hands a full-access turn's MCP forms to the client. It also
+ * needs the thread to be a user's, which `thread/start` states and a resumed
+ * thread keeps. */
+const FORM_INPUT_EXTENSION = "openai/standard-form-input";
+
+function codexMcpStatus(params: Record<string, unknown>): McpServerStatusInfo | undefined {
+  const name = text(params.name);
+  if (!name) return undefined;
+  const error = text(params.error);
+  const failed = (status: McpServerStatusInfo["status"]): McpServerStatusInfo => ({
+    name,
+    status,
+    ...(error ? { error } : {}),
+  });
+  switch (params.status) {
+    case "starting":
+      return { name, status: "connecting" };
+    case "ready":
+      return { name, status: "connected" };
+    case "failed":
+      return failed(params.failureReason === "reauthenticationRequired" ? "needs-auth" : "failed");
+    case "cancelled":
+      return failed("failed");
+    default:
+      return undefined;
+  }
+}
+
+/** The request a host can answer, or undefined for a mode only Codex's own
+ * clients understand. */
+function codexElicitationRequest(params: Record<string, unknown>): McpElicitationRequest | undefined {
+  const serverName = text(params.serverName);
+  const message = typeof params.message === "string" ? params.message : undefined;
+  if (!serverName || message === undefined) return undefined;
+  if (params.mode === "form") {
+    const requestedSchema = record(params.requestedSchema);
+    return requestedSchema ? { serverName, message, mode: "form", requestedSchema } : undefined;
+  }
+  if (params.mode === "url") {
+    const url = text(params.url);
+    return url ? { serverName, message, mode: "url", url } : undefined;
+  }
+  return undefined;
+}
+
 export async function createCodexAppServerSession(
   options: CreateCodexAppServerSessionOptions,
 ): Promise<CodexAppServerSession> {
@@ -1427,23 +1501,98 @@ export async function createCodexAppServerSession(
     ...(options.requestTimeoutMs !== undefined
       ? { requestTimeoutMs: options.requestTimeoutMs }
       : {}),
+    extensions: { [FORM_INPUT_EXTENSION]: {} },
+  });
+
+  let activeTurn: { callbacks: AgentCallbacks; elicitations: AbortController } | undefined;
+  let threadId: string | undefined;
+  const previousTurnIds = new Set<string>();
+  /** Requests a callback is answering, so Codex can say one is over. */
+  const openElicitations = new Map<number | string, AbortController>();
+  const mcpStatuses = new Map<string, McpServerStatusInfo>();
+  /** Status that arrived before `thread/start` named the thread. */
+  const earlyStatus: Array<Record<string, unknown>> = [];
+  const emitMcpStatus = (): void => {
+    const callbacks = activeTurn?.callbacks;
+    if (!callbacks?.onMcpStatus || mcpStatuses.size === 0) return;
+    const snapshot = [...mcpStatuses.values()].map((status) => ({ ...status }));
+    safeCallback(() => callbacks.onMcpStatus?.(snapshot));
+  };
+  const applyMcpStatus = (params: Record<string, unknown>): boolean => {
+    const tagged = text(params.threadId);
+    if (tagged && tagged !== threadId) return false;
+    const status = codexMcpStatus(params);
+    if (!status) return false;
+    const previous = mcpStatuses.get(status.name);
+    if (previous && JSON.stringify(previous) === JSON.stringify(status)) return false;
+    mcpStatuses.set(status.name, status);
+    return true;
+  };
+  // Both go in before `thread/start`: servers start, and can ask for input,
+  // as soon as the thread opens.
+  client.onNotification((method, rawParams) => {
+    const params = record(rawParams);
+    if (!params) return;
+    if (method === "serverRequest/resolved") {
+      if (params.threadId !== threadId) return;
+      const requestId = params.requestId;
+      if (typeof requestId === "string" || typeof requestId === "number") {
+        openElicitations.get(requestId)?.abort();
+      }
+      return;
+    }
+    if (method !== "mcpServer/startupStatus/updated") return;
+    if (threadId === undefined) {
+      earlyStatus.push(params);
+      return;
+    }
+    if (applyMcpStatus(params)) emitMcpStatus();
+  });
+  client.onServerRequest(async (request) => {
+    if (request.method !== "mcpServer/elicitation/request") {
+      throw new UnsupportedServerRequestError(request.method);
+    }
+    const params = record(request.params);
+    const turn = activeTurn;
+    // A tool call an earlier turn left behind can still ask. Nobody is waiting
+    // on it, and this turn's user would be answering something else.
+    const stale = typeof params?.turnId === "string" && previousTurnIds.has(params.turnId);
+    const elicitation = params && params.threadId === threadId && turn && !stale
+      ? codexElicitationRequest(params)
+      : undefined;
+    if (!turn || !elicitation) return { action: "decline" };
+    const resolved = new AbortController();
+    openElicitations.set(request.id, resolved);
+    try {
+      return await answerMcpElicitation(turn.callbacks.onMcpElicitation, elicitation, [
+        turn.elicitations.signal,
+        resolved.signal,
+      ]);
+    } finally {
+      openElicitations.delete(request.id);
+    }
   });
 
   let opened: OpenedCodexThread;
   try {
-    opened = openedCodexThread(await requestCodexThread(client, options), options.model);
+    opened = openedCodexThread(
+      await requestCodexThread(client, { ...options, threadSource: "user" }),
+      options.model,
+    );
   } catch (error) {
     client.close();
     throw error;
   }
+  threadId = opened.threadId;
+  for (const params of earlyStatus.splice(0)) applyMcpStatus(params);
 
   let closed = false;
   let running = false;
   let steerRunning: ((prompt: string) => Promise<void>) | null = null;
-  const previousTurnIds = new Set<string>();
   let closePromise: Promise<void> | undefined;
   client.onClose(() => {
     closed = true;
+    activeTurn?.elicitations.abort();
   });
 
   return {
@@ -1456,6 +1605,9 @@ export async function createCodexAppServerSession(
       if (closed) throw new Error("Codex app-server session is closed");
       if (running) throw new Error("Codex app-server session already has an active turn");
       running = true;
+      const turn = { callbacks: turnOptions, elicitations: new AbortController() };
+      activeTurn = turn;
+      emitMcpStatus();
       try {
         return await runCodexAppServerTurn({
           ...turnOptions,
@@ -1484,6 +1636,8 @@ export async function createCodexAppServerSession(
       } finally {
         running = false;
         steerRunning = null;
+        activeTurn = undefined;
+        turn.elicitations.abort();
       }
     },
     async steer({ prompt }) {

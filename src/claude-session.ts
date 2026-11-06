@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import {
   query as sdkQuery,
   type EffortLevel,
+  type ElicitationRequest,
+  type ElicitationResult,
   type HookCallbackMatcher,
   type HookEvent,
   type McpServerConfig,
@@ -18,6 +20,7 @@ import {
 } from "./claude-messages.js";
 import { AbortError, MissingCliError, SteerRejectedError, TimeoutError } from "./errors.js";
 import {
+  answerMcpElicitation,
   createChunkDecoder,
   filterEnv,
   isRecord,
@@ -26,7 +29,13 @@ import {
   SIGTERM_GRACE_MS,
   signalProcessTree,
 } from "./internal.js";
-import type { AgentCallbacks, RunResult, SpawnFn } from "./types.js";
+import type {
+  AgentCallbacks,
+  McpElicitationRequest,
+  McpServerStatusInfo,
+  RunResult,
+  SpawnFn,
+} from "./types.js";
 
 /** Nesting-guard variables the Claude CLI uses to refuse running inside
  * another Claude Code session. Stripped so hosts launched by Claude Code
@@ -54,6 +63,8 @@ export type ClaudeHooks = Partial<Record<HookEvent, HookCallbackMatcher[]>>;
 export interface ClaudeQuery extends AsyncIterable<unknown> {
   interrupt(): Promise<unknown>;
   close(): void;
+  /** Absent on a scripted query that doesn't model it. */
+  mcpServerStatus?(): Promise<ReadonlyArray<{ name: string; status: string; error?: string }>>;
 }
 
 /** The Agent SDK's `query()`, narrowed to the streaming-input form a session
@@ -71,6 +82,55 @@ export const CLAUDE_INTERRUPT_GRACE_MS = 5_000;
  * subagent has settled, for the CLI to answer the notification with a
  * `result` before the turn settles without it. */
 export const CLAUDE_FOLLOW_UP_GRACE_MS = 60_000;
+
+/** How long one `mcpServerStatus` call may take before the last snapshot stands. */
+const MCP_STATUS_TIMEOUT_MS = 5_000;
+/** How often a turn looks again while a server is still connecting, and for how
+ * long: a server that never settles must not poll for the rest of the turn. */
+const MCP_STATUS_POLL_MS = 2_000;
+const MCP_STATUS_POLL_LIMIT_MS = 30_000;
+
+const CLAUDE_MCP_STATUSES: Readonly<Record<string, McpServerStatusInfo["status"]>> = {
+  pending: "connecting",
+  connected: "connected",
+  failed: "failed",
+  "needs-auth": "needs-auth",
+  disabled: "disabled",
+};
+
+/** Normalize what the CLI reports. `known` supplies the error for a server that
+ * hasn't changed state, since the init line carries none. */
+function claudeMcpStatuses(
+  servers: readonly unknown[],
+  known: readonly McpServerStatusInfo[] = [],
+): McpServerStatusInfo[] {
+  return servers.flatMap((server) => {
+    if (!isRecord(server) || typeof server.name !== "string" || typeof server.status !== "string") {
+      return [];
+    }
+    const status = CLAUDE_MCP_STATUSES[server.status];
+    if (!status) return [];
+    const stated = typeof server.error === "string" && server.error ? server.error : undefined;
+    const previous = known.find((entry) => entry.name === server.name && entry.status === status);
+    const error = stated ?? previous?.error;
+    return [{ name: server.name, status, ...(error ? { error } : {}) }];
+  });
+}
+
+/** What a host can answer, or undefined for a URL request with no URL. A form
+ * with no schema asks only for a yes. */
+function claudeElicitationRequest(request: ElicitationRequest): McpElicitationRequest | undefined {
+  const { serverName, message } = request;
+  if (request.mode === "url") {
+    return request.url ? { serverName, message, mode: "url", url: request.url } : undefined;
+  }
+  return {
+    serverName,
+    message,
+    mode: "form",
+    requestedSchema: request.requestedSchema ?? { type: "object", properties: {} },
+  };
+}
 
 export interface CreateClaudeSessionOptions {
   cwd: string;
@@ -168,6 +228,10 @@ interface ActiveTurn {
   timeoutMs: number | undefined;
   /** Running while the turn waits on the CLI's follow-up `result`. */
   followUpTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Fires when the turn is over, so a request still waiting on the user ends. */
+  elicitations: AbortController;
+  /** When this turn stops looking again for a server still connecting. */
+  mcpPollDeadline: number;
   resolve(result: RunResult): void;
   reject(error: Error): void;
 }
@@ -395,8 +459,79 @@ export async function createClaudeSession(
     };
   };
 
-  const options = claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeCodeProcess);
+  const onElicitation: NonNullable<Options["onElicitation"]> = (request, { signal }) => {
+    const turn = active;
+    const elicitation = claudeElicitationRequest(request);
+    if (!turn || !elicitation) return Promise.resolve({ action: "decline" });
+    // A host's answer is typed loosely on purpose; the MCP server validates it.
+    return answerMcpElicitation(turn.callbacks.onMcpElicitation, elicitation, [
+      signal,
+      turn.elicitations.signal,
+    ]) as Promise<ElicitationResult>;
+  };
+  const options: Options = {
+    ...claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeCodeProcess),
+    ...(opts.isolated ? {} : { onElicitation }),
+  };
   const runtime = queryFn({ prompt: input.iterable, options });
+
+  /** The last status seen, kept for the next turn: the process may not repeat
+   * its init line, and a server's error comes from `mcpServerStatus` alone. */
+  let mcpStatuses: McpServerStatusInfo[] | undefined;
+  let mcpStatusInFlight = false;
+  let mcpPollTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const emitMcpStatus = (): void => {
+    const callbacks = active?.callbacks;
+    const snapshot = mcpStatuses;
+    if (!callbacks?.onMcpStatus || !snapshot) return;
+    safeCallback(() => callbacks.onMcpStatus?.(snapshot.map((status) => ({ ...status }))));
+  };
+  const updateMcpStatus = (next: McpServerStatusInfo[]): void => {
+    if (JSON.stringify(next) === JSON.stringify(mcpStatuses)) return;
+    mcpStatuses = next;
+    emitMcpStatus();
+  };
+  const stopMcpPoll = (): void => {
+    if (mcpPollTimer) clearTimeout(mcpPollTimer);
+    mcpPollTimer = undefined;
+  };
+  /** Best effort: a call that fails or stalls leaves the snapshot as it was. */
+  const refreshMcpStatus = async (): Promise<void> => {
+    const turn = active;
+    if (!turn?.callbacks.onMcpStatus || !runtime.mcpServerStatus || mcpStatusInFlight) return;
+    mcpStatusInFlight = true;
+    let stall: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const servers = await Promise.race([
+        runtime.mcpServerStatus(),
+        new Promise<never>((_resolve, reject) => {
+          stall = setTimeout(() => reject(new Error("timed out")), MCP_STATUS_TIMEOUT_MS);
+          stall.unref?.();
+        }),
+      ]);
+      if (active === turn) updateMcpStatus(claudeMcpStatuses(servers, mcpStatuses));
+    } catch {
+      // Status must never affect the turn.
+    } finally {
+      if (stall) clearTimeout(stall);
+      mcpStatusInFlight = false;
+    }
+    // A newer turn was turned away while this call was out, and needs its own.
+    if (active && active !== turn) {
+      void refreshMcpStatus();
+      return;
+    }
+    if (
+      active === turn
+      && Date.now() < turn.mcpPollDeadline
+      && mcpStatuses?.some(({ status }) => status === "connecting")
+    ) {
+      stopMcpPoll();
+      mcpPollTimer = setTimeout(() => void refreshMcpStatus(), MCP_STATUS_POLL_MS);
+      mcpPollTimer.unref?.();
+    }
+  };
 
   const killTree = (): Promise<void> => {
     const current = child;
@@ -498,6 +633,15 @@ export async function createClaudeSession(
           }
           continue;
         }
+        if (
+          isRecord(message)
+          && message.type === "system"
+          && message.subtype === "init"
+          && Array.isArray(message.mcp_servers)
+        ) {
+          updateMcpStatus(claudeMcpStatuses(message.mcp_servers, mcpStatuses));
+          void refreshMcpStatus();
+        }
         turn.translator.handle(message);
         if (turn.translator.echoedPromptUuid) cliEchoesPromptUuid = true;
         if (turn.translator.done) {
@@ -542,6 +686,8 @@ export async function createClaudeSession(
           if (graceTimer) clearTimeout(graceTimer);
           if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
           signal?.removeEventListener("abort", onAbort);
+          stopMcpPoll();
+          turn.elicitations.abort();
         };
         // Stamped so the turn's result can be told apart from one the CLI
         // writes for something else — a task an earlier process left running.
@@ -556,6 +702,8 @@ export async function createClaudeSession(
           interruption: null,
           timeoutMs,
           followUpTimer: undefined,
+          elicitations: new AbortController(),
+          mcpPollDeadline: Date.now() + MCP_STATUS_POLL_LIMIT_MS,
           resolve: (result) => {
             cleanup();
             resolve(result);
@@ -587,6 +735,12 @@ export async function createClaudeSession(
           timeoutTimer = setTimeout(() => interrupt("timeout"), timeoutMs);
         }
         active = turn;
+        // A first turn hears from the init line instead: asking before the CLI
+        // is up would only sit waiting.
+        if (mcpStatuses) {
+          emitMcpStatus();
+          void refreshMcpStatus();
+        }
         input.push({
           type: "user",
           message: { role: "user", content: prompt },

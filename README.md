@@ -139,6 +139,25 @@ For new threads, the runner opts into Codex raw response items so hosted web pag
 
 `forkSessionId` forks an existing thread for a side run on a one-off app-server, not `codex exec`. It sends `thread/fork` with `ephemeral: true`, a read-only sandbox and `approvalPolicy: "never"`. The fork sees the thread's history, including the current turn's completed items, and nothing it does is written back to the thread. With `isolated: true`, it also sends `CODEX_FORK_CONFIG`, which turns off web search and every tool feature, and switches off each configured MCP server by name. If a tool item starts anyway, the run sends `turn/interrupt` and rejects with `CodexTurnError`. Without `isolated`, the fork keeps Codex's tools, and `turn/start` carries your `sandboxPolicy`, which must be `readOnly`. That bounds the fork's shell, not everything it can reach: network access, exec-policy rules that allow a command outside the sandbox, and MCP tools approved in the user's Codex config can still act, exactly as they could in an ordinary read-only turn. A guarded fork's `forkConfig` goes on `thread/fork` as its config overrides, such as an MCP server for that fork alone. A fork cannot be combined with `resumeSessionId`, `appServerClient`, `appServerSession`, `turnCwd`, or `dangerouslyBypassApprovalsAndSandbox`; an isolated one cannot take a `sandboxPolicy` either.
 
+### MCP servers
+
+Claude runs and Codex sessions report their MCP servers through two callbacks. A one-off Codex run reports neither.
+
+`onMcpStatus` receives a snapshot of every server the CLI reports, as `{ name, status, error? }`, where `status` is `connecting`, `connected`, `failed`, `needs-auth` or `disabled`. Claude lists disabled servers; Codex only reports the ones it starts. It fires at the start of each turn on a long-lived session and whenever a server changes during one. Claude's errors come from the SDK's `mcpServerStatus()`, polled every 2 seconds for up to 30 while a server is still connecting; a failed status call keeps the last snapshot and never affects the turn.
+
+`onMcpElicitation` answers a server's request for user input while its tool call waits. It receives a `form` request with a `requestedSchema`, or a `url` request, and returns `{ action, content? }`. Without it the request is declined; a throw cancels it. Its `signal` fires when the request stops mattering, such as when the turn ends.
+
+Claude hands over every form and URL request. Codex decides first, based on its approval policy:
+
+| Codex turn | Forms with fields | Confirm (no fields) | URL |
+| --- | --- | --- | --- |
+| `approvalPolicy: "never"`, full access | Handed over | Auto-accepted by Codex | Declined by Codex |
+| `approvalPolicy: "never"`, restricted sandbox | Declined by Codex | Declined by Codex | Declined by Codex |
+
+To surface forms, a session declares the `openai/standard-form-input` extension and starts its threads with `threadSource: "user"`. A thread that was started without it and later resumed may not surface them. Other policies would surface more, but they also route MCP tool approvals through the same prompts, which changes how unattended turns behave, so the runner leaves the policy alone. Codex-only modes (`openai/form`, `openaiForm`) are declined.
+
+Codex reports MCP tools as `mcp__<server>__<tool>`, the form Claude uses.
+
 ### Errors
 
 `AbortError`, `TimeoutError`, `MissingCliError` (ENOENT; carries `.cli`), and `CodexTurnError` (fatal Codex turn notifications; isolated exec failures may also carry `.exitCode`).

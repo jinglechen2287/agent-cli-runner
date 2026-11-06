@@ -36,6 +36,7 @@ export {
   CODEX_FORK_CONFIG,
   createCodexAppServerClient,
   createCodexAppServerSession,
+  UnsupportedServerRequestError,
 } from "./codex-app-server.js";
 export type {
   CodexAppServerClient,
@@ -58,6 +59,9 @@ export {
 } from "./errors.js";
 export type {
   AgentCallbacks,
+  McpElicitationRequest,
+  McpElicitationResponse,
+  McpServerStatusInfo,
   BackgroundAgentInfo,
   BackgroundAgentProgress,
   BackgroundAgentStatus,
