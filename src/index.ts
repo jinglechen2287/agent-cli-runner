@@ -32,6 +32,8 @@ export type {
   PreToolUseHookInput as ClaudePreToolUseHookInput,
   PreToolUseHookSpecificOutput as ClaudePreToolUseHookOutput,
 } from "@anthropic-ai/claude-agent-sdk";
+export { deleteClaudeSession, forkClaudeSession, forkCodexThread } from "./fork.js";
+export type { ForkCodexThreadOptions } from "./fork.js";
 export { runCodex, CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
 export type { CodexSandboxPolicy, RunCodexOptions } from "./run-codex.js";
 export {

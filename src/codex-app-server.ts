@@ -96,6 +96,9 @@ export interface CreateCodexAppServerClientOptions {
   requestTimeoutMs?: number;
   /** MCP extensions this client supports, declared at `initialize`. */
   extensions?: { [id: string]: CodexJsonValue };
+  /** Gives up on starting: closes the app-server and rejects with
+   * `AbortError`. Only the start; close the client to stop it after. */
+  signal?: AbortSignal;
 }
 
 export type CodexAppServerTurnOptions = Omit<
@@ -404,7 +407,10 @@ export async function createCodexAppServerClient(
   };
   clientExitPromises.set(client, exitPromise);
 
+  const abort = () => client.close();
+  options.signal?.addEventListener("abort", abort, { once: true });
   try {
+    if (options.signal?.aborted) throw new AbortError();
     await client.request("initialize", {
       clientInfo: CLIENT_INFO,
       capabilities: {
@@ -416,7 +422,9 @@ export async function createCodexAppServerClient(
     return client;
   } catch (error) {
     client.close();
-    throw error;
+    throw options.signal?.aborted ? new AbortError() : error;
+  } finally {
+    options.signal?.removeEventListener("abort", abort);
   }
 }
 
@@ -705,7 +713,7 @@ function toUsage(
   };
 }
 
-function threadIdFrom(value: unknown): string | undefined {
+export function threadIdFrom(value: unknown): string | undefined {
   return text(record(record(value)?.thread)?.id);
 }
 

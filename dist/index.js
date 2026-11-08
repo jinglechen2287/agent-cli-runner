@@ -1392,8 +1392,8 @@ async function runClaude(opts) {
   }
 }
 
-// src/run-codex.ts
-import { spawn } from "child_process";
+// src/fork.ts
+import { deleteSession, forkSession } from "@anthropic-ai/claude-agent-sdk";
 
 // src/codex-app-server.ts
 import { spawn as nodeSpawn3 } from "child_process";
@@ -1618,7 +1618,10 @@ async function createCodexAppServerClient(options) {
     }
   };
   clientExitPromises.set(client, exitPromise);
+  const abort = () => client.close();
+  options.signal?.addEventListener("abort", abort, { once: true });
   try {
+    if (options.signal?.aborted) throw new AbortError();
     await client.request("initialize", {
       clientInfo: CLIENT_INFO,
       capabilities: {
@@ -1630,7 +1633,9 @@ async function createCodexAppServerClient(options) {
     return client;
   } catch (error) {
     client.close();
-    throw error;
+    throw options.signal?.aborted ? new AbortError() : error;
+  } finally {
+    options.signal?.removeEventListener("abort", abort);
   }
 }
 function record(value) {
@@ -2666,7 +2671,53 @@ async function runCodexAppServer(opts) {
   return runCodexAppServerTurn(opts, client, void 0, ownedClient);
 }
 
+// src/fork.ts
+var DEFAULT_FORK_TIMEOUT_MS = 6e4;
+async function forkClaudeSession(sessionId, options) {
+  const { sessionId: forked } = await forkSession(sessionId, { dir: options.cwd });
+  return forked;
+}
+async function deleteClaudeSession(sessionId, options) {
+  await deleteSession(sessionId, { dir: options.cwd });
+}
+async function forkCodexThread(options) {
+  const signal = options.signal;
+  if (signal?.aborted) throw new AbortError();
+  const timeoutMs = options.timeoutMs ?? DEFAULT_FORK_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
+  const client = await createCodexAppServerClient({
+    cwd: options.cwd,
+    requestTimeoutMs: timeoutMs,
+    ...options.executablePath ? { executablePath: options.executablePath } : {},
+    ...options.env ? { env: options.env } : {},
+    ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
+    ...signal ? { signal } : {}
+  });
+  const abort = () => client.close();
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    if (signal?.aborted) throw new AbortError();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new TimeoutError("Codex fork timed out while the app-server started");
+    const forked = await client.request(
+      "thread/fork",
+      { threadId: options.threadId, cwd: options.cwd, ephemeral: false },
+      remaining
+    );
+    const id = threadIdFrom(forked);
+    if (!id) throw new Error("Codex answered the fork without a thread id");
+    return id;
+  } catch (error) {
+    if (signal?.aborted) throw new AbortError();
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    client.close();
+  }
+}
+
 // src/run-codex.ts
+import { spawn } from "child_process";
 var CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"];
 function buildIsolatedArgs(opts) {
   const args = [
@@ -3536,6 +3587,9 @@ export {
   createCodexAppServerSession,
   createModelCatalogService,
   createProviderUpdateService,
+  deleteClaudeSession,
+  forkClaudeSession,
+  forkCodexThread,
   parseClaudeCliHelp,
   runClaude,
   runCodex

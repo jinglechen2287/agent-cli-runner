@@ -173,6 +173,17 @@ await codexSession.compact({ onUsage, onCompaction });
 
 Either way the result's `text` is empty, and the compaction can't be steered. `onCompaction` receives `{ trigger, preTokens?, postTokens? }` for a requested compaction and for one the CLI starts on its own mid-turn. After an automatic Claude compaction, a turn reports no size until a later request in it measures one.
 
+### Lasting forks
+
+A run's `forkSessionId` makes a throwaway copy. To copy a conversation that a new session carries on from, fork it without running a turn:
+
+```ts
+const claudeCopy = await forkClaudeSession(sessionId, { cwd });
+const codexCopy = await forkCodexThread({ threadId, cwd, executablePath, timeoutMs, signal });
+```
+
+Each answers the copy's id, which `resumeSessionId` then continues; later turns on the original and the copy don't see each other. `forkClaudeSession` copies the session file under new ids with the SDK's `forkSession`, reading and writing where the CLI keeps sessions for `cwd` (under this process's `CLAUDE_CONFIG_DIR`, or the default). `deleteClaudeSession(sessionId, { cwd })` deletes one, such as a copy nothing took up. `forkCodexThread` starts a one-shot app-server, sends `thread/fork` with `ephemeral: false`, and closes the app-server however the fork ends. `timeoutMs` (default 60 s) bounds the whole fork; an abort rejects with `AbortError`. Codex has no call that deletes a thread.
+
 ### Errors
 
 `AbortError`, `TimeoutError`, `MissingCliError` (ENOENT; carries `.cli`), and `CodexTurnError` (fatal Codex turn notifications; isolated exec failures may also carry `.exitCode`).

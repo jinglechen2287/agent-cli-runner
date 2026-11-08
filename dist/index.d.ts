@@ -550,6 +550,9 @@ interface CreateCodexAppServerClientOptions {
     extensions?: {
         [id: string]: CodexJsonValue;
     };
+    /** Gives up on starting: closes the app-server and rejects with
+     * `AbortError`. Only the start; close the client to stop it after. */
+    signal?: AbortSignal;
 }
 type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "forkSessionId" | "forkConfig" | "spawnFn">;
 interface CodexAppServerSession {
@@ -694,6 +697,33 @@ interface RunCodexOptions extends CommonRunOptions {
 /** Run a Codex turn. Regular work uses app-server; only isolated metadata
  * requests retain the legacy non-interactive `codex exec` path. */
 declare function runCodex(opts: RunCodexOptions): Promise<RunResult>;
+
+/** Copy a Claude Code session under new ids, as a session of its own that
+ * `resumeSessionId` continues. `cwd` is the directory the session was kept
+ * for. Reads and writes the session files where the CLI keeps them, under
+ * this process's `CLAUDE_CONFIG_DIR` (or the default). Answers the copy's id. */
+declare function forkClaudeSession(sessionId: string, options: {
+    cwd: string;
+}): Promise<string>;
+/** Delete a Claude Code session kept for `cwd` — say, a fork no one took up. */
+declare function deleteClaudeSession(sessionId: string, options: {
+    cwd: string;
+}): Promise<void>;
+interface ForkCodexThreadOptions {
+    /** The thread to copy. */
+    threadId: string;
+    cwd: string;
+    executablePath?: string;
+    env?: NodeJS.ProcessEnv;
+    /** Bounds the whole fork, the app-server's start included. Default 60 s. */
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    spawnFn?: RunCodexOptions["spawnFn"];
+}
+/** Fork a Codex thread into a new one that is kept, as one `resumeSessionId`
+ * continues, through a one-shot app-server that is closed however the fork
+ * ends. Answers the new thread's id. */
+declare function forkCodexThread(options: ForkCodexThreadOptions): Promise<string>;
 
 declare class AbortError extends Error {
     readonly name = "AbortError";
@@ -881,4 +911,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeContextUsage, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionCompactOptions, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerCompactOptions, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CompactionInfo, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeContextUsage, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionCompactOptions, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerCompactOptions, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CompactionInfo, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, type ForkCodexThreadOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, deleteClaudeSession, forkClaudeSession, forkCodexThread, parseClaudeCliHelp, runClaude, runCodex };
