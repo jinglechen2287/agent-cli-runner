@@ -39,6 +39,7 @@ interface FakeQuery {
   interrupt: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
   mcpServerStatus: ReturnType<typeof vi.fn>;
+  getContextUsage: ReturnType<typeof vi.fn>;
 }
 
 function makeFakeQuery(): FakeQuery {
@@ -65,6 +66,12 @@ function makeFakeQuery(): FakeQuery {
       notify();
     }),
     mcpServerStatus: vi.fn(async () => []),
+    getContextUsage: vi.fn(async () => ({
+      totalTokens: 20_429,
+      maxTokens: 1_000_000,
+      rawMaxTokens: 1_000_000,
+      model: "claude-opus-5-5",
+    })),
     queryFn: (params) => {
       captured = params;
       void (async () => {
@@ -85,6 +92,7 @@ function makeFakeQuery(): FakeQuery {
         interrupt: fake.interrupt,
         close: fake.close,
         mcpServerStatus: fake.mcpServerStatus as never,
+        getContextUsage: fake.getContextUsage as never,
         async *[Symbol.asyncIterator]() {
           while (true) {
             const next = messages.shift();
@@ -1394,5 +1402,134 @@ describe("createClaudeSession MCP elicitation", () => {
     const fake = makeFakeQuery();
     await startSession(fake, { isolated: true });
     expect(fake.options().onElicitation).toBeUndefined();
+  });
+});
+
+describe("ClaudeSession.compact", () => {
+  const boundary = {
+    type: "system",
+    subtype: "compact_boundary",
+    compact_metadata: { trigger: "manual", pre_tokens: 18_078, post_tokens: 4_180 },
+  };
+
+  it("sends Claude Code's own /compact and reports what is left afterwards", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const onCompaction = vi.fn();
+    const onUsage = vi.fn();
+    const turn = session.compact({ onCompaction, onUsage });
+    await fake.waitForPrompt(1);
+    expect(fake.prompts).toEqual(["/compact"]);
+    fake.emit(init());
+    fake.emit(boundary);
+    fake.emit(result("", { user_message_uuid: fake.uuids[0] }));
+    const outcome = await turn;
+    expect(outcome).toMatchObject({ text: "", exitCode: 0 });
+    expect(onCompaction).toHaveBeenCalledWith({ trigger: "manual", preTokens: 18_078, postTokens: 4_180 });
+    expect(fake.getContextUsage).toHaveBeenCalledWith({ detail: "full" });
+    const measured = {
+      contextTokens: 20_429,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      model: "claude-opus-5-5",
+      contextWindow: 1_000_000,
+    };
+    expect(onUsage).toHaveBeenLastCalledWith(measured);
+    expect(outcome.usage).toEqual(measured);
+    expect(session.closed).toBe(false);
+  });
+
+  it("passes focus instructions after the command", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.compact({ instructions: "  keep the API decisions  " });
+    await fake.waitForPrompt(1);
+    expect(fake.prompts).toEqual(["/compact keep the API decisions"]);
+    fake.emit(boundary);
+    fake.emit(result(""));
+    await expect(turn).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("settles without a size when the CLI cannot measure one", async () => {
+    const fake = makeFakeQuery();
+    fake.getContextUsage.mockRejectedValue(new Error("unsupported"));
+    const session = await startSession(fake);
+    const onUsage = vi.fn();
+    const turn = session.compact({ onUsage });
+    await fake.waitForPrompt(1);
+    fake.emit(boundary);
+    fake.emit(result(""));
+    const outcome = await turn;
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.usage).toBeUndefined();
+    expect(onUsage).not.toHaveBeenCalled();
+  });
+
+  it("does not measure a compaction that failed", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.compact({});
+    await fake.waitForPrompt(1);
+    fake.emit({ ...result(""), is_error: true, subtype: "error_during_execution", errors: ["Not enough messages to compact."] });
+    await expect(turn).resolves.toMatchObject({ exitCode: 1, text: "Not enough messages to compact." });
+    expect(fake.getContextUsage).not.toHaveBeenCalled();
+  });
+
+  /** A compaction whose result is in while the CLI is still counting. */
+  async function measuring(signal?: AbortSignal) {
+    const fake = makeFakeQuery();
+    let count!: (value: unknown) => void;
+    fake.getContextUsage.mockImplementation(() => new Promise((resolve) => {
+      count = resolve;
+    }));
+    const session = await startSession(fake);
+    const turn = session.compact(signal ? { signal } : {});
+    const outcome = turn.then(
+      (result) => ({ result }),
+      (error: Error) => ({ error }),
+    );
+    await fake.waitForPrompt(1);
+    fake.emit(boundary);
+    fake.emit(result(""));
+    await vi.waitFor(() => expect(fake.getContextUsage).toHaveBeenCalled());
+    return { fake, session, outcome, count: (total: number) => count({ totalTokens: total }) };
+  }
+
+  it("stays the active turn while it measures what is left", async () => {
+    const { session, outcome, count } = await measuring();
+    await expect(session.runTurn({ prompt: "next" })).rejects.toThrow(/active turn/);
+    count(20_000);
+    await expect(outcome).resolves.toMatchObject({ result: { exitCode: 0, usage: { contextTokens: 20_000 } } });
+    expect(session.closed).toBe(false);
+  });
+
+  it("stops while it measures, keeping the session", async () => {
+    const controller = new AbortController();
+    const { session, outcome, count } = await measuring(controller.signal);
+    controller.abort();
+    await expect(outcome).resolves.toMatchObject({ error: { name: "AbortError" } });
+    count(20_000);
+    expect(session.closed).toBe(false);
+    const next = session.runTurn({ prompt: "next" });
+    await expect(Promise.race([next.then(() => "settled", () => "settled"), Promise.resolve("running")]))
+      .resolves.toBe("running");
+  });
+
+  it("ends with the session if it closes while measuring", async () => {
+    const { session, outcome } = await measuring();
+    await session.close();
+    await expect(outcome).resolves.toMatchObject({ error: expect.any(Error) });
+  });
+
+  it("cannot be steered", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const turn = session.compact({});
+    await fake.waitForPrompt(1);
+    await expect(session.steer({ prompt: "and also" })).rejects.toBeInstanceOf(SteerRejectedError);
+    fake.emit(boundary);
+    fake.emit(result(""));
+    await turn;
   });
 });

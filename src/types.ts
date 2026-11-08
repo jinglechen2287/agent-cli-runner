@@ -95,6 +95,18 @@ export interface McpElicitationResponse {
   content?: Record<string, unknown>;
 }
 
+/** The agent's conversation was compacted: its history replaced by a summary
+ * so the context window has room again. */
+export interface CompactionInfo {
+  /** `manual` when the host asked for it, `auto` when the CLI decided to. */
+  trigger: "manual" | "auto";
+  /** Tokens in the context before compacting, as the CLI counted them. */
+  preTokens?: number;
+  /** The CLI's own estimate of what is left. Claude counts it differently
+   * from {@link TokenUsage.contextTokens}, so it is no stand-in for that. */
+  postTokens?: number;
+}
+
 export interface AgentCallbacks {
   /** Fired once with the CLI's session/thread id as soon as it is known. */
   onSessionId?: (id: string) => void;
@@ -131,6 +143,10 @@ export interface AgentCallbacks {
    * authoritative last request and model context window, and isolated Codex
    * once from the exec turn summary. Each call supersedes the last. */
   onUsage?: (usage: TokenUsage) => void;
+  /** Fired when the conversation is compacted, whether a host asked for it
+   * (`compact()` on a session) or the CLI did it on its own mid-turn. The
+   * size after compacting arrives through {@link onUsage}, when it is known. */
+  onCompaction?: (info: CompactionInfo) => void;
   /** Fired with the MCP servers' status at the start of each turn on a
    * long-lived session and whenever one changes during it. Each call is a
    * snapshot that replaces the last, of every server the CLI reports: Claude

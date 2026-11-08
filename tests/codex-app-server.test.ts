@@ -1434,6 +1434,7 @@ describe("Codex app-server runner", () => {
       closed: false,
       runTurn,
       steer: async () => {},
+      compact: runTurn,
       onClose: () => () => {},
       close: async () => {},
     };
@@ -2863,5 +2864,198 @@ describe("createCodexAppServerSession MCP", () => {
       error: { code: -32601, message: "Unsupported server request: item/tool/requestUserInput" },
     });
     await session.close();
+  });
+});
+
+describe("CodexAppServerSession.compact", () => {
+  const THREAD = "thread-compact";
+  /** A session whose `thread/compact/start` the test answers; `onCompact`
+   * decides what the app-server does after it. */
+  async function compactSession(onCompact: (child: FakeChild, id: number | undefined) => void) {
+    const child = makeFakeChild();
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: THREAD }, model: "gpt-test" } });
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("turn-1", "inProgress") } });
+        send(child, {
+          method: "item/completed",
+          params: { threadId: THREAD, turnId: "turn-1", item: { type: "agentMessage", id: "m1", text: "poem" } },
+        });
+        send(child, { method: "turn/completed", params: { threadId: THREAD, turn: completedTurn("turn-1") } });
+      } else if (message.method === "thread/compact/start") {
+        onCompact(child, message.id);
+      } else if (message.method === "turn/interrupt") {
+        send(child, { id: message.id, result: {} });
+      }
+    });
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", spawnFn: (() => child) as never });
+    return { child, session, requests };
+  }
+
+  const started = (turnId: string) => ({
+    method: "turn/started",
+    params: { threadId: THREAD, turn: completedTurn(turnId, "inProgress") },
+  });
+  const compaction = (method: "item/started" | "item/completed", turnId: string) => ({
+    method,
+    params: { threadId: THREAD, turnId, item: { type: "contextCompaction", id: "c1" } },
+  });
+  // As Codex 0.167 reports it: an estimate of the compacted history, with no
+  // request behind it.
+  const compactedUsage = (turnId: string) => ({
+    method: "thread/tokenUsage/updated",
+    params: {
+      threadId: THREAD,
+      turnId,
+      tokenUsage: {
+        total: { totalTokens: 16_441, inputTokens: 16_371, cachedInputTokens: 12_160, outputTokens: 70 },
+        last: { totalTokens: 20_864, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+        modelContextWindow: 258_400,
+      },
+    },
+  });
+  const completed = (turnId: string, status = "completed") => ({
+    method: "turn/completed",
+    params: { threadId: THREAD, turn: completedTurn(turnId, status) },
+  });
+
+  it("compacts with thread/compact/start, taking the turn from turn/started", async () => {
+    const { session, requests } = await compactSession((child, id) => {
+      send(child, { id, result: {} });
+      send(child, started("turn-c"));
+      send(child, compaction("item/started", "turn-c"));
+      send(child, compactedUsage("turn-c"));
+      send(child, compaction("item/completed", "turn-c"));
+      send(child, completed("turn-c"));
+    });
+    await session.runTurn({ prompt: "write a poem" });
+    const onCompaction = vi.fn();
+    const onUsage = vi.fn();
+    const result = await session.compact({ onCompaction, onUsage });
+    expect(requests.find((request) => request.method === "thread/compact/start")?.params).toEqual({ threadId: THREAD });
+    expect(result).toMatchObject({ text: "", exitCode: 0, sessionId: THREAD });
+    expect(onCompaction).toHaveBeenCalledWith({ trigger: "manual" });
+    expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ contextTokens: 20_864, contextWindow: 258_400 }));
+    expect(result.usage?.contextTokens).toBe(20_864);
+  });
+
+  it("takes the turn when turn/started arrives before the reply", async () => {
+    const { session } = await compactSession((child, id) => {
+      send(child, started("turn-c"));
+      send(child, { id, result: {} });
+      send(child, compaction("item/completed", "turn-c"));
+      send(child, completed("turn-c"));
+    });
+    await expect(session.compact({})).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("ignores a late event from the previous turn while waiting for its own", async () => {
+    const { session } = await compactSession((child, id) => {
+      send(child, { id, result: {} });
+      send(child, completed("turn-1"));
+      send(child, started("turn-c"));
+      send(child, completed("turn-c", "failed"));
+    });
+    await session.runTurn({ prompt: "write a poem" });
+    await expect(session.compact({})).rejects.toThrow(/Codex turn failed/);
+  });
+
+  it("fails with Codex's error, and the session takes the next turn", async () => {
+    let attempt = 0;
+    const { session } = await compactSession((child, id) => {
+      attempt += 1;
+      send(child, { id, result: {} });
+      const turnId = `turn-c${attempt}`;
+      send(child, started(turnId));
+      if (attempt === 1) {
+        send(child, {
+          method: "error",
+          params: { threadId: THREAD, turnId, willRetry: false, error: { message: "Error running remote compact task" } },
+        });
+        send(child, completed(turnId, "failed"));
+      } else {
+        send(child, compaction("item/completed", turnId));
+        send(child, completed(turnId));
+      }
+    });
+    await expect(session.compact({})).rejects.toThrow(/Error running remote compact task/);
+    expect(session.closed).toBe(false);
+    await expect(session.compact({})).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("retires the session when the compaction never starts", async () => {
+    vi.useFakeTimers();
+    try {
+      const { session, child } = await compactSession((c, id) => send(c, { id, result: {} }));
+      let settled: { status: string; error?: Error } | undefined;
+      void session.compact({ timeoutMs: 1_000 }).then(
+        () => { settled = { status: "resolved" }; },
+        (error: Error) => { settled = { status: "rejected", error }; },
+      );
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(settled).toMatchObject({ status: "rejected", error: expect.objectContaining({ name: "TimeoutError" }) });
+      expect(session.closed).toBe(true);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops before the turn is known by retiring the session", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const { session, child } = await compactSession((c, id) => {
+        send(c, { id, result: {} });
+        queueMicrotask(() => controller.abort());
+      });
+      let settled: { status: string; error?: Error } | undefined;
+      void session.compact({ signal: controller.signal }).then(
+        () => { settled = { status: "resolved" }; },
+        (error: Error) => { settled = { status: "rejected", error }; },
+      );
+      await vi.advanceTimersByTimeAsync(100);
+      expect(settled).toMatchObject({ status: "rejected", error: expect.objectContaining({ name: "AbortError" }) });
+      expect(session.closed).toBe(true);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops a running compaction with turn/interrupt", async () => {
+    const controller = new AbortController();
+    const { session, child, requests } = await compactSession((c, id) => {
+      send(c, { id, result: {} });
+      send(c, started("turn-c"));
+      queueMicrotask(() => controller.abort());
+    });
+    const run = session.compact({ signal: controller.signal });
+    const outcome = run.then(() => undefined, (error: Error) => error);
+    await vi.waitFor(() => {
+      if (!requests.some((request) => request.method === "turn/interrupt")) throw new Error("no interrupt yet");
+    });
+    expect(requests.find((request) => request.method === "turn/interrupt")?.params).toEqual({ threadId: THREAD, turnId: "turn-c" });
+    send(child, completed("turn-c", "interrupted"));
+    await expect(outcome).resolves.toMatchObject({ name: "AbortError" });
+  });
+
+  it("cannot be steered", async () => {
+    let finish: (() => void) | undefined;
+    const { session } = await compactSession((child, id) => {
+      send(child, { id, result: {} });
+      send(child, started("turn-c"));
+      finish = () => send(child, completed("turn-c"));
+    });
+    const run = session.compact({});
+    await vi.waitFor(() => {
+      if (!finish) throw new Error("not started");
+    });
+    await expect(session.steer({ prompt: "more" })).rejects.toBeInstanceOf(SteerRejectedError);
+    finish?.();
+    await run;
   });
 });

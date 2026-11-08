@@ -145,6 +145,17 @@ interface McpElicitationResponse {
     /** The form's values, on `accept` of a form. */
     content?: Record<string, unknown>;
 }
+/** The agent's conversation was compacted: its history replaced by a summary
+ * so the context window has room again. */
+interface CompactionInfo {
+    /** `manual` when the host asked for it, `auto` when the CLI decided to. */
+    trigger: "manual" | "auto";
+    /** Tokens in the context before compacting, as the CLI counted them. */
+    preTokens?: number;
+    /** The CLI's own estimate of what is left. Claude counts it differently
+     * from {@link TokenUsage.contextTokens}, so it is no stand-in for that. */
+    postTokens?: number;
+}
 interface AgentCallbacks {
     /** Fired once with the CLI's session/thread id as soon as it is known. */
     onSessionId?: (id: string) => void;
@@ -181,6 +192,10 @@ interface AgentCallbacks {
      * authoritative last request and model context window, and isolated Codex
      * once from the exec turn summary. Each call supersedes the last. */
     onUsage?: (usage: TokenUsage) => void;
+    /** Fired when the conversation is compacted, whether a host asked for it
+     * (`compact()` on a session) or the CLI did it on its own mid-turn. The
+     * size after compacting arrives through {@link onUsage}, when it is known. */
+    onCompaction?: (info: CompactionInfo) => void;
     /** Fired with the MCP servers' status at the start of each turn on a
      * long-lived session and whenever one changes during it. Each call is a
      * snapshot that replaces the last, of every server the CLI reports: Claude
@@ -246,6 +261,18 @@ interface ClaudeQuery extends AsyncIterable<unknown> {
         status: string;
         error?: string;
     }>>;
+    /** The data behind `/context`. Absent on a scripted query that doesn't model it. */
+    getContextUsage?(opts?: {
+        detail?: "summary" | "full";
+    }): Promise<ClaudeContextUsage>;
+}
+/** The slice of the Agent SDK's context-usage answer a session reads. */
+interface ClaudeContextUsage {
+    /** Tokens the context holds now, counted with the token-count API. */
+    totalTokens: number;
+    /** The window those tokens are measured against. */
+    maxTokens?: number;
+    model?: string;
 }
 /** The Agent SDK's `query()`, narrowed to the streaming-input form a session
  * uses. Injectable so tests can script the message stream. */
@@ -323,6 +350,13 @@ type ClaudeSessionTurnOptions = AgentCallbacks & {
      * with a TimeoutError. */
     timeoutMs?: number;
 };
+type ClaudeSessionCompactOptions = AgentCallbacks & {
+    /** What the summary should keep, as typed after Claude Code's `/compact`. */
+    instructions?: string;
+    /** As on {@link ClaudeSessionTurnOptions}. */
+    signal?: AbortSignal;
+    timeoutMs?: number;
+};
 interface ClaudeSessionSteerOptions {
     /** More input for the running turn, as the user would type it mid-turn. */
     prompt: string;
@@ -334,6 +368,11 @@ interface ClaudeSession {
     readonly closed: boolean;
     /** Run one turn. Rejects when another turn is active or the session is closed. */
     runTurn(options: ClaudeSessionTurnOptions): Promise<RunResult>;
+    /** Compact the conversation with Claude Code's own `/compact`, as a turn of
+     * its own: it settles with empty text, and reports the size left through
+     * `onUsage` and the result's `usage` when the CLI can measure it. It can't
+     * be steered. */
+    compact(options: ClaudeSessionCompactOptions): Promise<RunResult>;
     /** Hand more input to the running turn. The CLI reads it at the turn's next
      * tool round, or answers it as a turn of its own right after — either way
      * the running turn settles only once it is answered. Rejects with a
@@ -436,6 +475,8 @@ interface ClaudeTurnTranslator {
      * CLI still owes a `result`: the answer to a subagent's notification, or to
      * a steer it took up as a turn of its own. */
     readonly awaitingFollowUp: boolean;
+    /** The conversation was compacted during this turn. */
+    readonly compacted: boolean;
     /** A `result` this turn named the prompts it answers, so the CLI echoes
      * prompt uuids. */
     readonly echoedPromptUuid: boolean;
@@ -520,9 +561,18 @@ interface CodexAppServerSession {
      * is identified. Rejects with a {@link SteerRejectedError} when no turn is
      * running, the turn ends first, or the app-server refuses the steer. */
     steer(options: CodexAppServerSteerOptions): Promise<void>;
+    /** Compact the thread with Codex's own `thread/compact/start`, as a turn of
+     * its own: it settles with empty text, and reports Codex's estimate of the
+     * compacted history through `onUsage`. It can't be steered. */
+    compact(options: CodexAppServerCompactOptions): Promise<RunResult>;
     onClose(handler: (error: Error) => void): () => void;
     close(): Promise<void>;
 }
+type CodexAppServerCompactOptions = AgentCallbacks & {
+    /** As on a turn: aborting interrupts the compaction. */
+    signal?: AbortSignal;
+    timeoutMs?: number;
+};
 interface CodexAppServerSteerOptions {
     /** More input for the running turn, as the user would type it mid-turn. */
     prompt: string;
@@ -831,4 +881,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeContextUsage, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionCompactOptions, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerCompactOptions, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CompactionInfo, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, parseClaudeCliHelp, runClaude, runCodex };

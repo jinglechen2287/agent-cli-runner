@@ -1130,3 +1130,80 @@ describe("createClaudeTurnTranslator robustness", () => {
     });
   });
 });
+
+describe("Claude compaction", () => {
+  const boundary = (metadata: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    type: "system",
+    subtype: "compact_boundary",
+    compact_metadata: metadata,
+    ...extra,
+  });
+  const assistantWithUsage = (text: string, cacheRead: number) => ({
+    type: "assistant",
+    message: {
+      model: "claude-opus-4-8",
+      content: [{ type: "text", text }],
+      usage: { input_tokens: 2, cache_read_input_tokens: cacheRead, output_tokens: 5 },
+    },
+  });
+
+  it("reports a compact boundary through onCompaction", () => {
+    const onCompaction = vi.fn();
+    const t = feed({ onCompaction }, [
+      boundary({ trigger: "manual", pre_tokens: 18078, post_tokens: 4180, duration_ms: 3599 }),
+      { type: "result", subtype: "success", result: "" },
+    ]);
+    expect(onCompaction).toHaveBeenCalledWith({
+      trigger: "manual",
+      preTokens: 18078,
+      postTokens: 4180,
+    });
+    expect(t.compacted).toBe(true);
+  });
+
+  it("reports an automatic compaction, leaving out counts it lacks", () => {
+    const onCompaction = vi.fn();
+    feed({ onCompaction }, [boundary({ trigger: "auto" })]);
+    expect(onCompaction).toHaveBeenCalledWith({ trigger: "auto" });
+  });
+
+  it("ignores a subagent's own compaction", () => {
+    const onCompaction = vi.fn();
+    const t = feed({ onCompaction }, [
+      boundary({ trigger: "auto", pre_tokens: 1 }, { parent_tool_use_id: "toolu_1" }),
+    ]);
+    expect(onCompaction).not.toHaveBeenCalled();
+    expect(t.compacted).toBe(false);
+  });
+
+  it("does not carry the size from before a compaction past it", () => {
+    const onUsage = vi.fn();
+    const t = feed({ onUsage }, [
+      assistantWithUsage("working", 150_000),
+      boundary({ trigger: "auto", pre_tokens: 150_000, post_tokens: 9_000 }),
+      {
+        type: "result",
+        subtype: "success",
+        result: "",
+        usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    ]);
+    expect(onUsage).toHaveBeenCalledTimes(1);
+    expect(t.finish().usage).toBeUndefined();
+  });
+
+  it("takes the size a later message of the same turn reports", () => {
+    const t = feed({}, [
+      assistantWithUsage("working", 150_000),
+      boundary({ trigger: "auto", pre_tokens: 150_000, post_tokens: 9_000 }),
+      assistantWithUsage("carried on", 12_000),
+      {
+        type: "result",
+        subtype: "success",
+        result: "carried on",
+        usage: { input_tokens: 4, cache_read_input_tokens: 162_000, output_tokens: 10 },
+      },
+    ]);
+    expect(t.finish().usage?.contextTokens).toBe(12_002);
+  });
+});

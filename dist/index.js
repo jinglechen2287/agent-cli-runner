@@ -370,6 +370,10 @@ function claudeBackgroundAgentStatus(status) {
       return void 0;
   }
 }
+function optionalTokenCount(value) {
+  const count = toTokenCount(value);
+  return count > 0 ? count : void 0;
+}
 function toClaudeUsage(usage, model, contextWindow) {
   const input = toTokenCount(usage.input_tokens);
   const cacheRead = toTokenCount(usage.cache_read_input_tokens);
@@ -446,6 +450,7 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
   let lastAssistantModel;
   let lastMessageUsage;
   let lastUsage;
+  let compacted = false;
   const agentToolCallIds = /* @__PURE__ */ new Set();
   const backgroundAgents = /* @__PURE__ */ new Map();
   const liveTaskIds = /* @__PURE__ */ new Set();
@@ -487,6 +492,23 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
         const text2 = delta.text;
         safeCallback(() => callbacks.onAssistantTextDelta?.(text2));
       }
+      return;
+    }
+    if (parsed.type === "system" && parsed.subtype === "compact_boundary") {
+      if (parsed.parent_tool_use_id) return;
+      const metadata = isRecord(parsed.compact_metadata) ? parsed.compact_metadata : {};
+      const preTokens = optionalTokenCount(metadata.pre_tokens);
+      const postTokens = optionalTokenCount(metadata.post_tokens);
+      compacted = true;
+      outputSeen = true;
+      lastMessageUsage = void 0;
+      lastUsage = void 0;
+      const info = {
+        trigger: metadata.trigger === "auto" ? "auto" : "manual",
+        ...preTokens !== void 0 ? { preTokens } : {},
+        ...postTokens !== void 0 ? { postTokens } : {}
+      };
+      safeCallback(() => callbacks.onCompaction?.(info));
       return;
     }
     if (parsed.type === "system" && parsed.subtype === "init") {
@@ -637,7 +659,7 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       }
       isError = parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
       errors = Array.isArray(parsed.errors) ? parsed.errors.filter((entry) => typeof entry === "string") : [];
-      const occupancy = lastMessageUsage ?? (parsed.usage && countsTokens(parsed.usage) ? parsed.usage : void 0);
+      const occupancy = lastMessageUsage ?? (!compacted && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : void 0);
       if (occupancy) {
         const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? session.model);
         const model = primary?.model ?? lastAssistantModel;
@@ -664,6 +686,9 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
     get echoedPromptUuid() {
       return echoedPromptUuid;
     },
+    get compacted() {
+      return compacted;
+    },
     liveTaskIds,
     liveAgentTaskIds,
     finish() {
@@ -687,6 +712,7 @@ var CLAUDE_STRIPPED_ENV_VARS = [
 ];
 var CLAUDE_INTERRUPT_GRACE_MS = 5e3;
 var CLAUDE_FOLLOW_UP_GRACE_MS = 6e4;
+var CONTEXT_MEASURE_TIMEOUT_MS = 1e4;
 var MCP_STATUS_TIMEOUT_MS = 5e3;
 var MCP_STATUS_POLL_MS = 2e3;
 var MCP_STATUS_POLL_LIMIT_MS = 3e4;
@@ -1005,23 +1031,67 @@ async function createClaudeSession(opts) {
     closing = killTree();
     return closing;
   };
+  const measureContext = async () => {
+    if (!runtime.getContextUsage) return void 0;
+    let stall;
+    try {
+      const measured = await Promise.race([
+        runtime.getContextUsage({ detail: "full" }),
+        new Promise((_resolve, reject) => {
+          stall = setTimeout(() => reject(new Error("timed out")), CONTEXT_MEASURE_TIMEOUT_MS);
+          stall.unref?.();
+        })
+      ]);
+      const total = measured.totalTokens;
+      if (typeof total !== "number" || !Number.isFinite(total) || total <= 0) return void 0;
+      const model = sessionState.model ?? measured.model;
+      const reported = typeof measured.maxTokens === "number" && measured.maxTokens > 0 ? measured.maxTokens : void 0;
+      const contextWindow = (model !== void 0 ? sessionState.contextWindows.get(model) : void 0) ?? contextWindowForModel(model) ?? reported;
+      return {
+        contextTokens: Math.round(total),
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        ...model ? { model } : {},
+        ...contextWindow !== void 0 ? { contextWindow } : {}
+      };
+    } catch {
+      return void 0;
+    } finally {
+      if (stall) clearTimeout(stall);
+    }
+  };
   const exitError = (cause) => {
     const detail = cause instanceof Error ? cause.message : "Claude process exited";
     const tail = stderrTail.trim();
     return new Error(tail && !detail.includes(tail) ? `${detail}: ${tail}` : detail);
   };
   const settleTurn = (turn) => {
-    if (active !== turn) return;
-    active = void 0;
+    if (active !== turn || turn.measuring) return;
     const outcome = turn.translator.finish();
+    if (!turn.interruption && turn.compact && !outcome.isError && turn.translator.compacted && !outcome.usage) {
+      turn.measuring = true;
+      void measureContext().then((usage) => {
+        if (active !== turn) return;
+        turn.measuring = false;
+        if (usage) safeCallback(() => turn.callbacks.onUsage?.(usage));
+        finishTurn(turn, outcome, usage);
+      });
+      return;
+    }
+    finishTurn(turn, outcome);
+  };
+  const finishTurn = (turn, outcome, measured) => {
+    active = void 0;
     if (turn.interruption) {
       turn.reject(interruptionError(turn));
     } else {
+      const usage = measured ?? outcome.usage;
       turn.resolve({
         text: outcome.text,
         exitCode: outcome.isError ? 1 : 0,
         ...outcome.sessionId !== void 0 ? { sessionId: outcome.sessionId } : {},
-        ...outcome.usage !== void 0 ? { usage: outcome.usage } : {}
+        ...usage !== void 0 ? { usage } : {}
       });
     }
     if (turn.interruption) {
@@ -1065,6 +1135,82 @@ async function createClaudeSession(opts) {
       void closeWith(exitError(error));
     }
   })();
+  const startTurn = (turnOptions, compact) => {
+    if (closed) return Promise.reject(closeReason ?? new Error("Claude session is closed"));
+    if (active) return Promise.reject(new Error("Claude session already has an active turn"));
+    const { prompt, signal, timeoutMs, ...callbacks } = turnOptions;
+    if (signal?.aborted) return Promise.reject(new AbortError("claude run aborted"));
+    return new Promise((resolve, reject) => {
+      let timeoutTimer;
+      let graceTimer;
+      const cleanup = () => {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (graceTimer) clearTimeout(graceTimer);
+        if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
+        signal?.removeEventListener("abort", onAbort);
+        stopMcpPoll();
+        turn.elicitations.abort();
+      };
+      const promptUuid = randomUUID();
+      const turn = {
+        compact,
+        measuring: false,
+        translator: createClaudeTurnTranslator(callbacks, {
+          promptUuid,
+          cliEchoesPromptUuid,
+          session: sessionState
+        }),
+        callbacks,
+        interruption: null,
+        timeoutMs,
+        followUpTimer: void 0,
+        elicitations: new AbortController(),
+        mcpPollDeadline: Date.now() + MCP_STATUS_POLL_LIMIT_MS,
+        resolve: (result) => {
+          cleanup();
+          resolve(result);
+        },
+        reject: (error) => {
+          cleanup();
+          reject(error);
+        }
+      };
+      const interrupt = (kind) => {
+        if (active !== turn || turn.interruption) return;
+        turn.interruption = kind;
+        if (turn.measuring) {
+          active = void 0;
+          turn.reject(interruptionError(turn));
+          return;
+        }
+        runtime.interrupt().catch(() => {
+        });
+        if (turn.translator.resultSeen) {
+          void closeWith(new Error("Claude session closed after an interrupted turn"));
+          return;
+        }
+        graceTimer = setTimeout(() => {
+          if (active === turn) void closeWith(new Error("Claude did not stop after an interrupt"));
+        }, interruptGraceMs);
+      };
+      const onAbort = () => interrupt("abort");
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (timeoutMs !== void 0) {
+        timeoutTimer = setTimeout(() => interrupt("timeout"), timeoutMs);
+      }
+      active = turn;
+      if (mcpStatuses) {
+        emitMcpStatus();
+        void refreshMcpStatus();
+      }
+      input.push({
+        type: "user",
+        message: { role: "user", content: prompt },
+        parent_tool_use_id: null,
+        uuid: promptUuid
+      });
+    });
+  };
   return {
     sessionId,
     cwd: opts.cwd,
@@ -1072,73 +1218,11 @@ async function createClaudeSession(opts) {
       return closed;
     },
     runTurn(turnOptions) {
-      if (closed) return Promise.reject(closeReason ?? new Error("Claude session is closed"));
-      if (active) return Promise.reject(new Error("Claude session already has an active turn"));
-      const { prompt, signal, timeoutMs, ...callbacks } = turnOptions;
-      if (signal?.aborted) return Promise.reject(new AbortError("claude run aborted"));
-      return new Promise((resolve, reject) => {
-        let timeoutTimer;
-        let graceTimer;
-        const cleanup = () => {
-          if (timeoutTimer) clearTimeout(timeoutTimer);
-          if (graceTimer) clearTimeout(graceTimer);
-          if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
-          signal?.removeEventListener("abort", onAbort);
-          stopMcpPoll();
-          turn.elicitations.abort();
-        };
-        const promptUuid = randomUUID();
-        const turn = {
-          translator: createClaudeTurnTranslator(callbacks, {
-            promptUuid,
-            cliEchoesPromptUuid,
-            session: sessionState
-          }),
-          callbacks,
-          interruption: null,
-          timeoutMs,
-          followUpTimer: void 0,
-          elicitations: new AbortController(),
-          mcpPollDeadline: Date.now() + MCP_STATUS_POLL_LIMIT_MS,
-          resolve: (result) => {
-            cleanup();
-            resolve(result);
-          },
-          reject: (error) => {
-            cleanup();
-            reject(error);
-          }
-        };
-        const interrupt = (kind) => {
-          if (active !== turn || turn.interruption) return;
-          turn.interruption = kind;
-          runtime.interrupt().catch(() => {
-          });
-          if (turn.translator.resultSeen) {
-            void closeWith(new Error("Claude session closed after an interrupted turn"));
-            return;
-          }
-          graceTimer = setTimeout(() => {
-            if (active === turn) void closeWith(new Error("Claude did not stop after an interrupt"));
-          }, interruptGraceMs);
-        };
-        const onAbort = () => interrupt("abort");
-        signal?.addEventListener("abort", onAbort, { once: true });
-        if (timeoutMs !== void 0) {
-          timeoutTimer = setTimeout(() => interrupt("timeout"), timeoutMs);
-        }
-        active = turn;
-        if (mcpStatuses) {
-          emitMcpStatus();
-          void refreshMcpStatus();
-        }
-        input.push({
-          type: "user",
-          message: { role: "user", content: prompt },
-          parent_tool_use_id: null,
-          uuid: promptUuid
-        });
-      });
+      return startTurn(turnOptions, false);
+    },
+    compact({ instructions, ...turnOptions }) {
+      const focus = instructions?.trim();
+      return startTurn({ ...turnOptions, prompt: focus ? `/compact ${focus}` : "/compact" }, true);
     },
     steer({ prompt }) {
       if (closed) return Promise.reject(new SteerRejectedError("Claude session is closed"));
@@ -1146,6 +1230,9 @@ async function createClaudeSession(opts) {
       if (!turn) return Promise.reject(new SteerRejectedError("Claude session has no active turn"));
       if (turn.interruption) {
         return Promise.reject(new SteerRejectedError("Claude turn is being interrupted"));
+      }
+      if (turn.compact) {
+        return Promise.reject(new SteerRejectedError("Claude is compacting the conversation"));
       }
       if (turn.translator.resultSeen) {
         return Promise.reject(new SteerRejectedError("Claude turn is already finishing"));
@@ -1710,8 +1797,9 @@ function toUsage(params, threadId, turnId, model, fallbackWindow) {
   return {
     // Input side only (cached included), per the TokenUsage contract — not
     // last.totalTokens, which also counts output. Matches the Claude and
-    // isolated-exec paths.
-    contextTokens: input,
+    // isolated-exec paths. A compaction sends no request: Codex reports its
+    // estimate of the compacted history as a total with no input behind it.
+    contextTokens: input > 0 ? input : toTokenCount(last.totalTokens),
     inputTokens: Math.max(0, input - cached),
     cachedInputTokens: cached,
     outputTokens: toTokenCount(last.outputTokens),
@@ -1808,7 +1896,7 @@ function openedCodexThread(value, fallbackModel) {
   const model = text(record(value)?.model) ?? fallbackModel;
   return { threadId, ...model ? { model } : {} };
 }
-async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false, continuity, retireClientOnUnackedStart = ownedClient) {
+async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false, continuity, retireClientOnUnackedStart = ownedClient, start = "turn") {
   if (opts.signal?.aborted) throw new AbortError("codex run aborted");
   const isPreviousTurn = (turnId2) => continuity?.previousTurnIds?.has(turnId2) ?? false;
   let threadId = openedThread?.threadId ?? opts.resumeSessionId;
@@ -1831,10 +1919,15 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (turnId && eventTurnId !== turnId) return void 0;
     if (!turnId) {
       turnId = eventTurnId;
+      resolveTurnLatched();
       resolvePendingTurnError();
     }
     return eventTurnId;
   };
+  let resolveTurnLatched;
+  const turnLatched = new Promise((resolve) => {
+    resolveTurnLatched = resolve;
+  });
   let resolvedModel = opts.model ?? openedThread?.model;
   let finalText = "";
   let latestUsage;
@@ -2061,6 +2154,13 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (!item) return;
     const occurredAt = typeof params.startedAtMs === "number" ? params.startedAtMs : typeof params.completedAtMs === "number" ? params.completedAtMs : Date.now();
     updateBackgroundAgents(item, occurredAt);
+    if (itemType(item) === "contextCompaction") {
+      if (method === "item/completed") {
+        const info = { trigger: start === "compact" ? "manual" : "auto" };
+        safeCallback(() => opts.onCompaction?.(info));
+      }
+      return;
+    }
     if (method === "item/completed" && itemType(item) === "agentMessage") {
       const message = text(item.text);
       if (message) {
@@ -2200,8 +2300,9 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     let turnResult;
     turnStartSent = true;
     try {
+      const startDeadline = Date.now() + turnStartTimeoutMs;
       turnResult = await Promise.race([
-        client.request("turn/start", {
+        start === "compact" ? client.request("thread/compact/start", { threadId }, turnStartTimeoutMs) : client.request("turn/start", {
           threadId,
           input,
           cwd: opts.turnCwd ?? opts.cwd,
@@ -2215,6 +2316,32 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
         }),
         lifecycleFailure
       ]);
+      if (start === "compact") {
+        ackReceived = true;
+        for (const entry of preAckNotifications.splice(0)) {
+          dispatchNotification(entry.method, entry.params);
+        }
+        if (!turnId) {
+          let stall;
+          try {
+            await Promise.race([
+              turnLatched,
+              completion.then(() => {
+                throw new CodexTurnError("Codex compaction settled before it started");
+              }),
+              lifecycleFailure,
+              new Promise((_resolve, reject) => {
+                stall = setTimeout(
+                  () => reject(new TimeoutError("Codex app-server did not start the compaction")),
+                  Math.max(1, startDeadline - Date.now())
+                );
+              })
+            ]);
+          } finally {
+            if (stall) clearTimeout(stall);
+          }
+        }
+      }
     } catch (error) {
       if ((error instanceof TimeoutError || error instanceof AbortError) && threadId) {
         if (turnId && !interruption) {
@@ -2390,45 +2517,54 @@ async function createCodexAppServerSession(options) {
     closed = true;
     activeTurn?.elicitations.abort();
   });
+  const run = async (turnOptions, start) => {
+    if (closed) throw new Error("Codex app-server session is closed");
+    if (running) throw new Error("Codex app-server session already has an active turn");
+    running = true;
+    const turn = { callbacks: turnOptions, elicitations: new AbortController() };
+    activeTurn = turn;
+    emitMcpStatus();
+    try {
+      return await runCodexAppServerTurn({
+        ...turnOptions,
+        cwd: options.cwd,
+        ...options.executablePath ? { executablePath: options.executablePath } : {},
+        ...options.env ? { env: options.env } : {},
+        ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
+        ...options.dangerouslyBypassApprovalsAndSandbox !== void 0 ? {
+          dangerouslyBypassApprovalsAndSandbox: options.dangerouslyBypassApprovalsAndSandbox
+        } : {},
+        ...options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}
+      }, client, opened, false, {
+        previousTurnIds,
+        onTurnId: (turnId) => {
+          previousTurnIds.add(turnId);
+        },
+        // A compaction takes no more input.
+        ...start === "turn" ? {
+          onSteerable: (steer) => {
+            steerRunning = steer;
+          }
+        } : {}
+      }, true, start);
+    } finally {
+      running = false;
+      steerRunning = null;
+      activeTurn = void 0;
+      turn.elicitations.abort();
+    }
+  };
   return {
     threadId: opened.threadId,
     cwd: options.cwd,
     get closed() {
       return closed;
     },
-    async runTurn(turnOptions) {
-      if (closed) throw new Error("Codex app-server session is closed");
-      if (running) throw new Error("Codex app-server session already has an active turn");
-      running = true;
-      const turn = { callbacks: turnOptions, elicitations: new AbortController() };
-      activeTurn = turn;
-      emitMcpStatus();
-      try {
-        return await runCodexAppServerTurn({
-          ...turnOptions,
-          cwd: options.cwd,
-          ...options.executablePath ? { executablePath: options.executablePath } : {},
-          ...options.env ? { env: options.env } : {},
-          ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
-          ...options.dangerouslyBypassApprovalsAndSandbox !== void 0 ? {
-            dangerouslyBypassApprovalsAndSandbox: options.dangerouslyBypassApprovalsAndSandbox
-          } : {},
-          ...options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}
-        }, client, opened, false, {
-          previousTurnIds,
-          onTurnId: (turnId) => {
-            previousTurnIds.add(turnId);
-          },
-          onSteerable: (steer) => {
-            steerRunning = steer;
-          }
-        }, true);
-      } finally {
-        running = false;
-        steerRunning = null;
-        activeTurn = void 0;
-        turn.elicitations.abort();
-      }
+    runTurn(turnOptions) {
+      return run(turnOptions, "turn");
+    },
+    compact(compactOptions) {
+      return run({ ...compactOptions, prompt: "" }, "compact");
     },
     async steer({ prompt }) {
       if (closed) throw new SteerRejectedError("Codex app-server session is closed");

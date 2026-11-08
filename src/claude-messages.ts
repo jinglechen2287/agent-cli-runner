@@ -10,6 +10,7 @@ import type {
   AgentCallbacks,
   BackgroundAgentInfo,
   BackgroundAgentStatus,
+  CompactionInfo,
   ToolPlanItem,
 } from "./types.js";
 import { contextWindowForModel, type TokenUsage } from "./usage.js";
@@ -145,6 +146,8 @@ interface StreamLine {
   is_error?: boolean;
   /** On an error `result`: the CLI's error messages. */
   errors?: unknown;
+  /** On `compact_boundary`: what the compaction did. */
+  compact_metadata?: { trigger?: unknown; pre_tokens?: unknown; post_tokens?: unknown };
   /** On `task_notification`: the task's terminal state. */
   status?: string;
   /** On `result` (and a turn's stream frames): the uuid of the user message
@@ -182,6 +185,12 @@ function claudeBackgroundAgentStatus(status: string | undefined): BackgroundAgen
     default:
       return undefined;
   }
+}
+
+/** A token count the CLI reported, or undefined when it reported none. */
+function optionalTokenCount(value: unknown): number | undefined {
+  const count = toTokenCount(value);
+  return count > 0 ? count : undefined;
 }
 
 /** Normalize a Claude usage block into the shared shape. Context occupancy is
@@ -298,6 +307,8 @@ export interface ClaudeTurnTranslator {
    * CLI still owes a `result`: the answer to a subagent's notification, or to
    * a steer it took up as a turn of its own. */
   readonly awaitingFollowUp: boolean;
+  /** The conversation was compacted during this turn. */
+  readonly compacted: boolean;
   /** A `result` this turn named the prompts it answers, so the CLI echoes
    * prompt uuids. */
   readonly echoedPromptUuid: boolean;
@@ -386,6 +397,7 @@ export function createClaudeTurnTranslator(
   let lastAssistantModel: string | undefined;
   let lastMessageUsage: ClaudeUsage | undefined;
   let lastUsage: TokenUsage | undefined;
+  let compacted = false;
   const agentToolCallIds = new Set<string>();
   const backgroundAgents = new Map<string, BackgroundAgentInfo>();
   const liveTaskIds = new Set<string>();
@@ -445,6 +457,31 @@ const handle = (message: unknown): void => {
         const text = delta.text;
         safeCallback(() => callbacks.onAssistantTextDelta?.(text));
       }
+      return;
+    }
+    if (parsed.type === "system" && parsed.subtype === "compact_boundary") {
+      // A subagent compacting its own context leaves the turn's alone.
+      if (parsed.parent_tool_use_id) return;
+      const metadata: Record<string, unknown> = isRecord(parsed.compact_metadata)
+        ? parsed.compact_metadata
+        : {};
+      const preTokens = optionalTokenCount(metadata.pre_tokens);
+      const postTokens = optionalTokenCount(metadata.post_tokens);
+      compacted = true;
+      // The conversation's own doing, though no assistant message says so: a
+      // CLI that does not echo prompt uuids must not read this turn's empty
+      // result as a leftover.
+      outputSeen = true;
+      // Every size measured so far describes the history just replaced. Only
+      // a request made after the boundary says how full the context is now.
+      lastMessageUsage = undefined;
+      lastUsage = undefined;
+      const info: CompactionInfo = {
+        trigger: metadata.trigger === "auto" ? "auto" : "manual",
+        ...(preTokens !== undefined ? { preTokens } : {}),
+        ...(postTokens !== undefined ? { postTokens } : {}),
+      };
+      safeCallback(() => callbacks.onCompaction?.(info));
       return;
     }
     if (parsed.type === "system" && parsed.subtype === "init") {
@@ -670,8 +707,9 @@ const handle = (message: unknown): void => {
       // usage (then the turn had a single request and they coincide).
       // A result with no reply before it — a turn stopped before any output —
       // counts nothing, and reporting that would zero the host's occupancy.
+      // Nor after a compaction: summed across it, they describe nothing.
       const occupancy = lastMessageUsage
-        ?? (parsed.usage && countsTokens(parsed.usage) ? parsed.usage : undefined);
+        ?? (!compacted && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : undefined);
       if (occupancy) {
         // Without a reply to name the model, the session's own beats the
         // largest-window guess: Claude Code's helper calls (Haiku) appear in
@@ -704,6 +742,9 @@ const handle = (message: unknown): void => {
     },
     get echoedPromptUuid() {
       return echoedPromptUuid;
+    },
+    get compacted() {
+      return compacted;
     },
     liveTaskIds,
     liveAgentTaskIds,

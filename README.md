@@ -158,6 +158,21 @@ To surface forms, a session declares the `openai/standard-form-input` extension 
 
 Codex reports MCP tools as `mcp__<server>__<tool>`, the form Claude uses.
 
+### Compaction
+
+Both long-lived sessions can compact their conversation with the CLI's own compaction, as a turn of its own:
+
+```ts
+await claudeSession.compact({ instructions: "keep the API decisions", onUsage, onCompaction });
+await codexSession.compact({ onUsage, onCompaction });
+```
+
+`ClaudeSession.compact` sends Claude Code's `/compact`, with the optional `instructions` after it. Once the CLI's `compact_boundary` arrives, the session counts what is left with the SDK's `getContextUsage({ detail: "full" })`, which takes about 200 ms. It reports that count through `onUsage` and the result's `usage`. If the count fails or takes more than 10 seconds, the turn settles without a size. The boundary's own `post_tokens` is not used: Claude counts it differently from `contextTokens`.
+
+`CodexAppServerSession.compact` sends `thread/compact/start`, which takes no instructions. Its reply names no turn, so the session takes the turn from `turn/started`, waiting as long as a `turn/start` reply may take. After that, it runs like any turn, and Stop sends `turn/interrupt`. Codex reports its estimate of the compacted history through `thread/tokenUsage/updated`, which arrives as `onUsage`.
+
+Either way the result's `text` is empty, and the compaction can't be steered. `onCompaction` receives `{ trigger, preTokens?, postTokens? }` for a requested compaction and for one the CLI starts on its own mid-turn. After an automatic Claude compaction, a turn reports no size until a later request in it measures one.
+
 ### Errors
 
 `AbortError`, `TimeoutError`, `MissingCliError` (ENOENT; carries `.cli`), and `CodexTurnError` (fatal Codex turn notifications; isolated exec failures may also carry `.exitCode`).

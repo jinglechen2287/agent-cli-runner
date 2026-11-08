@@ -27,6 +27,7 @@ import type {
   AgentCallbacks,
   BackgroundAgentInfo,
   BackgroundAgentStatus,
+  CompactionInfo,
   McpElicitationRequest,
   McpServerStatusInfo,
   RunResult,
@@ -121,9 +122,19 @@ export interface CodexAppServerSession {
    * is identified. Rejects with a {@link SteerRejectedError} when no turn is
    * running, the turn ends first, or the app-server refuses the steer. */
   steer(options: CodexAppServerSteerOptions): Promise<void>;
+  /** Compact the thread with Codex's own `thread/compact/start`, as a turn of
+   * its own: it settles with empty text, and reports Codex's estimate of the
+   * compacted history through `onUsage`. It can't be steered. */
+  compact(options: CodexAppServerCompactOptions): Promise<RunResult>;
   onClose(handler: (error: Error) => void): () => void;
   close(): Promise<void>;
 }
+
+export type CodexAppServerCompactOptions = AgentCallbacks & {
+  /** As on a turn: aborting interrupts the compaction. */
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
 
 export interface CodexAppServerSteerOptions {
   /** More input for the running turn, as the user would type it mid-turn. */
@@ -677,8 +688,9 @@ function toUsage(
   return {
     // Input side only (cached included), per the TokenUsage contract — not
     // last.totalTokens, which also counts output. Matches the Claude and
-    // isolated-exec paths.
-    contextTokens: input,
+    // isolated-exec paths. A compaction sends no request: Codex reports its
+    // estimate of the compacted history as a total with no input behind it.
+    contextTokens: input > 0 ? input : toTokenCount(last.totalTokens),
     inputTokens: Math.max(0, input - cached),
     cachedInputTokens: cached,
     outputTokens: toTokenCount(last.outputTokens),
@@ -858,6 +870,9 @@ async function runCodexAppServerTurn(
    * borrowed shared client, whose lifecycle belongs to its owner and which
    * may be running other threads' turns. */
   retireClientOnUnackedStart = ownedClient,
+  /** `turn/start` with the prompt, or `thread/compact/start`, whose reply
+   * names no turn: then the turn is the one `turn/started` names. */
+  start: "turn" | "compact" = "turn",
 ): Promise<RunResult> {
   if (opts.signal?.aborted) throw new AbortError("codex run aborted");
 
@@ -902,10 +917,16 @@ async function runCodexAppServerTurn(
     if (turnId && eventTurnId !== turnId) return undefined;
     if (!turnId) {
       turnId = eventTurnId;
+      resolveTurnLatched();
       resolvePendingTurnError();
     }
     return eventTurnId;
   };
+  /** Resolves once some event names this turn. */
+  let resolveTurnLatched!: () => void;
+  const turnLatched = new Promise<void>((resolve) => {
+    resolveTurnLatched = resolve;
+  });
   let resolvedModel = opts.model ?? openedThread?.model;
   let finalText = "";
   let latestUsage: TokenUsage | undefined;
@@ -1176,6 +1197,14 @@ async function runCodexAppServerTurn(
       : typeof params.completedAtMs === "number" ? params.completedAtMs : Date.now();
     updateBackgroundAgents(item, occurredAt);
 
+    if (itemType(item) === "contextCompaction") {
+      if (method === "item/completed") {
+        const info: CompactionInfo = { trigger: start === "compact" ? "manual" : "auto" };
+        safeCallback(() => opts.onCompaction?.(info));
+      }
+      return;
+    }
+
     if (method === "item/completed" && itemType(item) === "agentMessage") {
       const message = text(item.text);
       if (message) {
@@ -1362,21 +1391,53 @@ async function runCodexAppServerTurn(
       // turn/start timeout expires. One flat race — an extra nesting level
       // would add a microtask hop and reorder ack handling against a
       // same-tick abort.
+      const startDeadline = Date.now() + turnStartTimeoutMs;
       turnResult = await Promise.race([
-        client.request("turn/start", {
-          threadId,
-          input,
-          cwd: opts.turnCwd ?? opts.cwd,
-          ...(opts.model ? { model: opts.model } : {}),
-          ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
-          ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
-          ...(opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}),
-        }, turnStartTimeoutMs),
+        start === "compact"
+          ? client.request("thread/compact/start", { threadId }, turnStartTimeoutMs)
+          : client.request("turn/start", {
+              threadId,
+              input,
+              cwd: opts.turnCwd ?? opts.cwd,
+              ...(opts.model ? { model: opts.model } : {}),
+              ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
+              ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
+              ...(opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}),
+            }, turnStartTimeoutMs),
         completion.then(() => {
           throw new CodexTurnError("Codex turn settled before turn/start was acknowledged");
         }),
         lifecycleFailure,
       ]);
+      if (start === "compact") {
+        // The reply names no turn; `turn/started` does, before or after it.
+        // Events in between pass straight through the attribution gate, which
+        // still drops every earlier turn's.
+        ackReceived = true;
+        for (const entry of preAckNotifications.splice(0)) {
+          dispatchNotification(entry.method, entry.params);
+        }
+        if (!turnId) {
+          let stall: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              turnLatched,
+              completion.then(() => {
+                throw new CodexTurnError("Codex compaction settled before it started");
+              }),
+              lifecycleFailure,
+              new Promise<never>((_resolve, reject) => {
+                stall = setTimeout(
+                  () => reject(new TimeoutError("Codex app-server did not start the compaction")),
+                  Math.max(1, startDeadline - Date.now()),
+                );
+              }),
+            ]);
+          } finally {
+            if (stall) clearTimeout(stall);
+          }
+        }
+      }
     } catch (error) {
       // The turn may have started server-side despite the lost ack, and an
       // unacked start cannot be trusted to unwind before the thread is
@@ -1595,50 +1656,65 @@ export async function createCodexAppServerSession(
     activeTurn?.elicitations.abort();
   });
 
+  const run = async (
+    turnOptions: CodexAppServerTurnOptions,
+    start: "turn" | "compact",
+  ): Promise<RunResult> => {
+    if (closed) throw new Error("Codex app-server session is closed");
+    if (running) throw new Error("Codex app-server session already has an active turn");
+    running = true;
+    const turn = { callbacks: turnOptions, elicitations: new AbortController() };
+    activeTurn = turn;
+    emitMcpStatus();
+    try {
+      return await runCodexAppServerTurn({
+        ...turnOptions,
+        cwd: options.cwd,
+        ...(options.executablePath ? { executablePath: options.executablePath } : {}),
+        ...(options.env ? { env: options.env } : {}),
+        ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
+        ...(options.dangerouslyBypassApprovalsAndSandbox !== undefined
+          ? {
+              dangerouslyBypassApprovalsAndSandbox:
+                options.dangerouslyBypassApprovalsAndSandbox,
+            }
+          : {}),
+        ...(options.developerInstructions
+          ? { developerInstructions: options.developerInstructions }
+          : {}),
+      }, client, opened, false, {
+        previousTurnIds,
+        onTurnId: (turnId) => {
+          previousTurnIds.add(turnId);
+        },
+        // A compaction takes no more input.
+        ...(start === "turn"
+          ? {
+              onSteerable: (steer: ((prompt: string) => Promise<void>) | null) => {
+                steerRunning = steer;
+              },
+            }
+          : {}),
+      }, true, start);
+    } finally {
+      running = false;
+      steerRunning = null;
+      activeTurn = undefined;
+      turn.elicitations.abort();
+    }
+  };
+
   return {
     threadId: opened.threadId,
     cwd: options.cwd,
     get closed() {
       return closed;
     },
-    async runTurn(turnOptions) {
-      if (closed) throw new Error("Codex app-server session is closed");
-      if (running) throw new Error("Codex app-server session already has an active turn");
-      running = true;
-      const turn = { callbacks: turnOptions, elicitations: new AbortController() };
-      activeTurn = turn;
-      emitMcpStatus();
-      try {
-        return await runCodexAppServerTurn({
-          ...turnOptions,
-          cwd: options.cwd,
-          ...(options.executablePath ? { executablePath: options.executablePath } : {}),
-          ...(options.env ? { env: options.env } : {}),
-          ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
-          ...(options.dangerouslyBypassApprovalsAndSandbox !== undefined
-            ? {
-                dangerouslyBypassApprovalsAndSandbox:
-                  options.dangerouslyBypassApprovalsAndSandbox,
-              }
-            : {}),
-          ...(options.developerInstructions
-            ? { developerInstructions: options.developerInstructions }
-            : {}),
-        }, client, opened, false, {
-          previousTurnIds,
-          onTurnId: (turnId) => {
-            previousTurnIds.add(turnId);
-          },
-          onSteerable: (steer) => {
-            steerRunning = steer;
-          },
-        }, true);
-      } finally {
-        running = false;
-        steerRunning = null;
-        activeTurn = undefined;
-        turn.elicitations.abort();
-      }
+    runTurn(turnOptions) {
+      return run(turnOptions, "turn");
+    },
+    compact(compactOptions) {
+      return run({ ...compactOptions, prompt: "" }, "compact");
     },
     async steer({ prompt }) {
       if (closed) throw new SteerRejectedError("Codex app-server session is closed");

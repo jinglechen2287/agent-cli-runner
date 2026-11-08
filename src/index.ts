@@ -6,10 +6,12 @@ export {
   createClaudeSession,
 } from "./claude-session.js";
 export type {
+  ClaudeContextUsage,
   ClaudeHooks,
   ClaudeQuery,
   ClaudeQueryFn,
   ClaudeSession,
+  ClaudeSessionCompactOptions,
   ClaudeSessionSteerOptions,
   ClaudeSessionTurnOptions,
   CreateClaudeSessionOptions,
@@ -40,6 +42,7 @@ export {
 } from "./codex-app-server.js";
 export type {
   CodexAppServerClient,
+  CodexAppServerCompactOptions,
   CodexAppServerSession,
   CodexAppServerSteerOptions,
   CodexAppServerTurnOptions,
@@ -66,6 +69,7 @@ export type {
   BackgroundAgentProgress,
   BackgroundAgentStatus,
   CommonRunOptions,
+  CompactionInfo,
   RunResult,
   SpawnFn,
   ToolResultInfo,

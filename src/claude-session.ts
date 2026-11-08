@@ -16,6 +16,7 @@ import {
 import {
   createClaudeSessionState,
   createClaudeTurnTranslator,
+  type ClaudeTurnOutcome,
   type ClaudeTurnTranslator,
 } from "./claude-messages.js";
 import { AbortError, MissingCliError, SteerRejectedError, TimeoutError } from "./errors.js";
@@ -36,6 +37,7 @@ import type {
   RunResult,
   SpawnFn,
 } from "./types.js";
+import { contextWindowForModel, type TokenUsage } from "./usage.js";
 
 /** Nesting-guard variables the Claude CLI uses to refuse running inside
  * another Claude Code session. Stripped so hosts launched by Claude Code
@@ -65,6 +67,17 @@ export interface ClaudeQuery extends AsyncIterable<unknown> {
   close(): void;
   /** Absent on a scripted query that doesn't model it. */
   mcpServerStatus?(): Promise<ReadonlyArray<{ name: string; status: string; error?: string }>>;
+  /** The data behind `/context`. Absent on a scripted query that doesn't model it. */
+  getContextUsage?(opts?: { detail?: "summary" | "full" }): Promise<ClaudeContextUsage>;
+}
+
+/** The slice of the Agent SDK's context-usage answer a session reads. */
+export interface ClaudeContextUsage {
+  /** Tokens the context holds now, counted with the token-count API. */
+  totalTokens: number;
+  /** The window those tokens are measured against. */
+  maxTokens?: number;
+  model?: string;
 }
 
 /** The Agent SDK's `query()`, narrowed to the streaming-input form a session
@@ -82,6 +95,10 @@ export const CLAUDE_INTERRUPT_GRACE_MS = 5_000;
  * subagent has settled, for the CLI to answer the notification with a
  * `result` before the turn settles without it. */
 export const CLAUDE_FOLLOW_UP_GRACE_MS = 60_000;
+
+/** How long measuring the context after a compaction may take before the
+ * turn settles without a size. */
+const CONTEXT_MEASURE_TIMEOUT_MS = 10_000;
 
 /** How long one `mcpServerStatus` call may take before the last snapshot stands. */
 const MCP_STATUS_TIMEOUT_MS = 5_000;
@@ -197,6 +214,14 @@ export type ClaudeSessionTurnOptions = AgentCallbacks & {
   timeoutMs?: number;
 };
 
+export type ClaudeSessionCompactOptions = AgentCallbacks & {
+  /** What the summary should keep, as typed after Claude Code's `/compact`. */
+  instructions?: string;
+  /** As on {@link ClaudeSessionTurnOptions}. */
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
+
 export interface ClaudeSessionSteerOptions {
   /** More input for the running turn, as the user would type it mid-turn. */
   prompt: string;
@@ -209,6 +234,11 @@ export interface ClaudeSession {
   readonly closed: boolean;
   /** Run one turn. Rejects when another turn is active or the session is closed. */
   runTurn(options: ClaudeSessionTurnOptions): Promise<RunResult>;
+  /** Compact the conversation with Claude Code's own `/compact`, as a turn of
+   * its own: it settles with empty text, and reports the size left through
+   * `onUsage` and the result's `usage` when the CLI can measure it. It can't
+   * be steered. */
+  compact(options: ClaudeSessionCompactOptions): Promise<RunResult>;
   /** Hand more input to the running turn. The CLI reads it at the turn's next
    * tool round, or answers it as a turn of its own right after — either way
    * the running turn settles only once it is answered. Rejects with a
@@ -223,6 +253,11 @@ export interface ClaudeSession {
 
 interface ActiveTurn {
   translator: ClaudeTurnTranslator;
+  /** Started by {@link ClaudeSession.compact}. */
+  compact: boolean;
+  /** A compaction's result is in, and the CLI is counting what is left. It
+   * is still the active turn until that ends. */
+  measuring: boolean;
   callbacks: AgentCallbacks;
   interruption: "abort" | "timeout" | null;
   timeoutMs: number | undefined;
@@ -584,6 +619,45 @@ export async function createClaudeSession(
     return closing;
   };
 
+  /** What the context holds now, by the CLI's own count; undefined when it
+   * can't say in time. Best effort: a size is never worth failing a turn. */
+  const measureContext = async (): Promise<TokenUsage | undefined> => {
+    if (!runtime.getContextUsage) return undefined;
+    let stall: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const measured = await Promise.race([
+        runtime.getContextUsage({ detail: "full" }),
+        new Promise<never>((_resolve, reject) => {
+          stall = setTimeout(() => reject(new Error("timed out")), CONTEXT_MEASURE_TIMEOUT_MS);
+          stall.unref?.();
+        }),
+      ]);
+      const total = measured.totalTokens;
+      if (typeof total !== "number" || !Number.isFinite(total) || total <= 0) return undefined;
+      // The init line's model keeps its window marker (`[1m]`); the answer's
+      // may not.
+      const model = sessionState.model ?? measured.model;
+      const reported = typeof measured.maxTokens === "number" && measured.maxTokens > 0
+        ? measured.maxTokens
+        : undefined;
+      const contextWindow = (model !== undefined ? sessionState.contextWindows.get(model) : undefined)
+        ?? contextWindowForModel(model)
+        ?? reported;
+      return {
+        contextTokens: Math.round(total),
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        ...(model ? { model } : {}),
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
+      };
+    } catch {
+      return undefined;
+    } finally {
+      if (stall) clearTimeout(stall);
+    }
+  };
+
   const exitError = (cause?: unknown): Error => {
     const detail = cause instanceof Error ? cause.message : "Claude process exited";
     const tail = stderrTail.trim();
@@ -591,17 +665,37 @@ export async function createClaudeSession(
   };
 
   const settleTurn = (turn: ActiveTurn): void => {
-    if (active !== turn) return;
-    active = undefined;
+    if (active !== turn || turn.measuring) return;
     const outcome = turn.translator.finish();
+    // A compaction makes no request whose usage would say what is left, so
+    // the turn asks the CLI to count it before handing the result back. It
+    // stays the active turn meanwhile: no other turn starts, and a stop or
+    // a close still ends it.
+    if (!turn.interruption && turn.compact && !outcome.isError && turn.translator.compacted && !outcome.usage) {
+      turn.measuring = true;
+      void measureContext().then((usage) => {
+        // Stopped or closed while counting: already settled.
+        if (active !== turn) return;
+        turn.measuring = false;
+        if (usage) safeCallback(() => turn.callbacks.onUsage?.(usage));
+        finishTurn(turn, outcome, usage);
+      });
+      return;
+    }
+    finishTurn(turn, outcome);
+  };
+
+  const finishTurn = (turn: ActiveTurn, outcome: ClaudeTurnOutcome, measured?: TokenUsage): void => {
+    active = undefined;
     if (turn.interruption) {
       turn.reject(interruptionError(turn));
     } else {
+      const usage = measured ?? outcome.usage;
       turn.resolve({
         text: outcome.text,
         exitCode: outcome.isError ? 1 : 0,
         ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
-        ...(outcome.usage !== undefined ? { usage: outcome.usage } : {}),
+        ...(usage !== undefined ? { usage } : {}),
       });
     }
     // A stopped turn ends the process once the CLI has finished the interrupt
@@ -664,6 +758,95 @@ export async function createClaudeSession(
     }
   })();
 
+  const startTurn = (turnOptions: ClaudeSessionTurnOptions, compact: boolean): Promise<RunResult> => {
+    // The close reason carries the CLI's stderr tail when it died on its
+    // own, so a host that never subscribed to onClose still sees why.
+    if (closed) return Promise.reject(closeReason ?? new Error("Claude session is closed"));
+    if (active) return Promise.reject(new Error("Claude session already has an active turn"));
+    const { prompt, signal, timeoutMs, ...callbacks } = turnOptions;
+    if (signal?.aborted) return Promise.reject(new AbortError("claude run aborted"));
+
+    return new Promise<RunResult>((resolve, reject) => {
+      let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = (): void => {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (graceTimer) clearTimeout(graceTimer);
+        if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
+        signal?.removeEventListener("abort", onAbort);
+        stopMcpPoll();
+        turn.elicitations.abort();
+      };
+      // Stamped so the turn's result can be told apart from one the CLI
+      // writes for something else — a task an earlier process left running.
+      const promptUuid = randomUUID();
+      const turn: ActiveTurn = {
+        compact,
+        measuring: false,
+        translator: createClaudeTurnTranslator(callbacks, {
+          promptUuid,
+          cliEchoesPromptUuid,
+          session: sessionState,
+        }),
+        callbacks,
+        interruption: null,
+        timeoutMs,
+        followUpTimer: undefined,
+        elicitations: new AbortController(),
+        mcpPollDeadline: Date.now() + MCP_STATUS_POLL_LIMIT_MS,
+        resolve: (result) => {
+          cleanup();
+          resolve(result);
+        },
+        reject: (error) => {
+          cleanup();
+          reject(error);
+        },
+      };
+      const interrupt = (kind: "abort" | "timeout"): void => {
+        if (active !== turn || turn.interruption) return;
+        turn.interruption = kind;
+        // The compaction is done and written; only the count is left, and
+        // nothing in the CLI needs stopping.
+        if (turn.measuring) {
+          active = undefined;
+          turn.reject(interruptionError(turn));
+          return;
+        }
+        runtime.interrupt().catch(() => {});
+        // Past its own result the turn is only waiting on subagents, and an
+        // idle CLI writes no result for the interrupt: the session goes now.
+        if (turn.translator.resultSeen) {
+          void closeWith(new Error("Claude session closed after an interrupted turn"));
+          return;
+        }
+        // The interrupted turn still ends with a `result`; if it never
+        // arrives, the process is wedged and goes.
+        graceTimer = setTimeout(() => {
+          if (active === turn) void closeWith(new Error("Claude did not stop after an interrupt"));
+        }, interruptGraceMs);
+      };
+      const onAbort = (): void => interrupt("abort");
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (timeoutMs !== undefined) {
+        timeoutTimer = setTimeout(() => interrupt("timeout"), timeoutMs);
+      }
+      active = turn;
+      // A first turn hears from the init line instead: asking before the CLI
+      // is up would only sit waiting.
+      if (mcpStatuses) {
+        emitMcpStatus();
+        void refreshMcpStatus();
+      }
+      input.push({
+        type: "user",
+        message: { role: "user", content: prompt },
+        parent_tool_use_id: null,
+        uuid: promptUuid,
+      });
+    });
+  };
+
   return {
     sessionId,
     cwd: opts.cwd,
@@ -671,83 +854,11 @@ export async function createClaudeSession(
       return closed;
     },
     runTurn(turnOptions: ClaudeSessionTurnOptions): Promise<RunResult> {
-      // The close reason carries the CLI's stderr tail when it died on its
-      // own, so a host that never subscribed to onClose still sees why.
-      if (closed) return Promise.reject(closeReason ?? new Error("Claude session is closed"));
-      if (active) return Promise.reject(new Error("Claude session already has an active turn"));
-      const { prompt, signal, timeoutMs, ...callbacks } = turnOptions;
-      if (signal?.aborted) return Promise.reject(new AbortError("claude run aborted"));
-
-      return new Promise<RunResult>((resolve, reject) => {
-        let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-        let graceTimer: ReturnType<typeof setTimeout> | undefined;
-        const cleanup = (): void => {
-          if (timeoutTimer) clearTimeout(timeoutTimer);
-          if (graceTimer) clearTimeout(graceTimer);
-          if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
-          signal?.removeEventListener("abort", onAbort);
-          stopMcpPoll();
-          turn.elicitations.abort();
-        };
-        // Stamped so the turn's result can be told apart from one the CLI
-        // writes for something else — a task an earlier process left running.
-        const promptUuid = randomUUID();
-        const turn: ActiveTurn = {
-          translator: createClaudeTurnTranslator(callbacks, {
-            promptUuid,
-            cliEchoesPromptUuid,
-            session: sessionState,
-          }),
-          callbacks,
-          interruption: null,
-          timeoutMs,
-          followUpTimer: undefined,
-          elicitations: new AbortController(),
-          mcpPollDeadline: Date.now() + MCP_STATUS_POLL_LIMIT_MS,
-          resolve: (result) => {
-            cleanup();
-            resolve(result);
-          },
-          reject: (error) => {
-            cleanup();
-            reject(error);
-          },
-        };
-        const interrupt = (kind: "abort" | "timeout"): void => {
-          if (active !== turn || turn.interruption) return;
-          turn.interruption = kind;
-          runtime.interrupt().catch(() => {});
-          // Past its own result the turn is only waiting on subagents, and an
-          // idle CLI writes no result for the interrupt: the session goes now.
-          if (turn.translator.resultSeen) {
-            void closeWith(new Error("Claude session closed after an interrupted turn"));
-            return;
-          }
-          // The interrupted turn still ends with a `result`; if it never
-          // arrives, the process is wedged and goes.
-          graceTimer = setTimeout(() => {
-            if (active === turn) void closeWith(new Error("Claude did not stop after an interrupt"));
-          }, interruptGraceMs);
-        };
-        const onAbort = (): void => interrupt("abort");
-        signal?.addEventListener("abort", onAbort, { once: true });
-        if (timeoutMs !== undefined) {
-          timeoutTimer = setTimeout(() => interrupt("timeout"), timeoutMs);
-        }
-        active = turn;
-        // A first turn hears from the init line instead: asking before the CLI
-        // is up would only sit waiting.
-        if (mcpStatuses) {
-          emitMcpStatus();
-          void refreshMcpStatus();
-        }
-        input.push({
-          type: "user",
-          message: { role: "user", content: prompt },
-          parent_tool_use_id: null,
-          uuid: promptUuid,
-        });
-      });
+      return startTurn(turnOptions, false);
+    },
+    compact({ instructions, ...turnOptions }: ClaudeSessionCompactOptions): Promise<RunResult> {
+      const focus = instructions?.trim();
+      return startTurn({ ...turnOptions, prompt: focus ? `/compact ${focus}` : "/compact" }, true);
     },
     steer({ prompt }: ClaudeSessionSteerOptions): Promise<void> {
       if (closed) return Promise.reject(new SteerRejectedError("Claude session is closed"));
@@ -755,6 +866,9 @@ export async function createClaudeSession(
       if (!turn) return Promise.reject(new SteerRejectedError("Claude session has no active turn"));
       if (turn.interruption) {
         return Promise.reject(new SteerRejectedError("Claude turn is being interrupted"));
+      }
+      if (turn.compact) {
+        return Promise.reject(new SteerRejectedError("Claude is compacting the conversation"));
       }
       // Past its result the turn is wrapping up or only waiting on subagents;
       // a steer now would wake the CLI into a turn nobody is waiting for.
