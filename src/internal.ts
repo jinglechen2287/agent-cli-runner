@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
-import { delimiter, join, resolve as resolvePath } from "node:path";
+import { delimiter, extname, resolve as resolvePath, win32 } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { AbortError, TimeoutError } from "./errors.js";
 import type { AgentCallbacks, McpElicitationRequest, McpElicitationResponse } from "./types.js";
@@ -238,7 +238,11 @@ export function watchLifecycle(opts: LifecycleOptions): Lifecycle {
   };
 }
 
-export function signalProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+export function signalProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  killDirect: (signal: NodeJS.Signals) => void = (direct) => child.kill(direct),
+): void {
   if (child.pid && process.platform !== "win32") {
     try {
       // Codex is spawned as a detached process-group leader. Signaling the
@@ -261,7 +265,7 @@ export function signalProcessTree(child: ChildProcess, signal: NodeJS.Signals): 
       if (fellBack) return;
       fellBack = true;
       try {
-        child.kill(signal);
+        killDirect(signal);
       } catch {
         // The process may already have exited.
       }
@@ -273,18 +277,47 @@ export function signalProcessTree(child: ChildProcess, signal: NodeJS.Signals): 
     return;
   }
   try {
-    child.kill(signal);
+    killDirect(signal);
   } catch {
     // The process may already have exited.
   }
 }
 
+/** On Windows, route `child.kill` through a forced {@link signalProcessTree},
+ * so the kills `execFile` makes itself (timeout, maxBuffer) reach the whole
+ * tree: a batch launch's real program is cmd.exe's child, which a plain kill
+ * of cmd.exe leaves running. Always forced, whatever signal execFile names —
+ * it never escalates, and a console program can refuse an unforced taskkill.
+ * The tree kill leaves an exit code behind, so a caller must check `killed`
+ * before treating a numeric code as an exit. Elsewhere `execFile` children
+ * share our process group, so this is a no-op. */
+export function killTreeOnKill(child: ChildProcess): void {
+  if (process.platform !== "win32") return;
+  const killDirect = child.kill.bind(child);
+  child.kill = (): boolean => {
+    signalProcessTree(child, "SIGKILL", (signal) => {
+      killDirect(signal);
+    });
+    return true;
+  };
+}
+
 /** Resolve a CLI name to an absolute path through `env.PATH`, the way a shell
  * would; a name that already contains a path separator is checked in place.
- * Returns undefined when nothing executable is found. Windows names are
- * returned unchanged — spawn resolves them with PATHEXT there. */
-export function resolveExecutable(name: string, env: NodeJS.ProcessEnv): string | undefined {
-  if (process.platform === "win32") return name;
+ * Returns undefined when nothing executable is found. */
+export interface ResolveExecutableOptions {
+  /** The child's working directory: relative names and PATH entries resolve
+   * against it, as spawn would resolve them. Defaults to `process.cwd()`. */
+  cwd?: string | undefined;
+  platform?: NodeJS.Platform;
+}
+
+export function resolveExecutable(
+  name: string,
+  env: NodeJS.ProcessEnv,
+  { cwd = process.cwd(), platform = process.platform }: ResolveExecutableOptions = {},
+): string | undefined {
+  if (platform === "win32") return resolveWindowsExecutable(name, env, cwd);
   const isExecutable = (candidate: string): boolean => {
     try {
       accessSync(candidate, constants.X_OK);
@@ -293,11 +326,108 @@ export function resolveExecutable(name: string, env: NodeJS.ProcessEnv): string 
       return false;
     }
   };
-  if (name.includes("/")) return isExecutable(name) ? resolvePath(name) : undefined;
+  if (name.includes("/")) {
+    const candidate = resolvePath(cwd, name);
+    return isExecutable(candidate) ? candidate : undefined;
+  }
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    const candidate = join(dir, name);
+    const candidate = resolvePath(cwd, dir, name);
     if (isExecutable(candidate)) return candidate;
   }
   return undefined;
+}
+
+/** Windows env names are case-insensitive, but a plain env object (unlike
+ * `process.env` there) keeps whatever case it was built with — `Path` is common. */
+function windowsEnvValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const upper = name.toUpperCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() === upper && value !== undefined) return value;
+  }
+  return undefined;
+}
+
+/** Windows lookup: a file is runnable by its extension, so a bare name is
+ * tried with each PATHEXT extension — never alone, which would pick the
+ * extensionless shell script npm installs beside its `.cmd` shim. A name
+ * that already has an extension is tried as it is first. */
+function resolveWindowsExecutable(
+  name: string,
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+): string | undefined {
+  const extensions = (windowsEnvValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .filter(Boolean)
+    .map((extension) => extension.toLowerCase());
+  const candidates = (base: string): string[] => [
+    ...(extname(base) ? [base] : []),
+    ...extensions.map((extension) => base + extension),
+  ];
+  const isFile = (candidate: string): boolean => {
+    try {
+      return statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (/[\\/]/.test(name)) return candidates(resolvePath(cwd, name)).find(isFile);
+  // Windows accepts quoted entries (`"C:\Program Files\x"`); a path itself
+  // cannot contain a quote.
+  for (const entry of (windowsEnvValue(env, "PATH") ?? "").split(win32.delimiter)) {
+    const dir = entry.replace(/"/g, "");
+    if (!dir) continue;
+    const found = candidates(resolvePath(cwd, dir, name)).find(isFile);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/** cmd.exe metacharacters, escaped with `^` (the set cross-spawn uses). */
+const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
+
+/** Quote one argument for the program a batch file runs, then caret-escape
+ * it twice: once for the `cmd.exe /c` line, once more for the batch file's
+ * own line where its `%*` expands — npm shims forward arguments that way. */
+function escapeBatchArgument(arg: string): string {
+  const quoted = `"${arg
+    .replace(/(\\*)"/g, '$1$1\\"')
+    .replace(/(\\*)$/, "$1$1")}"`;
+  return quoted.replace(CMD_META_CHARS, "^$1").replace(CMD_META_CHARS, "^$1");
+}
+
+export interface LaunchCommand {
+  command: string;
+  args: string[];
+  options: { windowsVerbatimArguments?: boolean };
+}
+
+/** The command line that actually runs `command` with `args`. Off Windows
+ * that is the call unchanged. On Windows, spawn finds only `.exe`/`.com`
+ * files on PATH and refuses `.cmd`/`.bat` ones outright without a shell,
+ * while npm installs CLIs as `.cmd` shims; so the name is resolved through
+ * PATHEXT, and a batch file runs under cmd.exe with its arguments escaped
+ * to arrive intact. An unresolved name is left for spawn to report missing. */
+export function launchCommand(
+  command: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  { cwd = process.cwd(), platform = process.platform }: ResolveExecutableOptions = {},
+): LaunchCommand {
+  if (platform !== "win32") return { command, args: [...args], options: {} };
+  const resolved = resolveWindowsExecutable(command, env, cwd) ?? command;
+  if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args], options: {} };
+  if (args.some((arg) => /[\r\n]/.test(arg))) {
+    throw new Error(`cmd.exe cannot pass a line break in an argument to ${resolved}`);
+  }
+  const line = [
+    win32.normalize(resolved).replace(CMD_META_CHARS, "^$1"),
+    ...args.map(escapeBatchArgument),
+  ].join(" ");
+  return {
+    command: windowsEnvValue(env, "ComSpec") ?? windowsEnvValue(process.env, "ComSpec") ?? "cmd.exe",
+    args: ["/d", "/s", "/c", `"${line}"`],
+    options: { windowsVerbatimArguments: true },
+  };
 }

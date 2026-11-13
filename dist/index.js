@@ -8,7 +8,7 @@ import {
 // src/internal.ts
 import { spawn as nodeSpawn } from "child_process";
 import { accessSync, constants, statSync } from "fs";
-import { delimiter, join, resolve as resolvePath } from "path";
+import { delimiter, extname, resolve as resolvePath, win32 } from "path";
 import { StringDecoder } from "string_decoder";
 
 // src/errors.ts
@@ -184,7 +184,7 @@ function watchLifecycle(opts) {
     }
   };
 }
-function signalProcessTree(child, signal) {
+function signalProcessTree(child, signal, killDirect = (direct) => child.kill(direct)) {
   if (child.pid && process.platform !== "win32") {
     try {
       process.kill(-child.pid, signal);
@@ -204,7 +204,7 @@ function signalProcessTree(child, signal) {
       if (fellBack) return;
       fellBack = true;
       try {
-        child.kill(signal);
+        killDirect(signal);
       } catch {
       }
     };
@@ -215,12 +215,22 @@ function signalProcessTree(child, signal) {
     return;
   }
   try {
-    child.kill(signal);
+    killDirect(signal);
   } catch {
   }
 }
-function resolveExecutable(name, env) {
-  if (process.platform === "win32") return name;
+function killTreeOnKill(child) {
+  if (process.platform !== "win32") return;
+  const killDirect = child.kill.bind(child);
+  child.kill = () => {
+    signalProcessTree(child, "SIGKILL", (signal) => {
+      killDirect(signal);
+    });
+    return true;
+  };
+}
+function resolveExecutable(name, env, { cwd = process.cwd(), platform = process.platform } = {}) {
+  if (platform === "win32") return resolveWindowsExecutable(name, env, cwd);
   const isExecutable = (candidate) => {
     try {
       accessSync(candidate, constants.X_OK);
@@ -229,13 +239,67 @@ function resolveExecutable(name, env) {
       return false;
     }
   };
-  if (name.includes("/")) return isExecutable(name) ? resolvePath(name) : void 0;
+  if (name.includes("/")) {
+    const candidate = resolvePath(cwd, name);
+    return isExecutable(candidate) ? candidate : void 0;
+  }
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    const candidate = join(dir, name);
+    const candidate = resolvePath(cwd, dir, name);
     if (isExecutable(candidate)) return candidate;
   }
   return void 0;
+}
+function windowsEnvValue(env, name) {
+  const upper = name.toUpperCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() === upper && value !== void 0) return value;
+  }
+  return void 0;
+}
+function resolveWindowsExecutable(name, env, cwd) {
+  const extensions = (windowsEnvValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map((extension) => extension.toLowerCase());
+  const candidates = (base) => [
+    ...extname(base) ? [base] : [],
+    ...extensions.map((extension) => base + extension)
+  ];
+  const isFile = (candidate) => {
+    try {
+      return statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (/[\\/]/.test(name)) return candidates(resolvePath(cwd, name)).find(isFile);
+  for (const entry of (windowsEnvValue(env, "PATH") ?? "").split(win32.delimiter)) {
+    const dir = entry.replace(/"/g, "");
+    if (!dir) continue;
+    const found = candidates(resolvePath(cwd, dir, name)).find(isFile);
+    if (found) return found;
+  }
+  return void 0;
+}
+var CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
+function escapeBatchArgument(arg) {
+  const quoted = `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
+  return quoted.replace(CMD_META_CHARS, "^$1").replace(CMD_META_CHARS, "^$1");
+}
+function launchCommand(command, args, env, { cwd = process.cwd(), platform = process.platform } = {}) {
+  if (platform !== "win32") return { command, args: [...args], options: {} };
+  const resolved = resolveWindowsExecutable(command, env, cwd) ?? command;
+  if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args], options: {} };
+  if (args.some((arg) => /[\r\n]/.test(arg))) {
+    throw new Error(`cmd.exe cannot pass a line break in an argument to ${resolved}`);
+  }
+  const line = [
+    win32.normalize(resolved).replace(CMD_META_CHARS, "^$1"),
+    ...args.map(escapeBatchArgument)
+  ].join(" ");
+  return {
+    command: windowsEnvValue(env, "ComSpec") ?? windowsEnvValue(process.env, "ComSpec") ?? "cmd.exe",
+    args: ["/d", "/s", "/c", `"${line}"`],
+    options: { windowsVerbatimArguments: true }
+  };
 }
 
 // src/usage.ts
@@ -860,7 +924,7 @@ function createInputQueue() {
 async function createClaudeSession(opts) {
   validateSessionOptions(opts);
   const env = opts.env ?? process.env;
-  const executablePath = resolveExecutable(opts.executablePath ?? "claude", env);
+  const executablePath = resolveExecutable(opts.executablePath ?? "claude", env, { cwd: opts.cwd });
   if (!executablePath) throw new MissingCliError("claude");
   const sessionId = opts.resumeSessionId ?? opts.newSessionId ?? randomUUID();
   const spawnFn = opts.spawnFn ?? nodeSpawn2;
@@ -878,8 +942,11 @@ async function createClaudeSession(opts) {
   const exitWaiters = /* @__PURE__ */ new Set();
   const input = createInputQueue();
   const spawnClaudeCodeProcess = (spawnOptions) => {
-    const spawned = spawnFn(spawnOptions.command, spawnOptions.args, {
-      cwd: spawnOptions.cwd ?? opts.cwd,
+    const cwd = spawnOptions.cwd ?? opts.cwd;
+    const launch = launchCommand(spawnOptions.command, spawnOptions.args, spawnOptions.env, { cwd });
+    const spawned = spawnFn(launch.command, launch.args, {
+      ...launch.options,
+      cwd,
       env: spawnOptions.env,
       stdio: ["pipe", "pipe", "pipe"],
       // Process-group leader (POSIX), so killing the session reaches tool
@@ -1357,10 +1424,15 @@ async function createCodexAppServerClient(options) {
   const spawnFn = options.spawnFn ?? nodeSpawn3;
   let child;
   try {
-    child = spawnFn(options.executablePath ?? "codex", ["app-server", "--stdio"], {
+    const env = filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]);
+    const launch = launchCommand(options.executablePath ?? "codex", ["app-server", "--stdio"], env, {
+      cwd: options.cwd
+    });
+    child = spawnFn(launch.command, launch.args, {
+      ...launch.options,
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]),
+      env,
       detached: process.platform !== "win32"
     });
   } catch (error) {
@@ -2667,10 +2739,15 @@ async function runIsolatedCodex(opts) {
   const spawnFn = opts.spawnFn ?? spawn;
   let child;
   try {
-    child = spawnFn(opts.executablePath ?? "codex", buildIsolatedArgs(opts), {
+    const env = filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS);
+    const launch = launchCommand(opts.executablePath ?? "codex", buildIsolatedArgs(opts), env, {
+      cwd: opts.cwd
+    });
+    child = spawnFn(launch.command, launch.args, {
+      ...launch.options,
       cwd: opts.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS),
+      env,
       detached: process.platform !== "win32"
     });
   } catch (error) {
@@ -2884,18 +2961,18 @@ function parseClaudeCliHelp(help) {
   return { aliases, efforts };
 }
 function readClaudeCliCapabilities(executablePath, cwd) {
+  const env = filterEnv(process.env, CLAUDE_STRIPPED_ENV_VARS);
   return new Promise((resolve, reject) => {
-    execFile(
-      executablePath,
-      ["--help"],
+    const launch = launchCommand(executablePath, ["--help"], env, { cwd });
+    const child = execFile(
+      launch.command,
+      launch.args,
       {
+        ...launch.options,
         cwd,
         timeout: 5e3,
         maxBuffer: 1e6,
-        // Same nesting-guard strip every other claude spawn applies, so
-        // discovery still works for hosts running inside a Claude Code
-        // session instead of silently degrading to the static fallback.
-        env: filterEnv(process.env, CLAUDE_STRIPPED_ENV_VARS)
+        env
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -2906,6 +2983,7 @@ function readClaudeCliCapabilities(executablePath, cwd) {
 ${stderr}`));
       }
     );
+    killTreeOnKill(child);
   });
 }
 function claudeModels(capabilities, defaultEffort) {
@@ -3056,10 +3134,12 @@ var APPLY_TIMEOUT_MS = 10 * 60 * 1e3;
 var CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases";
 function defaultRunCommand(executable, args, options) {
   return new Promise((resolve, reject) => {
-    execFile2(
-      executable,
-      [...args],
+    const launch = launchCommand(executable, args, options.env);
+    const child = execFile2(
+      launch.command,
+      launch.args,
       {
+        ...launch.options,
         env: options.env,
         timeout: options.timeoutMs,
         // SIGKILL, not the default SIGTERM: the timeout is a hard ceiling,
@@ -3074,13 +3154,14 @@ function defaultRunCommand(executable, args, options) {
           resolve({ stdout, stderr, exitCode: 0 });
           return;
         }
-        if (typeof error.code === "number") {
+        if (typeof error.code === "number" && !error.killed) {
           resolve({ stdout, stderr, exitCode: error.code });
           return;
         }
         reject(Object.assign(error, { stdout, stderr }));
       }
     );
+    killTreeOnKill(child);
   });
 }
 async function defaultFetchText(url, options) {

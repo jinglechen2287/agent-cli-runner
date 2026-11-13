@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -872,11 +872,15 @@ describe("createClaudeSession options", () => {
 
   it("resolves a bare executable name to an absolute path through PATH", async () => {
     const dir = mkdtempSync(join(tmpdir(), "claude-path-"));
-    const bin = join(dir, "claude");
+    // Windows finds a CLI by its extension; elsewhere by its execute bit.
+    const bin = join(dir, process.platform === "win32" ? "claude.cmd" : "claude");
     writeFileSync(bin, "#!/bin/sh\n");
     chmodSync(bin, 0o755);
     const fake = makeFakeQuery();
-    await startSession(fake, { executablePath: undefined, env: { PATH: `/nonexistent:${dir}` } });
+    await startSession(fake, {
+      executablePath: undefined,
+      env: { PATH: [join(dir, "missing"), dir].join(delimiter) },
+    });
     expect(fake.options().pathToClaudeCodeExecutable).toBe(bin);
   });
 });

@@ -25,6 +25,7 @@ import {
   createChunkDecoder,
   filterEnv,
   isRecord,
+  launchCommand,
   resolveExecutable,
   safeCallback,
   SIGTERM_GRACE_MS,
@@ -419,7 +420,7 @@ export async function createClaudeSession(
 ): Promise<ClaudeSession> {
   validateSessionOptions(opts);
   const env = opts.env ?? process.env;
-  const executablePath = resolveExecutable(opts.executablePath ?? "claude", env);
+  const executablePath = resolveExecutable(opts.executablePath ?? "claude", env, { cwd: opts.cwd });
   if (!executablePath) throw new MissingCliError("claude");
   const sessionId = opts.resumeSessionId ?? opts.newSessionId ?? randomUUID();
   const spawnFn = opts.spawnFn ?? nodeSpawn;
@@ -442,8 +443,11 @@ export async function createClaudeSession(
   const input = createInputQueue();
 
   const spawnClaudeCodeProcess = (spawnOptions: SdkSpawnOptions): SpawnedProcess => {
-    const spawned = spawnFn(spawnOptions.command, spawnOptions.args, {
-      cwd: spawnOptions.cwd ?? opts.cwd,
+    const cwd = spawnOptions.cwd ?? opts.cwd;
+    const launch = launchCommand(spawnOptions.command, spawnOptions.args, spawnOptions.env, { cwd });
+    const spawned = spawnFn(launch.command, launch.args, {
+      ...launch.options,
+      cwd,
       env: spawnOptions.env,
       stdio: ["pipe", "pipe", "pipe"],
       // Process-group leader (POSIX), so killing the session reaches tool

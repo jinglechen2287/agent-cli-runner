@@ -15,6 +15,7 @@ import {
   filterEnv,
   isMissingExecutable,
   isRecord,
+  launchCommand,
   normalizePlanStatus,
   normalizeSummary,
   planCompletionSummary,
@@ -207,10 +208,15 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
   const spawnFn = opts.spawnFn ?? spawn;
   let child;
   try {
-    child = spawnFn(opts.executablePath ?? "codex", buildIsolatedArgs(opts), {
+    const env = filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS);
+    const launch = launchCommand(opts.executablePath ?? "codex", buildIsolatedArgs(opts), env, {
+      cwd: opts.cwd,
+    });
+    child = spawnFn(launch.command, launch.args, {
+      ...launch.options,
       cwd: opts.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS),
+      env,
       detached: process.platform !== "win32",
     });
   } catch (error) {

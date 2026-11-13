@@ -14,7 +14,7 @@
 
 import { execFile } from "node:child_process";
 import { createCodexAppServerClient } from "./codex-app-server.js";
-import { filterEnv } from "./internal.js";
+import { filterEnv, killTreeOnKill, launchCommand } from "./internal.js";
 import { CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 
 export type ModelCatalogProvider = "claude" | "codex";
@@ -160,18 +160,21 @@ function readClaudeCliCapabilities(
   executablePath: string,
   cwd: string,
 ): Promise<ClaudeCliCapabilities> {
+  // Same nesting-guard strip every other claude spawn applies, so
+  // discovery still works for hosts running inside a Claude Code
+  // session instead of silently degrading to the static fallback.
+  const env = filterEnv(process.env, CLAUDE_STRIPPED_ENV_VARS);
   return new Promise((resolve, reject) => {
-    execFile(
-      executablePath,
-      ["--help"],
+    const launch = launchCommand(executablePath, ["--help"], env, { cwd });
+    const child = execFile(
+      launch.command,
+      launch.args,
       {
+        ...launch.options,
         cwd,
         timeout: 5_000,
         maxBuffer: 1_000_000,
-        // Same nesting-guard strip every other claude spawn applies, so
-        // discovery still works for hosts running inside a Claude Code
-        // session instead of silently degrading to the static fallback.
-        env: filterEnv(process.env, CLAUDE_STRIPPED_ENV_VARS),
+        env,
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -181,6 +184,7 @@ function readClaudeCliCapabilities(
         resolve(parseClaudeCliHelp(`${stdout}\n${stderr}`));
       },
     );
+    killTreeOnKill(child);
   });
 }
 

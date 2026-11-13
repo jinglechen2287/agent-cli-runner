@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { filterEnv, isMissingExecutable, isRecord } from "./internal.js";
+import { filterEnv, isMissingExecutable, isRecord, killTreeOnKill, launchCommand } from "./internal.js";
 import { CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 import { CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
 
@@ -114,10 +114,12 @@ function defaultRunCommand(
   options: ProviderUpdateCommandOptions,
 ): Promise<ProviderUpdateCommandResult> {
   return new Promise((resolve, reject) => {
-    execFile(
-      executable,
-      [...args],
+    const launch = launchCommand(executable, args, options.env);
+    const child = execFile(
+      launch.command,
+      launch.args,
       {
+        ...launch.options,
         env: options.env,
         timeout: options.timeoutMs,
         // SIGKILL, not the default SIGTERM: the timeout is a hard ceiling,
@@ -132,7 +134,9 @@ function defaultRunCommand(
           resolve({ stdout, stderr, exitCode: 0 });
           return;
         }
-        if (typeof error.code === "number") {
+        // `killed` first: a Windows tree kill (timeout, maxBuffer) leaves an
+        // exit code that is not the command's own.
+        if (typeof error.code === "number" && !error.killed) {
           resolve({ stdout, stderr, exitCode: error.code });
           return;
         }
@@ -142,6 +146,7 @@ function defaultRunCommand(
         reject(Object.assign(error, { stdout, stderr }));
       },
     );
+    killTreeOnKill(child);
   });
 }
 

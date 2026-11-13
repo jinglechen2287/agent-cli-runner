@@ -13,6 +13,7 @@ import {
   filterEnv,
   isMissingExecutable,
   isRecord,
+  launchCommand,
   normalizePlanStatus,
   normalizeSummary,
   planCompletionSummary,
@@ -197,10 +198,15 @@ export async function createCodexAppServerClient(
   const spawnFn = options.spawnFn ?? nodeSpawn;
   let child: ChildProcess;
   try {
-    child = spawnFn(options.executablePath ?? "codex", ["app-server", "--stdio"], {
+    const env = filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]);
+    const launch = launchCommand(options.executablePath ?? "codex", ["app-server", "--stdio"], env, {
+      cwd: options.cwd,
+    });
+    child = spawnFn(launch.command, launch.args, {
+      ...launch.options,
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]),
+      env,
       detached: process.platform !== "win32",
     });
   } catch (error) {
