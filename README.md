@@ -13,7 +13,7 @@ pnpm add agent-cli-runner@github:jinglechen2287/agent-cli-runner
 bun add agent-cli-runner@github:jinglechen2287/agent-cli-runner
 ```
 
-Requires Node ≥ 18 (or Bun — it uses `node:child_process`, which Bun implements) and the `claude` / `codex` binaries on `PATH` (or pass `executablePath`).
+Requires Node ≥ 18.14 (or Bun — it uses `node:child_process`, which Bun implements) and the `claude` / `codex` binaries on `PATH` (or pass `executablePath`).
 
 ## Usage
 

@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import {
   AbortError,
   createClaudeSession,
@@ -36,8 +36,8 @@ interface FakeQuery {
   end(): void;
   /** Make the message stream throw. */
   fail(error: Error): void;
-  interrupt: ReturnType<typeof vi.fn>;
-  close: ReturnType<typeof vi.fn>;
+  interrupt: Mock<() => Promise<unknown>>;
+  close: Mock<() => void>;
   mcpServerStatus: ReturnType<typeof vi.fn>;
   getContextUsage: ReturnType<typeof vi.fn>;
 }
