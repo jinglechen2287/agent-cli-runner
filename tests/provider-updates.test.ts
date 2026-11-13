@@ -583,6 +583,20 @@ describe("provider update service", () => {
       },
     });
   });
+
+  it("gives Codex doctor thirty seconds, since it checks the whole installation", async () => {
+    const deps = makeDeps({
+      "codex --version": result("codex-cli 0.145.0"),
+      "codex doctor --json": codexDoctor("0.145.0"),
+    });
+
+    await createProviderUpdateService({ env: { PATH: "/usr/bin" } }, deps).check("codex");
+
+    expect(deps.runCommand).toHaveBeenCalledWith("codex", ["doctor", "--json"], {
+      timeoutMs: 30_000,
+      env: { PATH: "/usr/bin" },
+    });
+  });
 });
 
 describe("provider update service regressions", () => {

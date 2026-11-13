@@ -3181,6 +3181,7 @@ function createModelCatalogService(config = {}, deps = {}) {
 // src/provider-updates.ts
 import { execFile as execFile2 } from "child_process";
 var CHECK_TIMEOUT_MS = 5e3;
+var CODEX_DOCTOR_TIMEOUT_MS = 3e4;
 var APPLY_TIMEOUT_MS = 10 * 60 * 1e3;
 var CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases";
 function defaultRunCommand(executable, args, options) {
@@ -3430,7 +3431,7 @@ ${doctor.stderr}`);
     const env = filterEnv(baseEnv, CODEX_STRIPPED_ENV_VARS);
     const [installed, doctorResult] = await Promise.all([
       installedVersion("codex", executable, env, checkedAt),
-      runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CHECK_TIMEOUT_MS }).then((value) => ({ ok: true, value })).catch(() => ({ ok: false }))
+      runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CODEX_DOCTOR_TIMEOUT_MS }).then((value) => ({ ok: true, value })).catch(() => ({ ok: false }))
     ]);
     if ("state" in installed) return installed;
     if (!doctorResult.ok) {

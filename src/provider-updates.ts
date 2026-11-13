@@ -4,6 +4,8 @@ import { CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 import { CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
 
 const CHECK_TIMEOUT_MS = 5_000;
+// Doctor checks the whole installation, including network and database health.
+const CODEX_DOCTOR_TIMEOUT_MS = 30_000;
 /** Installers download and unpack a whole release, so they need far longer than
  * the read-only checks — but still a ceiling, so a wedged installer cannot pin
  * a host's update state to "running" forever. */
@@ -423,7 +425,7 @@ export function createProviderUpdateService(
     const env = filterEnv(baseEnv, CODEX_STRIPPED_ENV_VARS);
     const [installed, doctorResult] = await Promise.all([
       installedVersion("codex", executable, env, checkedAt),
-      runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CHECK_TIMEOUT_MS })
+      runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CODEX_DOCTOR_TIMEOUT_MS })
         .then((value) => ({ ok: true as const, value }))
         .catch(() => ({ ok: false as const })),
     ]);

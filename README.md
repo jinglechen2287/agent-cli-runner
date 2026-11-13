@@ -94,7 +94,7 @@ Every check reports `current`, `update_available`, `not_installed`, or `unknown`
 
 Claude detection is intentionally definitive only for native installations. It reads the installation method and `stable` / `latest` channel from `claude doctor`, then compares against that channel at `downloads.claude.ai`; package-manager installations return `unknown` instead of risking a cross-channel false positive. Codex reads the latest version from `codex doctor --json` and accepts its JSON even when unrelated diagnostics make the command exit nonzero. Older Codex versions without update metadata return `unknown`; there is no npm fallback.
 
-Checks use five-second command and network timeouts and strip the same provider nesting-guard environment variables as agent runs. They never invoke `claude update`, `codex update`, or a package manager, and they do not cache results.
+Checks use five-second command and network timeouts — thirty seconds for `codex doctor --json`, which checks the whole installation, network and database included — and strip the same provider nesting-guard environment variables as agent runs. They never invoke `claude update`, `codex update`, or a package manager, and they do not cache results.
 
 ### Claude-specific
 
