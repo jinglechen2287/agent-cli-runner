@@ -482,6 +482,64 @@ describe("createClaudeTurnTranslator", () => {
     });
   });
 
+  it("passes a tool result's structured output through", () => {
+    const onToolResult = vi.fn();
+    const output = { worktreePath: "/repo/.claude/worktrees/feature", worktreeBranch: "feature", message: "Entered" };
+    feed({ onToolResult }, [{
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "enter-1", content: "Entered" }] },
+      tool_use_result: output,
+    }]);
+    expect(onToolResult).toHaveBeenCalledWith({ callId: "enter-1", content: "Entered", structured: output });
+  });
+
+  it("passes over a user message whose content is plain text", () => {
+    const onToolResult = vi.fn();
+    const t = feed({ onToolResult }, [{ type: "user", message: { content: "hello" }, tool_use_result: { x: 1 } }]);
+    expect(onToolResult).not.toHaveBeenCalled();
+    expect(t.done).toBe(false);
+  });
+
+  it("leaves structured output off when one message answers several calls", () => {
+    const onToolResult = vi.fn();
+    feed({ onToolResult }, [{
+      type: "user",
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "a", content: "one" },
+          { type: "tool_result", tool_use_id: "b", content: "two" },
+        ],
+      },
+      tool_use_result: { worktreePath: "/somewhere" },
+    }]);
+    expect(onToolResult).toHaveBeenNthCalledWith(1, { callId: "a", content: "one" });
+    expect(onToolResult).toHaveBeenNthCalledWith(2, { callId: "b", content: "two" });
+  });
+
+  it("names the subagent call behind a subagent's tool use and result", () => {
+    const onToolUse = vi.fn();
+    const onToolResult = vi.fn();
+    feed({ onToolUse, onToolResult }, [
+      {
+        type: "assistant",
+        parent_tool_use_id: "agent-1",
+        message: { content: [{ type: "tool_use", id: "inner", name: "EnterWorktree", input: { name: "x" } }] },
+      },
+      {
+        type: "user",
+        parent_tool_use_id: "agent-1",
+        message: { content: [{ type: "tool_result", tool_use_id: "inner", content: "Entered" }] },
+      },
+    ]);
+    expect(onToolUse).toHaveBeenCalledWith({
+      callId: "inner",
+      name: "EnterWorktree",
+      input: { name: "x" },
+      parentToolCallId: "agent-1",
+    });
+    expect(onToolResult).toHaveBeenCalledWith({ callId: "inner", content: "Entered", parentToolCallId: "agent-1" });
+  });
+
   it("emits normalized usage per assistant message, summing input and cache lanes", () => {
     const onUsage = vi.fn();
     feed({ onUsage }, [{

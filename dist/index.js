@@ -661,7 +661,8 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
             name: block.name,
             ...summary !== void 0 ? { summary } : {},
             ...block.input ? { input: block.input } : {},
-            ...planItems2 ? { planItems: planItems2 } : {}
+            ...planItems2 ? { planItems: planItems2 } : {},
+            ...parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}
           };
           safeCallback(() => callbacks.onToolUse?.(info));
         }
@@ -683,15 +684,18 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       }
       return;
     }
-    if (parsed.type === "user" && parsed.message?.content) {
-      for (const block of parsed.message.content) {
-        if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
-          continue;
-        }
+    if (parsed.type === "user" && Array.isArray(parsed.message?.content)) {
+      const results = parsed.message.content.filter(
+        (block) => block.type === "tool_result" && typeof block.tool_use_id === "string"
+      );
+      const structured = results.length === 1 && parsed.tool_use_result !== void 0 ? { structured: parsed.tool_use_result } : {};
+      for (const block of results) {
         const result = {
           callId: block.tool_use_id,
           content: block.content,
-          ...typeof block.is_error === "boolean" ? { isError: block.is_error } : {}
+          ...typeof block.is_error === "boolean" ? { isError: block.is_error } : {},
+          ...structured,
+          ...parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}
         };
         safeCallback(() => callbacks.onToolResult?.(result));
       }

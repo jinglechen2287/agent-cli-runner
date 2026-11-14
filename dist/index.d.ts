@@ -82,6 +82,9 @@ interface ToolUseInfo {
     input?: Record<string, unknown>;
     /** Provider-normalized Codex plan/todo snapshot, when this tool updates one. */
     planItems?: ToolPlanItem[];
+    /** The tool call that started the subagent making this call (Claude's
+     * `parent_tool_use_id`). Absent on the parent turn's own calls. */
+    parentToolCallId?: string;
 }
 /** A completed tool result as reported by the provider. Hosts should treat
  * `content` as opaque unless they recognize the corresponding tool. */
@@ -90,6 +93,13 @@ interface ToolResultInfo {
     callId: string;
     content: unknown;
     isError?: boolean;
+    /** The tool's full structured output, opaque (Claude's `tool_use_result`):
+     * its shape is per tool, keyed by the call's name. Absent when the CLI sent
+     * none, or when one message answered several calls and it can't be told
+     * whose it is. */
+    structured?: unknown;
+    /** See {@link ToolUseInfo.parentToolCallId}. */
+    parentToolCallId?: string;
 }
 /** One provider-normalized item from a Codex plan/todo snapshot. */
 interface ToolPlanItem {

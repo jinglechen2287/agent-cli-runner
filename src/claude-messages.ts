@@ -140,6 +140,8 @@ interface StreamLine {
   /** Set on lines produced by a background subagent, naming the tool call that
    * spawned it. Null/absent on the parent turn's own output. */
   parent_tool_use_id?: string | null;
+  /** On a `user` line answering a tool call: the tool's structured output. */
+  tool_use_result?: unknown;
   result?: string;
   /** On `result`: set when the turn failed (an error subtype, or an API
    * error the CLI reported as the success subtype's text). */
@@ -618,6 +620,7 @@ const handle = (message: unknown): void => {
             ...(summary !== undefined ? { summary } : {}),
             ...(block.input ? { input: block.input } : {}),
             ...(planItems ? { planItems } : {}),
+            ...(parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}),
           };
           safeCallback(() => callbacks.onToolUse?.(info));
         }
@@ -651,15 +654,24 @@ const handle = (message: unknown): void => {
       }
       return;
     }
-    if (parsed.type === "user" && parsed.message?.content) {
-      for (const block of parsed.message.content) {
-        if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
-          continue;
-        }
+    // A user message's content may be plain text, which answers no call.
+    if (parsed.type === "user" && Array.isArray(parsed.message?.content)) {
+      const results = parsed.message.content.filter(
+        (block): block is ClaudeContentBlock & { tool_use_id: string } =>
+          block.type === "tool_result" && typeof block.tool_use_id === "string",
+      );
+      // The structured output belongs to the message, so it is only one
+      // call's when the message answers one call.
+      const structured = results.length === 1 && parsed.tool_use_result !== undefined
+        ? { structured: parsed.tool_use_result }
+        : {};
+      for (const block of results) {
         const result = {
           callId: block.tool_use_id,
           content: block.content,
           ...(typeof block.is_error === "boolean" ? { isError: block.is_error } : {}),
+          ...structured,
+          ...(parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}),
         };
         safeCallback(() => callbacks.onToolResult?.(result));
       }
