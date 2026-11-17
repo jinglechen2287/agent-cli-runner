@@ -152,6 +152,12 @@ interface StreamLine {
   compact_metadata?: { trigger?: unknown; pre_tokens?: unknown; post_tokens?: unknown };
   /** On `task_notification`: the task's terminal state. */
   status?: string;
+  /** On `task_notification`: the run whose notification the CLI will answer
+   * with a result naming it in `origin`. */
+  run_id?: string;
+  /** On a `result` answering something other than a user message — a
+   * subagent's notification names its run. */
+  origin?: { kind?: string; runId?: string };
   /** On `result` (and a turn's stream frames): the uuid of the user message
    * the turn answers, when the host stamped one. */
   user_message_uuid?: unknown;
@@ -309,6 +315,11 @@ export interface ClaudeTurnTranslator {
    * CLI still owes a `result`: the answer to a subagent's notification, or to
    * a steer it took up as a turn of its own. */
   readonly awaitingFollowUp: boolean;
+  /** Waiting only on answers to notifications that landed while the CLI was
+   * answering another, with the CLI answering nothing now: it opens each
+   * queued answer at once, so if none opens, the answer just written took
+   * them in between tool rounds. */
+  readonly followUpMayBeAbsorbed: boolean;
   /** The conversation was compacted during this turn. */
   readonly compacted: boolean;
   /** A `result` this turn named the prompts it answers, so the CLI echoes
@@ -405,9 +416,41 @@ export function createClaudeTurnTranslator(
   const liveTaskIds = new Set<string>();
   const liveAgentTaskIds = new Set<string>();
 
+  /** Subagents that settled after the turn's result, whose notification
+   * hasn't come yet: the CLI reports a task's end before its notification. */
+  const owedTasks = new Set<string>();
+  /** Runs whose notification came after the turn's result and that the CLI
+   * still owes an answer to. Each answer names its run, so a notification
+   * that lands while the CLI is answering another is still waited for: one
+   * flag would be cleared by the first answer. */
+  const owedRuns = new Set<string>();
+  /** The CLI has started answering a queued notification — it opens each
+   * answer with an `init` — and hasn't written that answer's result yet. */
+  let answeringQueued = false;
+  /** Owed runs whose notification landed while the CLI was answering
+   * another: the only ones that answer can have taken in. */
+  const notifiedMidAnswer = new Set<string>();
+
+  /** A task's end: an agent that ends after the turn's result is owed an
+   * answer, once its notification comes. */
   const settleTask = (taskId: string): void => {
     liveTaskIds.delete(taskId);
-    if (liveAgentTaskIds.delete(taskId) && resultSeen) followUpPending = true;
+    if (liveAgentTaskIds.delete(taskId) && resultSeen) owedTasks.add(taskId);
+  };
+
+  /** A task's notification, which the CLI answers with a result naming its
+   * run. A CLI that names no run is waited for by a flag the next result
+   * clears. */
+  const notifyTask = (taskId: string, runId: string | undefined): void => {
+    const live = liveAgentTaskIds.has(taskId);
+    settleTask(taskId);
+    if (!owedTasks.delete(taskId) && !(live && resultSeen)) return;
+    if (!runId) {
+      followUpPending = true;
+      return;
+    }
+    owedRuns.add(runId);
+    if (answeringQueued) notifiedMidAnswer.add(runId);
   };
 
   /** Whether a `result` answers some other command than this turn's prompt.
@@ -487,6 +530,7 @@ const handle = (message: unknown): void => {
       return;
     }
     if (parsed.type === "system" && parsed.subtype === "init") {
+      if (resultSeen) answeringQueued = true;
       if (typeof parsed.model === "string" && parsed.model) session.model = parsed.model;
       if (parsed.session_id) emitSessionId(parsed.session_id);
       return;
@@ -595,7 +639,9 @@ const handle = (message: unknown): void => {
       && parsed.subtype === "task_notification"
       && typeof parsed.task_id === "string"
     ) {
-      if (isTerminalTaskStatus(parsed.status)) settleTask(parsed.task_id);
+      if (isTerminalTaskStatus(parsed.status)) {
+        notifyTask(parsed.task_id, typeof parsed.run_id === "string" ? parsed.run_id : undefined);
+      }
       return;
     }
     if (parsed.type === "assistant" && parsed.message?.content) {
@@ -692,6 +738,11 @@ const handle = (message: unknown): void => {
       const followUp = resultSeen;
       resultSeen = true;
       followUpPending = false;
+      answeringQueued = false;
+      if (parsed.origin?.kind === "task-notification" && typeof parsed.origin.runId === "string") {
+        owedRuns.delete(parsed.origin.runId);
+        notifiedMidAnswer.delete(parsed.origin.runId);
+      }
       const named = namedPromptUuids(parsed);
       if (named) {
         const last = Math.max(...named.map((uuid) => expected.indexOf(uuid)));
@@ -744,14 +795,22 @@ const handle = (message: unknown): void => {
       expected.push(uuid);
     },
     get done() {
-      return resultSeen && allAnswered() && liveAgentTaskIds.size === 0 && !followUpPending;
+      return resultSeen && allAnswered() && liveAgentTaskIds.size === 0 && !followUpPending
+        && owedTasks.size === 0 && owedRuns.size === 0;
     },
     get resultSeen() {
       return resultSeen;
     },
     get awaitingFollowUp() {
-      return resultSeen && liveAgentTaskIds.size === 0 && (followUpPending || !allAnswered());
+      return resultSeen && liveAgentTaskIds.size === 0
+        && (followUpPending || owedTasks.size > 0 || owedRuns.size > 0 || !allAnswered());
     },
+    get followUpMayBeAbsorbed() {
+      return resultSeen && liveAgentTaskIds.size === 0 && !followUpPending && allAnswered()
+        && !answeringQueued && owedTasks.size === 0 && owedRuns.size > 0
+        && [...owedRuns].every((runId) => notifiedMidAnswer.has(runId));
+    },
+
     get echoedPromptUuid() {
       return echoedPromptUuid;
     },

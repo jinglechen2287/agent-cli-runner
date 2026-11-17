@@ -1032,6 +1032,75 @@ describe("createClaudeTurnTranslator prompt correlation", () => {
     expect(t.finish().text).toBe("launched");
   });
 
+  it("waits for the answer to an agent that settled while the CLI answered another", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    // As the CLI reports it: the task's update, then its notification.
+    const settled = (taskId: string, runId: string) => {
+      t.handle({ type: "system", subtype: "task_updated", task_id: taskId, patch: { status: "completed" } });
+      t.handle({ type: "system", subtype: "task_notification", task_id: taskId, run_id: runId, status: "completed" });
+    };
+    const answer = (text: string, runId: string) => {
+      t.handle({ type: "assistant", message: { content: [{ type: "text", text }] } });
+      t.handle({
+        type: "result",
+        subtype: "success",
+        result: text,
+        session_id: "s",
+        origin: { kind: "task-notification", producer: "session-task", runId },
+      });
+    };
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-2", task_type: "local_agent" });
+    t.handle(ours("launched"));
+
+    settled("agent-1", "run-1");
+    // The second lands while the CLI is still answering the first.
+    settled("agent-2", "run-2");
+    answer("one is in", "run-1");
+    expect(t.done).toBe(false);
+    expect(t.awaitingFollowUp).toBe(true);
+
+    answer("both are in", "run-2");
+    expect(t.done).toBe(true);
+    expect(t.finish().text).toBe("both are in");
+  });
+
+  it("still waits when the second agent's notification comes only after the answer to the first", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-2", task_type: "local_agent" });
+    t.handle(ours("launched"));
+    t.handle({ type: "system", subtype: "task_updated", task_id: "agent-1", patch: { status: "completed" } });
+    t.handle({ type: "system", subtype: "task_notification", task_id: "agent-1", run_id: "run-1", status: "completed" });
+    t.handle({ type: "system", subtype: "task_updated", task_id: "agent-2", patch: { status: "completed" } });
+    t.handle({ type: "result", subtype: "success", result: "one", session_id: "s", origin: { kind: "task-notification", runId: "run-1" } });
+    expect(t.done).toBe(false);
+    t.handle({ type: "system", subtype: "task_notification", task_id: "agent-2", run_id: "run-2", status: "completed" });
+    t.handle({ type: "result", subtype: "success", result: "two", session_id: "s", origin: { kind: "task-notification", runId: "run-2" } });
+    expect(t.done).toBe(true);
+  });
+
+  it("thinks a notification absorbed only if it landed while the CLI was answering another", () => {
+    const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    t.handle({ type: "system", subtype: "task_started", task_id: "agent-2", task_type: "local_agent" });
+    t.handle(ours("launched"));
+    // Both ended, neither notified yet: not absorbed, just late.
+    t.handle({ type: "system", subtype: "task_updated", task_id: "agent-1", patch: { status: "completed" } });
+    t.handle({ type: "system", subtype: "task_updated", task_id: "agent-2", patch: { status: "completed" } });
+    expect(t.awaitingFollowUp).toBe(true);
+    expect(t.followUpMayBeAbsorbed).toBe(false);
+    // Notified while the CLI is idle: it opens an answer for it.
+    t.handle({ type: "system", subtype: "task_notification", task_id: "agent-1", run_id: "run-1", status: "completed" });
+    expect(t.followUpMayBeAbsorbed).toBe(false);
+    t.handle({ type: "system", subtype: "init", session_id: "s" });
+    // Notified mid-answer, and the answer names only the first.
+    t.handle({ type: "system", subtype: "task_notification", task_id: "agent-2", run_id: "run-2", status: "completed" });
+    expect(t.followUpMayBeAbsorbed).toBe(false);
+    t.handle({ type: "result", subtype: "success", result: "both", session_id: "s", origin: { kind: "task-notification", runId: "run-1" } });
+    expect(t.followUpMayBeAbsorbed).toBe(true);
+  });
+
   it("needs no follow-up for an agent that settled before the result", () => {
     const t = createClaudeTurnTranslator({}, { promptUuid: "u1" });
     t.handle({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });

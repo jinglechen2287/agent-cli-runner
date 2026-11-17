@@ -96,6 +96,10 @@ export const CLAUDE_INTERRUPT_GRACE_MS = 5_000;
  * subagent has settled, for the CLI to answer the notification with a
  * `result` before the turn settles without it. */
 export const CLAUDE_FOLLOW_UP_GRACE_MS = 60_000;
+/** How long a held turn waits for the CLI to open an answer to a subagent's
+ * notification once nothing else is owed: it opens one at once, so silence
+ * this long means the last answer already took the notification in. */
+export const CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS = 5_000;
 
 /** How long measuring the context after a compaction may take before the
  * turn settles without a size. */
@@ -200,6 +204,8 @@ export interface CreateClaudeSessionOptions {
   interruptGraceMs?: number;
   /** Override {@link CLAUDE_FOLLOW_UP_GRACE_MS}. */
   followUpGraceMs?: number;
+  /** Override {@link CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS}. */
+  absorbedFollowUpGraceMs?: number;
   spawnFn?: SpawnFn;
   queryFn?: ClaudeQueryFn;
 }
@@ -427,6 +433,7 @@ export async function createClaudeSession(
   const queryFn: ClaudeQueryFn = opts.queryFn ?? sdkQuery;
   const interruptGraceMs = opts.interruptGraceMs ?? CLAUDE_INTERRUPT_GRACE_MS;
   const followUpGraceMs = opts.followUpGraceMs ?? CLAUDE_FOLLOW_UP_GRACE_MS;
+  const absorbedFollowUpGraceMs = opts.absorbedFollowUpGraceMs ?? CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS;
   /** Some `result` of this process named its prompt, so one that names none
    * is never a turn's own. */
   let cliEchoesPromptUuid = false;
@@ -750,7 +757,10 @@ export async function createClaudeSession(
           // silent gap ends the wait — the thread is not held forever by a
           // CLI that never answers.
           if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
-          turn.followUpTimer = setTimeout(() => settleTurn(turn), followUpGraceMs);
+          turn.followUpTimer = setTimeout(
+            () => settleTurn(turn),
+            turn.translator.followUpMayBeAbsorbed ? absorbedFollowUpGraceMs : followUpGraceMs,
+          );
         } else if (turn.followUpTimer) {
           clearTimeout(turn.followUpTimer);
           turn.followUpTimer = undefined;

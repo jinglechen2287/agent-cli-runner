@@ -1,6 +1,7 @@
 export { runClaude, CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
 export type { ClaudePermissionMode, RunClaudeOptions } from "./run-claude.js";
 export {
+  CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS,
   CLAUDE_FOLLOW_UP_GRACE_MS,
   CLAUDE_INTERRUPT_GRACE_MS,
   createClaudeSession,

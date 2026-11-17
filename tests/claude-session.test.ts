@@ -390,6 +390,49 @@ describe("createClaudeSession", () => {
     expect(session.closed).toBe(false);
   });
 
+  it("ends a held turn soon when the answer to one subagent took in another's notification too", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake, { followUpGraceMs: 10_000, absorbedFollowUpGraceMs: 20 });
+    const turn = session.runTurn({ prompt: "research" });
+    await fake.waitForPrompt(1);
+    const uuid = fake.uuids[0];
+    fake.emit({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    fake.emit({ type: "system", subtype: "task_started", task_id: "agent-2", task_type: "local_agent" });
+    fake.emit(result("launched", { user_message_uuid: uuid }));
+    fake.emit({ type: "system", subtype: "task_notification", task_id: "agent-1", run_id: "run-1", status: "completed" });
+    fake.emit(init());
+    // The second lands mid-answer and is taken in between tool rounds: the
+    // answer names only the first, and no further answer comes.
+    fake.emit({ type: "system", subtype: "task_notification", task_id: "agent-2", run_id: "run-2", status: "completed" });
+    fake.emit(assistant("both are in"));
+    fake.emit(result("both are in", { origin: { kind: "task-notification", runId: "run-1" } }));
+    await expect(turn).resolves.toMatchObject({ text: "both are in", exitCode: 0 });
+  });
+
+  it("keeps waiting, past the short wait, once the CLI starts answering a queued notification", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake, { followUpGraceMs: 10_000, absorbedFollowUpGraceMs: 20 });
+    const turn = session.runTurn({ prompt: "research" });
+    let settled = false;
+    void turn.then(() => {
+      settled = true;
+    });
+    await fake.waitForPrompt(1);
+    const uuid = fake.uuids[0];
+    fake.emit({ type: "system", subtype: "task_started", task_id: "agent-1", task_type: "local_agent" });
+    fake.emit({ type: "system", subtype: "task_started", task_id: "agent-2", task_type: "local_agent" });
+    fake.emit(result("launched", { user_message_uuid: uuid }));
+    fake.emit({ type: "system", subtype: "task_notification", task_id: "agent-1", run_id: "run-1", status: "completed" });
+    fake.emit({ type: "system", subtype: "task_notification", task_id: "agent-2", run_id: "run-2", status: "completed" });
+    fake.emit(init());
+    fake.emit(result("one", { origin: { kind: "task-notification", runId: "run-1" } }));
+    fake.emit(init());
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(settled).toBe(false);
+    fake.emit(result("two", { origin: { kind: "task-notification", runId: "run-2" } }));
+    await expect(turn).resolves.toMatchObject({ text: "two", exitCode: 0 });
+  });
+
   it("keeps waiting on a follow-up that is still producing output", async () => {
     const fake = makeFakeQuery();
     const session = await startSession(fake, { followUpGraceMs: 30 });

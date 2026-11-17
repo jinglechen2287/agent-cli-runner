@@ -519,9 +519,24 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
   const backgroundAgents = /* @__PURE__ */ new Map();
   const liveTaskIds = /* @__PURE__ */ new Set();
   const liveAgentTaskIds = /* @__PURE__ */ new Set();
+  const owedTasks = /* @__PURE__ */ new Set();
+  const owedRuns = /* @__PURE__ */ new Set();
+  let answeringQueued = false;
+  const notifiedMidAnswer = /* @__PURE__ */ new Set();
   const settleTask = (taskId) => {
     liveTaskIds.delete(taskId);
-    if (liveAgentTaskIds.delete(taskId) && resultSeen) followUpPending = true;
+    if (liveAgentTaskIds.delete(taskId) && resultSeen) owedTasks.add(taskId);
+  };
+  const notifyTask = (taskId, runId) => {
+    const live = liveAgentTaskIds.has(taskId);
+    settleTask(taskId);
+    if (!owedTasks.delete(taskId) && !(live && resultSeen)) return;
+    if (!runId) {
+      followUpPending = true;
+      return;
+    }
+    owedRuns.add(runId);
+    if (answeringQueued) notifiedMidAnswer.add(runId);
   };
   const isForeignResult = (parsed) => {
     if (promptUuid === void 0) return false;
@@ -576,6 +591,7 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       return;
     }
     if (parsed.type === "system" && parsed.subtype === "init") {
+      if (resultSeen) answeringQueued = true;
       if (typeof parsed.model === "string" && parsed.model) session.model = parsed.model;
       if (parsed.session_id) emitSessionId(parsed.session_id);
       return;
@@ -642,7 +658,9 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       return;
     }
     if (parsed.type === "system" && parsed.subtype === "task_notification" && typeof parsed.task_id === "string") {
-      if (isTerminalTaskStatus(parsed.status)) settleTask(parsed.task_id);
+      if (isTerminalTaskStatus(parsed.status)) {
+        notifyTask(parsed.task_id, typeof parsed.run_id === "string" ? parsed.run_id : void 0);
+      }
       return;
     }
     if (parsed.type === "assistant" && parsed.message?.content) {
@@ -712,6 +730,11 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       const followUp = resultSeen;
       resultSeen = true;
       followUpPending = false;
+      answeringQueued = false;
+      if (parsed.origin?.kind === "task-notification" && typeof parsed.origin.runId === "string") {
+        owedRuns.delete(parsed.origin.runId);
+        notifiedMidAnswer.delete(parsed.origin.runId);
+      }
       const named = namedPromptUuids(parsed);
       if (named) {
         const last = Math.max(...named.map((uuid) => expected.indexOf(uuid)));
@@ -743,13 +766,16 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       expected.push(uuid);
     },
     get done() {
-      return resultSeen && allAnswered() && liveAgentTaskIds.size === 0 && !followUpPending;
+      return resultSeen && allAnswered() && liveAgentTaskIds.size === 0 && !followUpPending && owedTasks.size === 0 && owedRuns.size === 0;
     },
     get resultSeen() {
       return resultSeen;
     },
     get awaitingFollowUp() {
-      return resultSeen && liveAgentTaskIds.size === 0 && (followUpPending || !allAnswered());
+      return resultSeen && liveAgentTaskIds.size === 0 && (followUpPending || owedTasks.size > 0 || owedRuns.size > 0 || !allAnswered());
+    },
+    get followUpMayBeAbsorbed() {
+      return resultSeen && liveAgentTaskIds.size === 0 && !followUpPending && allAnswered() && !answeringQueued && owedTasks.size === 0 && owedRuns.size > 0 && [...owedRuns].every((runId) => notifiedMidAnswer.has(runId));
     },
     get echoedPromptUuid() {
       return echoedPromptUuid;
@@ -780,6 +806,7 @@ var CLAUDE_STRIPPED_ENV_VARS = [
 ];
 var CLAUDE_INTERRUPT_GRACE_MS = 5e3;
 var CLAUDE_FOLLOW_UP_GRACE_MS = 6e4;
+var CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS = 5e3;
 var CONTEXT_MEASURE_TIMEOUT_MS = 1e4;
 var MCP_STATUS_TIMEOUT_MS = 5e3;
 var MCP_STATUS_POLL_MS = 2e3;
@@ -935,6 +962,7 @@ async function createClaudeSession(opts) {
   const queryFn = opts.queryFn ?? sdkQuery;
   const interruptGraceMs = opts.interruptGraceMs ?? CLAUDE_INTERRUPT_GRACE_MS;
   const followUpGraceMs = opts.followUpGraceMs ?? CLAUDE_FOLLOW_UP_GRACE_MS;
+  const absorbedFollowUpGraceMs = opts.absorbedFollowUpGraceMs ?? CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS;
   let cliEchoesPromptUuid = false;
   const sessionState = createClaudeSessionState();
   let closed = false;
@@ -1195,7 +1223,10 @@ async function createClaudeSession(opts) {
           settleTurn(turn);
         } else if (turn.translator.awaitingFollowUp) {
           if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
-          turn.followUpTimer = setTimeout(() => settleTurn(turn), followUpGraceMs);
+          turn.followUpTimer = setTimeout(
+            () => settleTurn(turn),
+            turn.translator.followUpMayBeAbsorbed ? absorbedFollowUpGraceMs : followUpGraceMs
+          );
         } else if (turn.followUpTimer) {
           clearTimeout(turn.followUpTimer);
           turn.followUpTimer = void 0;
@@ -3571,6 +3602,7 @@ ${command.stderr}` : command.stdout,
 }
 export {
   AbortError,
+  CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS,
   CLAUDE_CONTEXT_WINDOWS,
   CLAUDE_FOLLOW_UP_GRACE_MS,
   CLAUDE_INTERRUPT_GRACE_MS,
