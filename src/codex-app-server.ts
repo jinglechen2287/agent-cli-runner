@@ -158,6 +158,15 @@ export interface CreateCodexAppServerSessionOptions {
   /** Config overrides for the thread, sent on `thread/start` and
    * `thread/resume` — e.g. `{ mcp_servers: { name: { url } } }`. */
   config?: CodexConfigOverrides;
+  /** Archive the thread with `thread/archive` when the session closes, once
+   * it has run a turn: the rollout moves to Codex's archived sessions, kept
+   * on disk but out of the history a Codex client lists by default. */
+  archive?: boolean;
+  /** How long close waits for the archive; 2 s unless given. */
+  archiveTimeoutMs?: number;
+  /** Told the thread's id when close couldn't archive it: Codex refused, didn't
+   * answer in time, or had already exited. The session closes all the same. */
+  onArchiveError?: (threadId: string, error: Error) => void;
 }
 
 /** app-server's `config` map: dotted or nested config.toml keys to values. */
@@ -185,6 +194,8 @@ const CLIENT_INFO = {
   version: "0.1.0",
 };
 const clientExitPromises = new WeakMap<CodexAppServerClient, Promise<void>>();
+/** How long a closing session waits for `thread/archive`. */
+const ARCHIVE_TIMEOUT_MS = 2000;
 
 function rpcError(value: unknown, fallback: string): Error {
   if (!isRecord(value)) return new Error(fallback);
@@ -857,6 +868,8 @@ interface TurnContinuity {
   onTurnId?: (turnId: string) => void;
   /** Handed the turn's steer function when it starts, and null when it ends. */
   onSteerable?: (steer: ((prompt: string) => Promise<void>) | null) => void;
+  /** Told as `turn/start` is sent, acknowledged or not. */
+  onTurnStartSent?: () => void;
 }
 
 interface PendingCodexWebTool {
@@ -1398,6 +1411,7 @@ async function runCodexAppServerTurn(
       : Math.max(1, Math.min(TURN_START_TIMEOUT_MS, runDeadline - Date.now()));
     let turnResult: unknown;
     turnStartSent = true;
+    safeCallback(() => continuity?.onTurnStartSent?.());
     try {
       // Also raced against `completion`: a thread-fatal error or pre-ack
       // buffer overflow settles the turn while the ack is still pending, and
@@ -1665,10 +1679,31 @@ export async function createCodexAppServerSession(
   let running = false;
   let steerRunning: ((prompt: string) => Promise<void>) | null = null;
   let closePromise: Promise<void> | undefined;
+  /** The app-server went on its own, before close asked it to. */
+  let exited = false;
+  /** A turn started on the thread: from then on Codex may have saved it. */
+  let turnStarted = false;
   client.onClose(() => {
+    if (!closed) exited = true;
     closed = true;
     activeTurn?.elicitations.abort();
   });
+  /** Whether close archives the thread: asked to, once a turn started, as a
+   * thread with none has no rollout to move. One whose `turn/start` went
+   * unanswered may have one, so it counts too. */
+  const archives = (): boolean => !!options.archive && turnStarted;
+  const archiveThread = async (): Promise<void> => {
+    const failed = (error: unknown) => safeCallback(() => options.onArchiveError?.(
+      opened.threadId,
+      error instanceof Error ? error : new Error(String(error)),
+    ));
+    if (exited) return failed(new Error("Codex app-server exited before the thread was archived"));
+    try {
+      await client.request("thread/archive", { threadId: opened.threadId }, options.archiveTimeoutMs ?? ARCHIVE_TIMEOUT_MS);
+    } catch (error) {
+      failed(error);
+    }
+  };
 
   const run = async (
     turnOptions: CodexAppServerTurnOptions,
@@ -1700,6 +1735,9 @@ export async function createCodexAppServerSession(
         previousTurnIds,
         onTurnId: (turnId) => {
           previousTurnIds.add(turnId);
+        },
+        onTurnStartSent: () => {
+          turnStarted = true;
         },
         // A compaction takes no more input.
         ...(start === "turn"
@@ -1739,9 +1777,16 @@ export async function createCodexAppServerSession(
       return client.onClose(handler);
     },
     close(): Promise<void> {
-      closePromise ??= clientExitPromises.get(client) ?? Promise.resolve();
-      if (!closed) closed = true;
-      client.close();
+      if (closePromise) return closePromise;
+      // closed before anything awaits: a turn or steer from here is refused
+      closed = true;
+      const exit = () => {
+        client.close();
+        return clientExitPromises.get(client) ?? Promise.resolve();
+      };
+      // the archive starts once closePromise is set, so a callback that closes again gets this close;
+      // with nothing to archive, the app-server is told to go at once
+      closePromise = archives() ? Promise.resolve().then(archiveThread).then(exit) : exit();
       return closePromise;
     },
   };

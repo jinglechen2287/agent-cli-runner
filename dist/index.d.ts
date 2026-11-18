@@ -614,6 +614,15 @@ interface CreateCodexAppServerSessionOptions {
     /** Config overrides for the thread, sent on `thread/start` and
      * `thread/resume` — e.g. `{ mcp_servers: { name: { url } } }`. */
     config?: CodexConfigOverrides;
+    /** Archive the thread with `thread/archive` when the session closes, once
+     * it has run a turn: the rollout moves to Codex's archived sessions, kept
+     * on disk but out of the history a Codex client lists by default. */
+    archive?: boolean;
+    /** How long close waits for the archive; 2 s unless given. */
+    archiveTimeoutMs?: number;
+    /** Told the thread's id when close couldn't archive it: Codex refused, didn't
+     * answer in time, or had already exited. The session closes all the same. */
+    onArchiveError?: (threadId: string, error: Error) => void;
 }
 /** app-server's `config` map: dotted or nested config.toml keys to values. */
 type CodexConfigOverrides = {
