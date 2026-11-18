@@ -580,6 +580,12 @@ var CodexTurnError = class extends Error {
   /** Exit code of the Codex process, once known. */
   exitCode;
 };
+var UnsupportedServerRequestError = class extends Error {
+  constructor(method) {
+    super(`Unsupported server request: ${method}`);
+    this.name = "UnsupportedServerRequestError";
+  }
+};
 var SteerRejectedError = class extends Error {
   name = "SteerRejectedError";
 };
@@ -1447,24 +1453,14 @@ async function runClaude(opts) {
 // src/fork.ts
 import { deleteSession, forkSession } from "@anthropic-ai/claude-agent-sdk";
 
-// src/codex-app-server.ts
+// src/codex-client.ts
 import { spawn as nodeSpawn3 } from "child_process";
-var UnsupportedServerRequestError = class extends Error {
-  constructor(method) {
-    super(`Unsupported server request: ${method}`);
-    this.name = "UnsupportedServerRequestError";
-  }
-};
 var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;
-var TURN_START_TIMEOUT_MS = 6e4;
-var MAX_PRE_ACK_NOTIFICATIONS = 1e4;
 var CLIENT_INFO = {
   name: "agent_cli_runner",
   title: "Agent CLI Runner",
   version: "0.1.0"
 };
-var clientExitPromises = /* @__PURE__ */ new WeakMap();
-var ARCHIVE_TIMEOUT_MS = 2e3;
 function rpcError(value, fallback) {
   if (!isRecord(value)) return new Error(fallback);
   const message = typeof value.message === "string" ? value.message : fallback;
@@ -1473,7 +1469,7 @@ function rpcError(value, fallback) {
   if (value.data !== void 0) error.data = value.data;
   return error;
 }
-async function createCodexAppServerClient(options) {
+async function startCodexAppServer(options) {
   const spawnFn = options.spawnFn ?? nodeSpawn3;
   let child;
   try {
@@ -1670,7 +1666,6 @@ async function createCodexAppServerClient(options) {
       killTimer.unref();
     }
   };
-  clientExitPromises.set(client, exitPromise);
   const abort = () => client.close();
   options.signal?.addEventListener("abort", abort, { once: true });
   try {
@@ -1683,7 +1678,7 @@ async function createCodexAppServerClient(options) {
       }
     });
     client.notify("initialized", {});
-    return client;
+    return { client, whenExited: exitPromise };
   } catch (error) {
     client.close();
     throw options.signal?.aborted ? new AbortError() : error;
@@ -1691,6 +1686,11 @@ async function createCodexAppServerClient(options) {
     options.signal?.removeEventListener("abort", abort);
   }
 }
+async function createCodexAppServerClient(options) {
+  return (await startCodexAppServer(options)).client;
+}
+
+// src/codex-items.ts
 function record(value) {
   return isRecord(value) ? value : void 0;
 }
@@ -1946,6 +1946,94 @@ function turnIdFrom(value) {
 function turnStatus(value) {
   return text(record(record(value)?.turn)?.status);
 }
+function codexMcpStatus(params) {
+  const name = text(params.name);
+  if (!name) return void 0;
+  const error = text(params.error);
+  const failed = (status) => ({
+    name,
+    status,
+    ...error ? { error } : {}
+  });
+  switch (params.status) {
+    case "starting":
+      return { name, status: "connecting" };
+    case "ready":
+      return { name, status: "connected" };
+    case "failed":
+      return failed(params.failureReason === "reauthenticationRequired" ? "needs-auth" : "failed");
+    case "cancelled":
+      return failed("failed");
+    default:
+      return void 0;
+  }
+}
+function codexElicitationRequest(params) {
+  const serverName = text(params.serverName);
+  const message = typeof params.message === "string" ? params.message : void 0;
+  if (!serverName || message === void 0) return void 0;
+  if (params.mode === "form") {
+    const requestedSchema = record(params.requestedSchema);
+    return requestedSchema ? { serverName, message, mode: "form", requestedSchema } : void 0;
+  }
+  if (params.mode === "url") {
+    const url = text(params.url);
+    return url ? { serverName, message, mode: "url", url } : void 0;
+  }
+  return void 0;
+}
+
+// src/fork.ts
+var DEFAULT_FORK_TIMEOUT_MS = 6e4;
+async function forkClaudeSession(sessionId, options) {
+  const { sessionId: forked } = await forkSession(sessionId, { dir: options.cwd });
+  return forked;
+}
+async function deleteClaudeSession(sessionId, options) {
+  await deleteSession(sessionId, { dir: options.cwd });
+}
+async function forkCodexThread(options) {
+  const signal = options.signal;
+  if (signal?.aborted) throw new AbortError();
+  const timeoutMs = options.timeoutMs ?? DEFAULT_FORK_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
+  const client = await createCodexAppServerClient({
+    cwd: options.cwd,
+    requestTimeoutMs: timeoutMs,
+    ...options.executablePath ? { executablePath: options.executablePath } : {},
+    ...options.env ? { env: options.env } : {},
+    ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
+    ...signal ? { signal } : {}
+  });
+  const abort = () => client.close();
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    if (signal?.aborted) throw new AbortError();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new TimeoutError("Codex fork timed out while the app-server started");
+    const forked = await client.request(
+      "thread/fork",
+      { threadId: options.threadId, cwd: options.cwd, ephemeral: false },
+      remaining
+    );
+    const id = threadIdFrom(forked);
+    if (!id) throw new Error("Codex answered the fork without a thread id");
+    return id;
+  } catch (error) {
+    if (signal?.aborted) throw new AbortError();
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    client.close();
+  }
+}
+
+// src/run-codex.ts
+import { spawn } from "child_process";
+
+// src/codex-turn.ts
+var TURN_START_TIMEOUT_MS = 6e4;
+var MAX_PRE_ACK_NOTIFICATIONS = 1e4;
 var CODEX_FORK_CONFIG = {
   web_search: "disabled",
   features: {
@@ -2026,7 +2114,14 @@ function openedCodexThread(value, fallbackModel) {
   const model = text(record(value)?.model) ?? fallbackModel;
   return { threadId, ...model ? { model } : {} };
 }
-async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = false, continuity, retireClientOnUnackedStart = ownedClient, start = "turn") {
+async function runCodexAppServerTurn(opts, {
+  client,
+  thread: openedThread,
+  ownsClient: ownedClient,
+  retireClientOnUnackedStart,
+  continuity,
+  start
+}) {
   if (opts.signal?.aborted) throw new AbortError("codex run aborted");
   const isPreviousTurn = (turnId2) => continuity?.previousTurnIds?.has(turnId2) ?? false;
   let threadId = openedThread?.threadId ?? opts.resumeSessionId;
@@ -2522,45 +2617,12 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     if (ownedClient) client.close();
   }
 }
+
+// src/codex-app-server.ts
+var ARCHIVE_TIMEOUT_MS = 2e3;
 var FORM_INPUT_EXTENSION = "openai/standard-form-input";
-function codexMcpStatus(params) {
-  const name = text(params.name);
-  if (!name) return void 0;
-  const error = text(params.error);
-  const failed = (status) => ({
-    name,
-    status,
-    ...error ? { error } : {}
-  });
-  switch (params.status) {
-    case "starting":
-      return { name, status: "connecting" };
-    case "ready":
-      return { name, status: "connected" };
-    case "failed":
-      return failed(params.failureReason === "reauthenticationRequired" ? "needs-auth" : "failed");
-    case "cancelled":
-      return failed("failed");
-    default:
-      return void 0;
-  }
-}
-function codexElicitationRequest(params) {
-  const serverName = text(params.serverName);
-  const message = typeof params.message === "string" ? params.message : void 0;
-  if (!serverName || message === void 0) return void 0;
-  if (params.mode === "form") {
-    const requestedSchema = record(params.requestedSchema);
-    return requestedSchema ? { serverName, message, mode: "form", requestedSchema } : void 0;
-  }
-  if (params.mode === "url") {
-    const url = text(params.url);
-    return url ? { serverName, message, mode: "url", url } : void 0;
-  }
-  return void 0;
-}
 async function createCodexAppServerSession(options) {
-  const client = await createCodexAppServerClient({
+  const { client, whenExited } = await startCodexAppServer({
     cwd: options.cwd,
     ...options.executablePath ? { executablePath: options.executablePath } : {},
     ...options.env ? { env: options.env } : {},
@@ -2682,21 +2744,28 @@ async function createCodexAppServerSession(options) {
           dangerouslyBypassApprovalsAndSandbox: options.dangerouslyBypassApprovalsAndSandbox
         } : {},
         ...options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}
-      }, client, opened, false, {
-        previousTurnIds,
-        onTurnId: (turnId) => {
-          previousTurnIds.add(turnId);
-        },
-        onTurnStartSent: () => {
-          turnStarted = true;
-        },
-        // A compaction takes no more input.
-        ...start === "turn" ? {
-          onSteerable: (steer) => {
-            steerRunning = steer;
-          }
-        } : {}
-      }, true, start);
+      }, {
+        client,
+        thread: opened,
+        ownsClient: false,
+        retireClientOnUnackedStart: true,
+        start,
+        continuity: {
+          previousTurnIds,
+          onTurnId: (turnId) => {
+            previousTurnIds.add(turnId);
+          },
+          onTurnStartSent: () => {
+            turnStarted = true;
+          },
+          // A compaction takes no more input.
+          ...start === "turn" ? {
+            onSteerable: (steer) => {
+              steerRunning = steer;
+            }
+          } : {}
+        }
+      });
     } finally {
       running = false;
       steerRunning = null;
@@ -2729,7 +2798,7 @@ async function createCodexAppServerSession(options) {
       closed = true;
       const exit = () => {
         client.close();
-        return clientExitPromises.get(client) ?? Promise.resolve();
+        return whenExited;
       };
       closePromise = archives() ? Promise.resolve().then(archiveThread).then(exit) : exit();
       return closePromise;
@@ -2745,56 +2814,15 @@ async function runCodexAppServer(opts) {
     ...opts.env ? { env: opts.env } : {},
     ...opts.spawnFn ? { spawnFn: opts.spawnFn } : {}
   });
-  return runCodexAppServerTurn(opts, client, void 0, ownedClient);
-}
-
-// src/fork.ts
-var DEFAULT_FORK_TIMEOUT_MS = 6e4;
-async function forkClaudeSession(sessionId, options) {
-  const { sessionId: forked } = await forkSession(sessionId, { dir: options.cwd });
-  return forked;
-}
-async function deleteClaudeSession(sessionId, options) {
-  await deleteSession(sessionId, { dir: options.cwd });
-}
-async function forkCodexThread(options) {
-  const signal = options.signal;
-  if (signal?.aborted) throw new AbortError();
-  const timeoutMs = options.timeoutMs ?? DEFAULT_FORK_TIMEOUT_MS;
-  const deadline = Date.now() + timeoutMs;
-  const client = await createCodexAppServerClient({
-    cwd: options.cwd,
-    requestTimeoutMs: timeoutMs,
-    ...options.executablePath ? { executablePath: options.executablePath } : {},
-    ...options.env ? { env: options.env } : {},
-    ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
-    ...signal ? { signal } : {}
+  return runCodexAppServerTurn(opts, {
+    client,
+    ownsClient: ownedClient,
+    retireClientOnUnackedStart: ownedClient,
+    start: "turn"
   });
-  const abort = () => client.close();
-  signal?.addEventListener("abort", abort, { once: true });
-  try {
-    if (signal?.aborted) throw new AbortError();
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new TimeoutError("Codex fork timed out while the app-server started");
-    const forked = await client.request(
-      "thread/fork",
-      { threadId: options.threadId, cwd: options.cwd, ephemeral: false },
-      remaining
-    );
-    const id = threadIdFrom(forked);
-    if (!id) throw new Error("Codex answered the fork without a thread id");
-    return id;
-  } catch (error) {
-    if (signal?.aborted) throw new AbortError();
-    throw error;
-  } finally {
-    signal?.removeEventListener("abort", abort);
-    client.close();
-  }
 }
 
 // src/run-codex.ts
-import { spawn } from "child_process";
 function buildIsolatedArgs(opts) {
   const args = [
     "exec",

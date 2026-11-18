@@ -38,23 +38,22 @@ export type { ForkCodexThreadOptions } from "./fork.js";
 export { runCodex } from "./run-codex.js";
 export { CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS } from "./process.js";
 export type { CodexSandboxPolicy, RunCodexOptions } from "./run-codex.js";
-export {
-  CODEX_FORK_CONFIG,
-  createCodexAppServerClient,
-  createCodexAppServerSession,
-  UnsupportedServerRequestError,
-} from "./codex-app-server.js";
+export { createCodexAppServerClient } from "./codex-client.js";
 export type {
   CodexAppServerClient,
-  CodexAppServerCompactOptions,
-  CodexAppServerSession,
-  CodexAppServerSteerOptions,
-  CodexAppServerTurnOptions,
   CodexConfigOverrides,
   CodexJsonValue,
   CodexServerRequest,
   CodexServerRequestHandler,
   CreateCodexAppServerClientOptions,
+} from "./codex-client.js";
+export { CODEX_FORK_CONFIG } from "./codex-turn.js";
+export { createCodexAppServerSession } from "./codex-app-server.js";
+export type {
+  CodexAppServerCompactOptions,
+  CodexAppServerSession,
+  CodexAppServerSteerOptions,
+  CodexAppServerTurnOptions,
   CreateCodexAppServerSessionOptions,
 } from "./codex-app-server.js";
 export {
@@ -63,6 +62,7 @@ export {
   MissingCliError,
   SteerRejectedError,
   TimeoutError,
+  UnsupportedServerRequestError,
 } from "./errors.js";
 export type {
   AgentCallbacks,

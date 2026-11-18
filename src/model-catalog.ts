@@ -13,7 +13,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { createCodexAppServerClient } from "./codex-app-server.js";
+import { createCodexAppServerClient } from "./codex-client.js";
 import { childEnv, killTreeOnKill, launchCommand } from "./process.js";
 
 export type ModelCatalogProvider = "claude" | "codex";

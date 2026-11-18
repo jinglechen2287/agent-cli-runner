@@ -533,11 +533,6 @@ declare function createClaudeSessionState(): ClaudeSessionState;
  * tracking are all scoped to it. */
 declare function createClaudeTurnTranslator(callbacks: AgentCallbacks, options?: ClaudeTurnTranslatorOptions): ClaudeTurnTranslator;
 
-/** Thrown by a {@link CodexServerRequestHandler} for a method it does not
- * take: the server gets "method not found", as if nothing were registered. */
-declare class UnsupportedServerRequestError extends Error {
-    constructor(method: string);
-}
 interface CodexServerRequest {
     id: number | string;
     method: string;
@@ -571,6 +566,15 @@ interface CreateCodexAppServerClientOptions {
      * `AbortError`. Only the start; close the client to stop it after. */
     signal?: AbortSignal;
 }
+/** app-server's `config` map: dotted or nested config.toml keys to values. */
+type CodexConfigOverrides = {
+    [key: string]: CodexJsonValue;
+};
+type CodexJsonValue = string | number | boolean | null | CodexJsonValue[] | {
+    [key: string]: CodexJsonValue;
+};
+declare function createCodexAppServerClient(options: CreateCodexAppServerClientOptions): Promise<CodexAppServerClient>;
+
 type CodexAppServerTurnOptions = Omit<RunCodexOptions, "appServerClient" | "appServerSession" | "cwd" | "dangerouslyBypassApprovalsAndSandbox" | "developerInstructions" | "env" | "executablePath" | "isolated" | "resumeSessionId" | "forkSessionId" | "forkConfig" | "spawnFn">;
 interface CodexAppServerSession {
     readonly threadId: string;
@@ -620,34 +624,6 @@ interface CreateCodexAppServerSessionOptions {
      * answer in time, or had already exited. The session closes all the same. */
     onArchiveError?: (threadId: string, error: Error) => void;
 }
-/** app-server's `config` map: dotted or nested config.toml keys to values. */
-type CodexConfigOverrides = {
-    [key: string]: CodexJsonValue;
-};
-type CodexJsonValue = string | number | boolean | null | CodexJsonValue[] | {
-    [key: string]: CodexJsonValue;
-};
-declare function createCodexAppServerClient(options: CreateCodexAppServerClientOptions): Promise<CodexAppServerClient>;
-/** Thread config for a forked side run: no web search, and every tool
- * feature off, so the copy can only answer from its history. The run adds
- * each configured MCP server, switched off by name, and still fails closed
- * on any item beyond a message or reasoning that starts anyway. */
-declare const CODEX_FORK_CONFIG: {
-    readonly web_search: "disabled";
-    readonly features: {
-        readonly multi_agent: false;
-        readonly multi_agent_v2: false;
-        readonly goals: false;
-        readonly shell_tool: false;
-        readonly unified_exec: false;
-        readonly apps: false;
-        readonly image_generation: false;
-        readonly view_image: false;
-        readonly sleep_tool: false;
-        readonly browser_use: false;
-        readonly computer_use: false;
-    };
-};
 declare function createCodexAppServerSession(options: CreateCodexAppServerSessionOptions): Promise<CodexAppServerSession>;
 
 /** A per-turn sandbox override, mirroring app-server's SandboxPolicy union.
@@ -762,6 +738,27 @@ declare const CLAUDE_STRIPPED_ENV_VARS: readonly ["CLAUDECODE", "CLAUDE_CODE_ENT
  * not inherit the parent's thread. */
 declare const CODEX_STRIPPED_ENV_VARS: readonly ["CODEX_THREAD_ID"];
 
+/** Thread config for a forked side run: no web search, and every tool
+ * feature off, so the copy can only answer from its history. The run adds
+ * each configured MCP server, switched off by name, and still fails closed
+ * on any item beyond a message or reasoning that starts anyway. */
+declare const CODEX_FORK_CONFIG: {
+    readonly web_search: "disabled";
+    readonly features: {
+        readonly multi_agent: false;
+        readonly multi_agent_v2: false;
+        readonly goals: false;
+        readonly shell_tool: false;
+        readonly unified_exec: false;
+        readonly apps: false;
+        readonly image_generation: false;
+        readonly view_image: false;
+        readonly sleep_tool: false;
+        readonly browser_use: false;
+        readonly computer_use: false;
+    };
+};
+
 declare class AbortError extends Error {
     readonly name = "AbortError";
     constructor(message?: string);
@@ -780,6 +777,11 @@ declare class CodexTurnError extends Error {
     readonly name = "CodexTurnError";
     /** Exit code of the Codex process, once known. */
     exitCode?: number;
+}
+/** Thrown by a {@link CodexServerRequestHandler} for a method it does not
+ * take: the server gets "method not found", as if nothing were registered. */
+declare class UnsupportedServerRequestError extends Error {
+    constructor(method: string);
 }
 /** A steer the session could not hand to the running turn: none is running,
  * or the turn is past the point of taking more input. The host can send the

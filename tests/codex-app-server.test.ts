@@ -9,7 +9,7 @@ import {
   SteerRejectedError,
   type CodexAppServerSession,
 } from "../src/index.js";
-import { toolName } from "../src/codex-app-server.js";
+import { toolName } from "../src/codex-items.js";
 
 interface FakeChild extends EventEmitter {
   stdin: PassThrough;

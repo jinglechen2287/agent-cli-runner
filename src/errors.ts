@@ -28,6 +28,15 @@ export class CodexTurnError extends Error {
   exitCode?: number;
 }
 
+/** Thrown by a {@link CodexServerRequestHandler} for a method it does not
+ * take: the server gets "method not found", as if nothing were registered. */
+export class UnsupportedServerRequestError extends Error {
+  constructor(method: string) {
+    super(`Unsupported server request: ${method}`);
+    this.name = "UnsupportedServerRequestError";
+  }
+}
+
 /** A steer the session could not hand to the running turn: none is running,
  * or the turn is past the point of taking more input. The host can send the
  * same words as the next turn instead. */
