@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomUUID, type UUID } from "node:crypto";
 import {
   query as sdkQuery,
   type EffortLevel,
@@ -13,30 +13,34 @@ import {
   type SpawnedProcess,
   type SpawnOptions as SdkSpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
+import { createClaudeMcpStatus, MCP_STATUS_POLL_LIMIT_MS } from "./claude-mcp-status.js";
 import {
   createClaudeSessionState,
   createClaudeTurnTranslator,
+  knownContextWindow,
   type ClaudeTurnOutcome,
   type ClaudeTurnTranslator,
 } from "./claude-messages.js";
-import { AbortError, MissingCliError, SteerRejectedError, TimeoutError } from "./errors.js";
-import { answerMcpElicitation, isRecord, safeCallback } from "./internal.js";
+import { MissingCliError, runAborted, runTimedOut, SteerRejectedError } from "./errors.js";
+import {
+  answerMcpElicitation,
+  createDeferred,
+  isRecord,
+  raceTimeout,
+  safeCallback,
+  withoutUndefined,
+  type Deferred,
+} from "./internal.js";
 import {
   childEnv,
   createChunkDecoder,
-  launchCommand,
   resolveExecutable,
-  SIGTERM_GRACE_MS,
   signalProcessTree,
+  spawnCli,
+  terminateTree,
 } from "./process.js";
-import type {
-  AgentCallbacks,
-  McpElicitationRequest,
-  McpServerStatusInfo,
-  RunResult,
-  SpawnFn,
-} from "./types.js";
-import { contextWindowForModel, type TokenUsage } from "./usage.js";
+import type { AgentCallbacks, McpElicitationRequest, RunResult, SpawnFn } from "./types.js";
+import { tokenUsage, type TokenUsage } from "./usage.js";
 
 /** Claude Code permission modes. `manual` is this package's name for the
  * CLI's `default` (prompt-for-everything) mode. */
@@ -93,40 +97,6 @@ export const CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS = 5_000;
 /** How long measuring the context after a compaction may take before the
  * turn settles without a size. */
 const CONTEXT_MEASURE_TIMEOUT_MS = 10_000;
-
-/** How long one `mcpServerStatus` call may take before the last snapshot stands. */
-const MCP_STATUS_TIMEOUT_MS = 5_000;
-/** How often a turn looks again while a server is still connecting, and for how
- * long: a server that never settles must not poll for the rest of the turn. */
-const MCP_STATUS_POLL_MS = 2_000;
-const MCP_STATUS_POLL_LIMIT_MS = 30_000;
-
-const CLAUDE_MCP_STATUSES: Readonly<Record<string, McpServerStatusInfo["status"]>> = {
-  pending: "connecting",
-  connected: "connected",
-  failed: "failed",
-  "needs-auth": "needs-auth",
-  disabled: "disabled",
-};
-
-/** Normalize what the CLI reports. `known` supplies the error for a server that
- * hasn't changed state, since the init line carries none. */
-function claudeMcpStatuses(
-  servers: readonly unknown[],
-  known: readonly McpServerStatusInfo[] = [],
-): McpServerStatusInfo[] {
-  return servers.flatMap((server) => {
-    if (!isRecord(server) || typeof server.name !== "string" || typeof server.status !== "string") {
-      return [];
-    }
-    const status = CLAUDE_MCP_STATUSES[server.status];
-    if (!status) return [];
-    const stated = typeof server.error === "string" && server.error ? server.error : undefined;
-    const previous = known.find((entry) => entry.name === server.name && entry.status === status);
-    const error = stated ?? previous?.error;
-    return [{ name: server.name, status, ...(error ? { error } : {}) }];
-  });
-}
 
 /** What a host can answer, or undefined for a URL request with no URL. A form
  * with no schema asks only for a yes. */
@@ -280,12 +250,10 @@ function validateSessionOptions(opts: CreateClaudeSessionOptions): void {
       "newSessionId and resumeSessionId are mutually exclusive — pass one or the other",
     );
   }
-  if (opts.forkSessionId) {
-    if (opts.newSessionId || opts.resumeSessionId) {
-      throw new Error(
-        "forkSessionId is mutually exclusive with newSessionId and resumeSessionId",
-      );
-    }
+  if (opts.forkSessionId && (opts.newSessionId || opts.resumeSessionId)) {
+    throw new Error(
+      "forkSessionId is mutually exclusive with newSessionId and resumeSessionId",
+    );
   }
   if (opts.isolated && opts.resumeSessionId) {
     throw new Error("isolated Claude runs cannot resume a session");
@@ -370,6 +338,48 @@ export function claudeSessionQueryOptions(
   };
 }
 
+/** A user message for the CLI's input, stamped with `uuid`. `priority: "next"`
+ * has the CLI read it between tool rounds of the running turn. */
+function userMessage(prompt: string, uuid: UUID, priority?: "next"): SDKUserMessage {
+  return {
+    type: "user",
+    message: { role: "user", content: prompt },
+    parent_tool_use_id: null,
+    uuid,
+    ...(priority ? { priority } : {}),
+  };
+}
+
+/** The SDK's view of a spawned CLI: its pipes, its state, and a kill that
+ * reaches the process tree. */
+function toSpawnedProcess(child: ChildProcess): SpawnedProcess {
+  if (!child.stdin || !child.stdout) {
+    throw new Error("Claude process was spawned without stdio pipes");
+  }
+  const stdin = child.stdin;
+  const stdout = child.stdout;
+  return {
+    stdin,
+    stdout,
+    get killed() {
+      return child.killed;
+    },
+    get exitCode() {
+      return child.exitCode;
+    },
+    get signalCode() {
+      return child.signalCode;
+    },
+    kill(signal) {
+      signalProcessTree(child, signal);
+      return true;
+    },
+    on: child.on.bind(child) as SpawnedProcess["on"],
+    once: child.once.bind(child) as SpawnedProcess["once"],
+    off: child.off.bind(child) as SpawnedProcess["off"],
+  };
+}
+
 /** A queue the SDK reads user messages from. Ending it closes the CLI's stdin. */
 function createInputQueue(): {
   push(message: SDKUserMessage): void;
@@ -431,31 +441,28 @@ export async function createClaudeSession(
 
   let closed = false;
   let child: ChildProcess | undefined;
-  let childExited = false;
+  /** Settles when the latest child exits. */
+  let childExit: Deferred<void> | undefined;
   let active: ActiveTurn | undefined;
   let stderrTail = "";
   const closeHandlers = new Set<(error: Error) => void>();
-  const exitWaiters = new Set<() => void>();
   const input = createInputQueue();
 
   const spawnClaudeCodeProcess = (spawnOptions: SdkSpawnOptions): SpawnedProcess => {
-    const cwd = spawnOptions.cwd ?? opts.cwd;
-    const launch = launchCommand(spawnOptions.command, spawnOptions.args, spawnOptions.env, { cwd });
-    const spawned = spawnFn(launch.command, launch.args, {
-      ...launch.options,
-      cwd,
+    // A process-group leader (POSIX), so killing the session reaches tool
+    // children (a running Bash) as well as the CLI.
+    const spawned = spawnCli({
+      cli: "claude",
+      spawnFn,
+      command: spawnOptions.command,
+      args: spawnOptions.args,
+      cwd: spawnOptions.cwd ?? opts.cwd,
       env: spawnOptions.env,
-      stdio: ["pipe", "pipe", "pipe"],
-      // Process-group leader (POSIX), so killing the session reaches tool
-      // children (a running Bash) as well as the CLI.
-      detached: process.platform !== "win32",
     });
+    const exited = createDeferred();
     child = spawned;
-    spawned.once("exit", () => {
-      childExited = true;
-      for (const waiter of exitWaiters) waiter();
-      exitWaiters.clear();
-    });
+    childExit = exited;
+    spawned.once("exit", () => exited.resolve());
     // Always drained: an unread stderr pipe would eventually block the CLI.
     const stderr = createChunkDecoder((text) => {
       stderrTail = (stderrTail + text).slice(-STDERR_TAIL_CHARS);
@@ -467,31 +474,7 @@ export async function createClaudeSession(
     spawnOptions.signal.addEventListener("abort", () => signalProcessTree(spawned, "SIGKILL"), {
       once: true,
     });
-    if (!spawned.stdin || !spawned.stdout) {
-      throw new Error("Claude process was spawned without stdio pipes");
-    }
-    const stdin = spawned.stdin;
-    const stdout = spawned.stdout;
-    return {
-      stdin,
-      stdout,
-      get killed() {
-        return spawned.killed;
-      },
-      get exitCode() {
-        return spawned.exitCode;
-      },
-      get signalCode() {
-        return spawned.signalCode;
-      },
-      kill(signal) {
-        signalProcessTree(spawned, signal);
-        return true;
-      },
-      on: spawned.on.bind(spawned) as SpawnedProcess["on"],
-      once: spawned.once.bind(spawned) as SpawnedProcess["once"],
-      off: spawned.off.bind(spawned) as SpawnedProcess["off"],
-    };
+    return toSpawnedProcess(spawned);
   };
 
   const onElicitation: NonNullable<Options["onElicitation"]> = (request, { signal }) => {
@@ -510,93 +493,19 @@ export async function createClaudeSession(
   };
   const runtime = queryFn({ prompt: input.iterable, options });
 
-  /** The last status seen, kept for the next turn: the process may not repeat
-   * its init line, and a server's error comes from `mcpServerStatus` alone. */
-  let mcpStatuses: McpServerStatusInfo[] | undefined;
-  let mcpStatusInFlight = false;
-  let mcpPollTimer: ReturnType<typeof setTimeout> | undefined;
-
-  const emitMcpStatus = (): void => {
-    const callbacks = active?.callbacks;
-    const snapshot = mcpStatuses;
-    if (!callbacks?.onMcpStatus || !snapshot) return;
-    safeCallback(() => callbacks.onMcpStatus?.(snapshot.map((status) => ({ ...status }))));
-  };
-  const updateMcpStatus = (next: McpServerStatusInfo[]): void => {
-    if (JSON.stringify(next) === JSON.stringify(mcpStatuses)) return;
-    mcpStatuses = next;
-    emitMcpStatus();
-  };
-  const stopMcpPoll = (): void => {
-    if (mcpPollTimer) clearTimeout(mcpPollTimer);
-    mcpPollTimer = undefined;
-  };
-  /** Best effort: a call that fails or stalls leaves the snapshot as it was. */
-  const refreshMcpStatus = async (): Promise<void> => {
-    const turn = active;
-    if (!turn?.callbacks.onMcpStatus || !runtime.mcpServerStatus || mcpStatusInFlight) return;
-    mcpStatusInFlight = true;
-    let stall: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const servers = await Promise.race([
-        runtime.mcpServerStatus(),
-        new Promise<never>((_resolve, reject) => {
-          stall = setTimeout(() => reject(new Error("timed out")), MCP_STATUS_TIMEOUT_MS);
-          stall.unref?.();
-        }),
-      ]);
-      if (active === turn) updateMcpStatus(claudeMcpStatuses(servers, mcpStatuses));
-    } catch {
-      // Status must never affect the turn.
-    } finally {
-      if (stall) clearTimeout(stall);
-      mcpStatusInFlight = false;
-    }
-    // A newer turn was turned away while this call was out, and needs its own.
-    if (active && active !== turn) {
-      void refreshMcpStatus();
-      return;
-    }
-    if (
-      active === turn
-      && Date.now() < turn.mcpPollDeadline
-      && mcpStatuses?.some(({ status }) => status === "connecting")
-    ) {
-      stopMcpPoll();
-      mcpPollTimer = setTimeout(() => void refreshMcpStatus(), MCP_STATUS_POLL_MS);
-      mcpPollTimer.unref?.();
-    }
-  };
+  const mcpStatus = createClaudeMcpStatus(runtime, () => active);
 
   const killTree = (): Promise<void> => {
     const current = child;
-    if (!current || childExited) return Promise.resolve();
-    return new Promise<void>((resolve) => {
-      let killTimer: ReturnType<typeof setTimeout> | undefined;
-      let giveUpTimer: ReturnType<typeof setTimeout> | undefined;
-      const done = (): void => {
-        if (killTimer) clearTimeout(killTimer);
-        if (giveUpTimer) clearTimeout(giveUpTimer);
-        exitWaiters.delete(done);
-        resolve();
-      };
-      exitWaiters.add(done);
-      signalProcessTree(current, "SIGTERM");
-      killTimer = setTimeout(() => {
-        signalProcessTree(current, "SIGKILL");
-        // A process that ignores even SIGKILL (a zombie the OS has not reaped)
-        // must not hang close() forever.
-        giveUpTimer = setTimeout(done, SIGTERM_GRACE_MS);
-        giveUpTimer.unref?.();
-      }, SIGTERM_GRACE_MS);
-      killTimer.unref?.();
-    });
+    const exited = childExit;
+    if (!current || !exited || exited.settled) return Promise.resolve();
+    return terminateTree((signal) => signalProcessTree(current, signal), exited, { unref: true });
   };
 
   const interruptionError = (turn: ActiveTurn): Error =>
     turn.interruption === "timeout"
-      ? new TimeoutError(`claude run timed out after ${turn.timeoutMs}ms`)
-      : new AbortError("claude run aborted");
+      ? runTimedOut("claude", turn.timeoutMs)
+      : runAborted("claude");
 
   let closing: Promise<void> | undefined;
   let closeReason: Error | undefined;
@@ -623,15 +532,13 @@ export async function createClaudeSession(
    * can't say in time. Best effort: a size is never worth failing a turn. */
   const measureContext = async (): Promise<TokenUsage | undefined> => {
     if (!runtime.getContextUsage) return undefined;
-    let stall: ReturnType<typeof setTimeout> | undefined;
     try {
-      const measured = await Promise.race([
-        runtime.getContextUsage({ detail: "full" }),
-        new Promise<never>((_resolve, reject) => {
-          stall = setTimeout(() => reject(new Error("timed out")), CONTEXT_MEASURE_TIMEOUT_MS);
-          stall.unref?.();
-        }),
-      ]);
+      const measured = await raceTimeout(
+        [runtime.getContextUsage({ detail: "full" })],
+        CONTEXT_MEASURE_TIMEOUT_MS,
+        () => new Error("timed out"),
+        { unref: true },
+      );
       const total = measured.totalTokens;
       if (typeof total !== "number" || !Number.isFinite(total) || total <= 0) return undefined;
       // The init line's model keeps its window marker (`[1m]`); the answer's
@@ -640,21 +547,13 @@ export async function createClaudeSession(
       const reported = typeof measured.maxTokens === "number" && measured.maxTokens > 0
         ? measured.maxTokens
         : undefined;
-      const contextWindow = (model !== undefined ? sessionState.contextWindows.get(model) : undefined)
-        ?? contextWindowForModel(model)
-        ?? reported;
-      return {
-        contextTokens: Math.round(total),
-        inputTokens: 0,
-        cachedInputTokens: 0,
-        outputTokens: 0,
-        ...(model ? { model } : {}),
-        ...(contextWindow !== undefined ? { contextWindow } : {}),
-      };
+      return tokenUsage(
+        { contextTokens: Math.round(total), inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+        model,
+        knownContextWindow(sessionState, model) ?? reported,
+      );
     } catch {
       return undefined;
-    } finally {
-      if (stall) clearTimeout(stall);
     }
   };
 
@@ -690,12 +589,10 @@ export async function createClaudeSession(
     if (turn.interruption) {
       turn.reject(interruptionError(turn));
     } else {
-      const usage = measured ?? outcome.usage;
       turn.resolve({
         text: outcome.text,
         exitCode: outcome.isError ? 1 : 0,
-        ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
-        ...(usage !== undefined ? { usage } : {}),
+        ...withoutUndefined({ sessionId: outcome.sessionId, usage: measured ?? outcome.usage }),
       });
     }
     // A stopped turn ends the process once the CLI has finished the interrupt
@@ -733,8 +630,7 @@ export async function createClaudeSession(
           && message.subtype === "init"
           && Array.isArray(message.mcp_servers)
         ) {
-          updateMcpStatus(claudeMcpStatuses(message.mcp_servers, mcpStatuses));
-          void refreshMcpStatus();
+          mcpStatus.fromInit(message.mcp_servers);
         }
         turn.translator.handle(message);
         if (turn.translator.echoedPromptUuid) cliEchoesPromptUuid = true;
@@ -767,7 +663,7 @@ export async function createClaudeSession(
     if (closed) return Promise.reject(closeReason ?? new Error("Claude session is closed"));
     if (active) return Promise.reject(new Error("Claude session already has an active turn"));
     const { prompt, signal, timeoutMs, ...callbacks } = turnOptions;
-    if (signal?.aborted) return Promise.reject(new AbortError("claude run aborted"));
+    if (signal?.aborted) return Promise.reject(runAborted("claude"));
 
     return new Promise<RunResult>((resolve, reject) => {
       let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
@@ -777,7 +673,7 @@ export async function createClaudeSession(
         if (graceTimer) clearTimeout(graceTimer);
         if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
         signal?.removeEventListener("abort", onAbort);
-        stopMcpPoll();
+        mcpStatus.stopPoll();
         turn.elicitations.abort();
       };
       // Stamped so the turn's result can be told apart from one the CLI
@@ -835,18 +731,9 @@ export async function createClaudeSession(
         timeoutTimer = setTimeout(() => interrupt("timeout"), timeoutMs);
       }
       active = turn;
-      // A first turn hears from the init line instead: asking before the CLI
-      // is up would only sit waiting.
-      if (mcpStatuses) {
-        emitMcpStatus();
-        void refreshMcpStatus();
-      }
-      input.push({
-        type: "user",
-        message: { role: "user", content: prompt },
-        parent_tool_use_id: null,
-        uuid: promptUuid,
-      });
+      input.push(userMessage(prompt, promptUuid));
+      // After the prompt: a status callback that steers queues behind it.
+      mcpStatus.turnStarted();
     });
   };
 
@@ -880,14 +767,8 @@ export async function createClaudeSession(
       }
       const uuid = randomUUID();
       turn.translator.expectUserMessage(uuid);
-      input.push({
-        type: "user",
-        message: { role: "user", content: prompt },
-        parent_tool_use_id: null,
-        uuid,
-        // Read between tool rounds of the running turn, not held until it ends.
-        priority: "next",
-      });
+      // Read between tool rounds of the running turn, not held until it ends.
+      input.push(userMessage(prompt, uuid, "next"));
       return Promise.resolve();
     },
     onClose(handler) {

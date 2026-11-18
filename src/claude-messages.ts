@@ -1,10 +1,15 @@
 import {
   isRecord,
+  isTerminalAgentStatus,
   normalizeSummary,
+  optionalString,
   planCompletionSummary,
+  planItem,
   safeCallback,
   toContextWindow,
+  toPlanItems,
   toTokenCount,
+  withoutUndefined,
 } from "./internal.js";
 import type {
   AgentCallbacks,
@@ -13,7 +18,7 @@ import type {
   CompactionInfo,
   ToolPlanItem,
 } from "./types.js";
-import { contextWindowForModel, type TokenUsage } from "./usage.js";
+import { contextWindowForModel, tokenUsage, type TokenUsage } from "./usage.js";
 
 interface ClaudeContentBlock {
   type: string;
@@ -83,18 +88,15 @@ function claudeTodoPlanItems(
   name: string,
   input: Record<string, unknown> | undefined,
 ): ToolPlanItem[] | undefined {
-  if (name !== "TodoWrite" || !input || !Array.isArray(input.todos)) return undefined;
-  const items: ToolPlanItem[] = [];
-  for (const raw of input.todos) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-    const record = raw as Record<string, unknown>;
-    const text = normalizeSummary(record.content) ?? normalizeSummary(record.activeForm);
-    const status = normalizeSummary(record.status)?.toLowerCase().replace(/\s+/g, "_");
-    if (!text || !status) return undefined;
-    items.push({ text, status });
-  }
-  return items.length > 0 ? items : undefined;
+  if (name !== "TodoWrite" || !input) return undefined;
+  return toPlanItems(input.todos, (todo) => planItem(
+    normalizeSummary(todo.content) ?? normalizeSummary(todo.activeForm),
+    todo.status,
+  ));
 }
+
+/** The tools that start a subagent. */
+const AGENT_TOOL_NAMES: ReadonlySet<string> = new Set(["Agent", "Task"]);
 
 /** The `usage` block on a Claude `assistant` message and the `result` event.
  * `cache_read_input_tokens` are prior context replayed from cache;
@@ -211,14 +213,12 @@ function toClaudeUsage(
   const input = toTokenCount(usage.input_tokens);
   const cacheRead = toTokenCount(usage.cache_read_input_tokens);
   const cacheCreation = toTokenCount(usage.cache_creation_input_tokens);
-  return {
+  return tokenUsage({
     contextTokens: input + cacheRead + cacheCreation,
     inputTokens: input,
     cachedInputTokens: cacheRead,
     outputTokens: toTokenCount(usage.output_tokens),
-    ...(model ? { model } : {}),
-    ...(contextWindow !== undefined ? { contextWindow } : {}),
-  };
+  }, model, contextWindow);
 }
 
 /** Drop a Claude model id's `[...]` variant marker so `claude-opus-4-8` (from
@@ -362,6 +362,16 @@ export function createClaudeSessionState(): ClaudeSessionState {
   return { contextWindows: new Map() };
 }
 
+/** The window a result reported for the model this session, else a guess
+ * from its id. */
+export function knownContextWindow(
+  session: ClaudeSessionState,
+  model: string | undefined,
+): number | undefined {
+  return (model !== undefined ? session.contextWindows.get(model) : undefined)
+    ?? contextWindowForModel(model);
+}
+
 /** The prompt uuids a `result` names, or undefined when it names none. */
 function namedPromptUuids(parsed: StreamLine): string[] | undefined {
   const named: string[] = [];
@@ -383,11 +393,6 @@ export function createClaudeTurnTranslator(
 ): ClaudeTurnTranslator {
   const { promptUuid } = options;
   const session = options.session ?? createClaudeSessionState();
-  /** The window a result reported for the model this session, else a guess
-   * from its id. */
-  const knownContextWindow = (model: string | undefined): number | undefined =>
-    (model !== undefined ? session.contextWindows.get(model) : undefined)
-      ?? contextWindowForModel(model);
   /** The prompt, then every steer, in the order the CLI received them. */
   const expected: string[] = promptUuid !== undefined ? [promptUuid] : [];
   /** How many of {@link expected} some `result` has answered. A result that
@@ -462,12 +467,10 @@ export function createClaudeTurnTranslator(
     const named = namedPromptUuids(parsed);
     if (named) return !named.some((uuid) => expected.includes(uuid));
     if (resultSeen) return false;
-    if (options.cliEchoesPromptUuid || echoedPromptUuid) return true;
+    if (echoesPromptUuid()) return true;
     // A CLI that does not echo: an empty success before the prompt produced
     // anything is the CLI settling a task left over from an earlier process.
-    const failed = parsed.is_error === true
-      || (typeof parsed.subtype === "string" && parsed.subtype !== "success");
-    return !failed && !outputSeen && !parsed.result;
+    return !resultFailed(parsed) && !outputSeen && !parsed.result;
   };
   const emitBackgroundAgent = (agent: BackgroundAgentInfo): void => {
     backgroundAgents.set(agent.id, agent);
@@ -486,308 +489,324 @@ export function createClaudeTurnTranslator(
     safeCallback(() => callbacks.onSessionId?.(id));
   };
 
-const handle = (message: unknown): void => {
-  if (!isRecord(message)) return;
-  const parsed = message as StreamLine;
-    // Checked first: with --include-partial-messages these outnumber every
-    // other line type by an order of magnitude.
-    if (parsed.type === "stream_event") {
-      // Subagent prose streams through the parent's stdout tagged with the
-      // spawning tool call — it belongs to that agent, not this transcript.
-      if (parsed.parent_tool_use_id) return;
-      const delta = parsed.event?.type === "content_block_delta"
-        ? parsed.event.delta
-        : undefined;
-      if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
-        const text = delta.text;
-        safeCallback(() => callbacks.onAssistantTextDelta?.(text));
-      }
-      return;
-    }
-    if (parsed.type === "system" && parsed.subtype === "compact_boundary") {
-      // A subagent compacting its own context leaves the turn's alone.
-      if (parsed.parent_tool_use_id) return;
-      const metadata: Record<string, unknown> = isRecord(parsed.compact_metadata)
-        ? parsed.compact_metadata
-        : {};
-      const preTokens = optionalTokenCount(metadata.pre_tokens);
-      const postTokens = optionalTokenCount(metadata.post_tokens);
-      compacted = true;
-      // The conversation's own doing, though no assistant message says so: a
-      // CLI that does not echo prompt uuids must not read this turn's empty
-      // result as a leftover.
-      outputSeen = true;
-      // Every size measured so far describes the history just replaced. Only
-      // a request made after the boundary says how full the context is now.
-      lastMessageUsage = undefined;
-      lastUsage = undefined;
-      const info: CompactionInfo = {
-        trigger: metadata.trigger === "auto" ? "auto" : "manual",
-        ...(preTokens !== undefined ? { preTokens } : {}),
-        ...(postTokens !== undefined ? { postTokens } : {}),
-      };
-      safeCallback(() => callbacks.onCompaction?.(info));
-      return;
-    }
-    if (parsed.type === "system" && parsed.subtype === "init") {
-      if (resultSeen) answeringQueued = true;
-      if (typeof parsed.model === "string" && parsed.model) session.model = parsed.model;
-      if (parsed.session_id) emitSessionId(parsed.session_id);
-      return;
-    }
-    if (
-      parsed.type === "system"
-      && parsed.subtype === "task_started"
-      && typeof parsed.task_id === "string"
-    ) {
-      // Every task — a background Bash or Monitor as much as a subagent — is
-      // live until it settles, so the host can tell a turn that leaves work
-      // running behind it.
-      liveTaskIds.add(parsed.task_id);
-      const isAgent = parsed.task_type === "local_agent"
-        || parsed.task_type === "remote_agent"
-        || (typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id));
-      if (!isAgent) return;
-      liveAgentTaskIds.add(parsed.task_id);
-      const now = Date.now();
-      emitBackgroundAgent({
-        id: parsed.task_id,
-        provider: "claude",
-        ...(typeof parsed.tool_use_id === "string"
-          ? { parentToolCallId: parsed.tool_use_id }
-          : {}),
-        ...(typeof parsed.description === "string"
-          ? { description: parsed.description }
-          : {}),
-        ...(typeof parsed.task_type === "string" ? { agentType: parsed.task_type } : {}),
-        status: "running",
-        startedAt: now,
-        updatedAt: now,
-      });
-      return;
-    }
-    if (
-      parsed.type === "system"
-      && parsed.subtype === "task_progress"
-      && typeof parsed.task_id === "string"
-    ) {
-      const current = backgroundAgents.get(parsed.task_id);
-      if (!current) return;
-      const usage = parsed.usage;
-      const progress = {
-        ...(current.progress ?? {}),
-        ...(typeof usage?.total_tokens === "number" ? { totalTokens: usage.total_tokens } : {}),
-        ...(typeof usage?.tool_uses === "number" ? { toolUses: usage.tool_uses } : {}),
-        ...(typeof usage?.duration_ms === "number" ? { durationMs: usage.duration_ms } : {}),
-        ...(typeof parsed.last_tool_name === "string"
-          ? { lastToolName: parsed.last_tool_name }
-          : {}),
-      };
-      emitBackgroundAgent({
-        ...current,
-        ...(typeof parsed.tool_use_id === "string"
-          ? { parentToolCallId: parsed.tool_use_id }
-          : {}),
-        ...(typeof parsed.description === "string"
-          ? { description: parsed.description }
-          : {}),
-        ...(typeof parsed.subagent_type === "string"
-          ? { agentType: parsed.subagent_type }
-          : {}),
-        ...(typeof parsed.summary === "string" ? { summary: parsed.summary } : {}),
-        ...(Object.keys(progress).length > 0 ? { progress } : {}),
-        // A trailing progress rollup can arrive after the terminal
-        // task_updated; it must not resurrect a finished agent.
-        status: current.status === "completed"
-          || current.status === "failed"
-          || current.status === "interrupted"
-          ? current.status
-          : "running",
-        updatedAt: Date.now(),
-      });
-      return;
-    }
-    if (
-      parsed.type === "system"
-      && parsed.subtype === "task_updated"
-      && typeof parsed.task_id === "string"
-    ) {
-      if (isTerminalTaskStatus(parsed.patch?.status)) settleTask(parsed.task_id);
-      const current = backgroundAgents.get(parsed.task_id);
-      if (!current || !parsed.patch) return;
-      const status = claudeBackgroundAgentStatus(parsed.patch.status) ?? current.status;
-      const now = Date.now();
-      emitBackgroundAgent({
-        ...current,
-        ...(typeof parsed.patch.description === "string"
-          ? { description: parsed.patch.description }
-          : {}),
-        ...(typeof parsed.patch.error === "string" ? { error: parsed.patch.error } : {}),
-        status,
-        updatedAt: now,
-        ...((status === "completed" || status === "failed" || status === "interrupted")
-          ? {
-              endedAt: current.endedAt
-                ?? (typeof parsed.patch.end_time === "number" ? parsed.patch.end_time : now),
-            }
-          : {}),
-      });
-      return;
-    }
-    if (
-      parsed.type === "system"
-      && parsed.subtype === "task_notification"
-      && typeof parsed.task_id === "string"
-    ) {
-      if (isTerminalTaskStatus(parsed.status)) {
-        notifyTask(parsed.task_id, typeof parsed.run_id === "string" ? parsed.run_id : undefined);
-      }
-      return;
-    }
-    if (parsed.type === "assistant" && parsed.message?.content) {
-      const texts: string[] = [];
-      for (const block of parsed.message.content) {
-        if (block.type === "text" && typeof block.text === "string") {
-          texts.push(block.text);
-        } else if (block.type === "tool_use" && typeof block.name === "string") {
-          if (
-            (block.name === "Agent" || block.name === "Task")
-            && typeof block.id === "string"
-          ) {
-            agentToolCallIds.add(block.id);
-          }
-          const planItems = claudeTodoPlanItems(block.name, block.input);
-          const summary = planItems
-            ? planCompletionSummary(planItems)
-            : summarizeClaudeTool(block.name, block.input);
-          const info = {
-            ...(typeof block.id === "string" ? { callId: block.id } : {}),
-            name: block.name,
-            ...(summary !== undefined ? { summary } : {}),
-            ...(block.input ? { input: block.input } : {}),
-            ...(planItems ? { planItems } : {}),
-            ...(parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}),
-          };
-          safeCallback(() => callbacks.onToolUse?.(info));
-        }
-      }
-      // Subagent prose belongs to the subagent, not this transcript —
-      // matching the delta stream, which drops subagent fragments, so
-      // fragments always concatenate to the next completed message. Its
-      // tool calls above still belong in the parent transcript.
-      if (!parsed.parent_tool_use_id) outputSeen = true;
-      if (texts.length > 0 && !parsed.parent_tool_use_id) {
-        const text = texts.join("");
-        lastAssistantText = text;
-        safeCallback(() => callbacks.onAssistantText?.(text));
-      }
-      // A subagent also runs on its own context window; its usage says
-      // nothing about how full this turn's is.
-      if (parsed.parent_tool_use_id) return;
-      const model = qualifyModel(parsed.message.model, session.model);
-      // Track the responding model even on messages without usage, so the
-      // result event can attribute usage to it rather than the largest-window
-      // model in a multi-model turn.
-      if (model) lastAssistantModel = model;
-      if (parsed.message.usage) {
-        // Live window is what an earlier result reported for the model, else
-        // a guess from its id; the `result` event corrects it with the
-        // authoritative modelUsage window.
-        lastMessageUsage = parsed.message.usage;
-        emitUsage(
-          toClaudeUsage(parsed.message.usage, model, knownContextWindow(model)),
-        );
-      }
-      return;
-    }
-    // A user message's content may be plain text, which answers no call.
-    if (parsed.type === "user" && Array.isArray(parsed.message?.content)) {
-      const results = parsed.message.content.filter(
-        (block): block is ClaudeContentBlock & { tool_use_id: string } =>
-          block.type === "tool_result" && typeof block.tool_use_id === "string",
-      );
-      // The structured output belongs to the message, so it is only one
-      // call's when the message answers one call.
-      const structured = results.length === 1 && parsed.tool_use_result !== undefined
-        ? { structured: parsed.tool_use_result }
-        : {};
-      for (const block of results) {
-        const result = {
-          callId: block.tool_use_id,
-          content: block.content,
-          ...(typeof block.is_error === "boolean" ? { isError: block.is_error } : {}),
-          ...structured,
-          ...(parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}),
-        };
-        safeCallback(() => callbacks.onToolResult?.(result));
-      }
-      return;
-    }
-    if (parsed.type === "result") {
-      if (namedPromptUuids(parsed)) echoedPromptUuid = true;
-      if (isForeignResult(parsed)) return;
-      // Remembered whether or not this result reports usage, so the next
-      // turn's live window is the one Claude Code really runs the model at.
-      for (const [key, entry] of Object.entries(parsed.modelUsage ?? {})) {
-        if (!entry || typeof entry !== "object") continue;
-        const window = toContextWindow(entry.contextWindow);
-        if (window !== undefined) session.contextWindows.set(key, window);
-      }
-      // A follow-up that answers a notification with nothing to add leaves
-      // the turn's last words in place.
-      const followUp = resultSeen;
-      resultSeen = true;
-      followUpPending = false;
-      answeringQueued = false;
-      if (parsed.origin?.kind === "task-notification" && typeof parsed.origin.runId === "string") {
-        owedRuns.delete(parsed.origin.runId);
-        notifiedMidAnswer.delete(parsed.origin.runId);
-      }
-      const named = namedPromptUuids(parsed);
-      if (named) {
-        const last = Math.max(...named.map((uuid) => expected.indexOf(uuid)));
-        answeredCount = Math.max(answeredCount, last + 1);
-      } else if (options.cliEchoesPromptUuid || echoedPromptUuid) {
-        // An echoing CLI names what it answers; this one answers a subagent's
-        // notification, which leaves any steer still owed.
-        answeredCount = Math.max(answeredCount, 1);
-      } else {
-        answeredCount = expected.length;
-      }
-      if (parsed.session_id) emitSessionId(parsed.session_id);
-      if (typeof parsed.result === "string" && (!followUp || parsed.result)) {
-        resultText = parsed.result;
-      }
-      isError = parsed.is_error === true
-        || (typeof parsed.subtype === "string" && parsed.subtype !== "success");
-      errors = Array.isArray(parsed.errors)
-        ? parsed.errors.filter((entry): entry is string => typeof entry === "string")
-        : [];
-      // The result event's usage sums every request in the turn, so it does
-      // not describe context occupancy on a multi-request turn — the last
-      // per-message usage does. Take only the authoritative model/window
-      // from here, falling back to the summed counts when no message carried
-      // usage (then the turn had a single request and they coincide).
-      // A result with no reply before it — a turn stopped before any output —
-      // counts nothing, and reporting that would zero the host's occupancy.
-      // Nor after a compaction: summed across it, they describe nothing.
-      const occupancy = lastMessageUsage
-        ?? (!compacted && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : undefined);
-      if (occupancy) {
-        // Without a reply to name the model, the session's own beats the
-        // largest-window guess: Claude Code's helper calls (Haiku) appear in
-        // modelUsage too, first, and can tie on window.
-        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? session.model);
-        const model = primary?.model ?? lastAssistantModel;
-        const contextWindow =
-          primary?.contextWindow ?? knownContextWindow(model);
-        emitUsage(toClaudeUsage(occupancy, model, contextWindow));
-      }
+  /** A failed turn: an error subtype, or an API error the CLI reported as
+   * the success subtype's text. */
+  const resultFailed = (parsed: StreamLine): boolean =>
+    parsed.is_error === true
+    || (typeof parsed.subtype === "string" && parsed.subtype !== "success");
+
+  /** This CLI names, on each result, the prompts it answers. */
+  const echoesPromptUuid = (): boolean =>
+    options.cliEchoesPromptUuid === true || echoedPromptUuid;
+
+  const handleStreamEvent = (parsed: StreamLine): void => {
+    // Subagent prose streams through the parent's stdout tagged with the
+    // spawning tool call — it belongs to that agent, not this transcript.
+    if (parsed.parent_tool_use_id) return;
+    const delta = parsed.event?.type === "content_block_delta"
+      ? parsed.event.delta
+      : undefined;
+    if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+      const text = delta.text;
+      safeCallback(() => callbacks.onAssistantTextDelta?.(text));
     }
   };
 
+  const handleCompactBoundary = (parsed: StreamLine): void => {
+    // A subagent compacting its own context leaves the turn's alone.
+    if (parsed.parent_tool_use_id) return;
+    const metadata: Record<string, unknown> = isRecord(parsed.compact_metadata)
+      ? parsed.compact_metadata
+      : {};
+    const preTokens = optionalTokenCount(metadata.pre_tokens);
+    const postTokens = optionalTokenCount(metadata.post_tokens);
+    compacted = true;
+    // The conversation's own doing, though no assistant message says so: a
+    // CLI that does not echo prompt uuids must not read this turn's empty
+    // result as a leftover.
+    outputSeen = true;
+    // Every size measured so far describes the history just replaced. Only
+    // a request made after the boundary says how full the context is now.
+    lastMessageUsage = undefined;
+    lastUsage = undefined;
+    const info: CompactionInfo = {
+      trigger: metadata.trigger === "auto" ? "auto" : "manual",
+      ...(preTokens !== undefined ? { preTokens } : {}),
+      ...(postTokens !== undefined ? { postTokens } : {}),
+    };
+    safeCallback(() => callbacks.onCompaction?.(info));
+  };
+
+  const handleInit = (parsed: StreamLine): void => {
+    if (resultSeen) answeringQueued = true;
+    if (typeof parsed.model === "string" && parsed.model) session.model = parsed.model;
+    if (parsed.session_id) emitSessionId(parsed.session_id);
+  };
+
+  const handleTaskStarted = (parsed: StreamLine, taskId: string): void => {
+    // Every task — a background Bash or Monitor as much as a subagent — is
+    // live until it settles, so the host can tell a turn that leaves work
+    // running behind it.
+    liveTaskIds.add(taskId);
+    const isAgent = parsed.task_type === "local_agent"
+      || parsed.task_type === "remote_agent"
+      || (typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id));
+    if (!isAgent) return;
+    liveAgentTaskIds.add(taskId);
+    const now = Date.now();
+    emitBackgroundAgent({
+      id: taskId,
+      provider: "claude",
+      ...withoutUndefined({
+        parentToolCallId: optionalString(parsed.tool_use_id),
+        description: optionalString(parsed.description),
+        agentType: optionalString(parsed.task_type),
+      }),
+      status: "running",
+      startedAt: now,
+      updatedAt: now,
+    });
+  };
+
+  const handleTaskProgress = (parsed: StreamLine, taskId: string): void => {
+    const current = backgroundAgents.get(taskId);
+    if (!current) return;
+    const usage = parsed.usage;
+    const progress = {
+      ...(current.progress ?? {}),
+      ...(typeof usage?.total_tokens === "number" ? { totalTokens: usage.total_tokens } : {}),
+      ...(typeof usage?.tool_uses === "number" ? { toolUses: usage.tool_uses } : {}),
+      ...(typeof usage?.duration_ms === "number" ? { durationMs: usage.duration_ms } : {}),
+      ...(typeof parsed.last_tool_name === "string"
+        ? { lastToolName: parsed.last_tool_name }
+        : {}),
+    };
+    emitBackgroundAgent({
+      ...current,
+      ...withoutUndefined({
+        parentToolCallId: optionalString(parsed.tool_use_id),
+        description: optionalString(parsed.description),
+        agentType: optionalString(parsed.subagent_type),
+        summary: optionalString(parsed.summary),
+      }),
+      ...(Object.keys(progress).length > 0 ? { progress } : {}),
+      // A trailing progress rollup can arrive after the terminal
+      // task_updated; it must not resurrect a finished agent.
+      status: isTerminalAgentStatus(current.status) ? current.status : "running",
+      updatedAt: Date.now(),
+    });
+  };
+
+  const handleTaskUpdated = (parsed: StreamLine, taskId: string): void => {
+    const patch = parsed.patch;
+    if (isTerminalTaskStatus(patch?.status)) settleTask(taskId);
+    const current = backgroundAgents.get(taskId);
+    if (!current || !patch) return;
+    const status = claudeBackgroundAgentStatus(patch.status) ?? current.status;
+    const now = Date.now();
+    emitBackgroundAgent({
+      ...current,
+      ...withoutUndefined({
+        description: optionalString(patch.description),
+        error: optionalString(patch.error),
+      }),
+      status,
+      updatedAt: now,
+      ...(isTerminalAgentStatus(status)
+        ? {
+            endedAt: current.endedAt
+              ?? (typeof patch.end_time === "number" ? patch.end_time : now),
+          }
+        : {}),
+    });
+  };
+
+  const handleSystem = (parsed: StreamLine): void => {
+    switch (parsed.subtype) {
+      case "compact_boundary":
+        return handleCompactBoundary(parsed);
+      case "init":
+        return handleInit(parsed);
+    }
+    const taskId = parsed.task_id;
+    if (typeof taskId !== "string") return;
+    switch (parsed.subtype) {
+      case "task_started":
+        return handleTaskStarted(parsed, taskId);
+      case "task_progress":
+        return handleTaskProgress(parsed, taskId);
+      case "task_updated":
+        return handleTaskUpdated(parsed, taskId);
+      case "task_notification":
+        if (isTerminalTaskStatus(parsed.status)) notifyTask(taskId, optionalString(parsed.run_id));
+        return;
+    }
+  };
+
+  const handleAssistant = (parsed: StreamLine): void => {
+    const message = parsed.message;
+    if (!message?.content) return;
+    const texts: string[] = [];
+    for (const block of message.content) {
+      if (block.type === "text" && typeof block.text === "string") {
+        texts.push(block.text);
+      } else if (block.type === "tool_use" && typeof block.name === "string") {
+        if (AGENT_TOOL_NAMES.has(block.name) && typeof block.id === "string") {
+          agentToolCallIds.add(block.id);
+        }
+        const planItems = claudeTodoPlanItems(block.name, block.input);
+        const summary = planItems
+          ? planCompletionSummary(planItems)
+          : summarizeClaudeTool(block.name, block.input);
+        const info = {
+          ...(typeof block.id === "string" ? { callId: block.id } : {}),
+          name: block.name,
+          ...(summary !== undefined ? { summary } : {}),
+          ...(block.input ? { input: block.input } : {}),
+          ...(planItems ? { planItems } : {}),
+          ...(parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}),
+        };
+        safeCallback(() => callbacks.onToolUse?.(info));
+      }
+    }
+    // Subagent prose belongs to the subagent, not this transcript —
+    // matching the delta stream, which drops subagent fragments, so
+    // fragments always concatenate to the next completed message. Its
+    // tool calls above still belong in the parent transcript.
+    if (!parsed.parent_tool_use_id) outputSeen = true;
+    if (texts.length > 0 && !parsed.parent_tool_use_id) {
+      const text = texts.join("");
+      lastAssistantText = text;
+      safeCallback(() => callbacks.onAssistantText?.(text));
+    }
+    // A subagent also runs on its own context window; its usage says
+    // nothing about how full this turn's is.
+    if (parsed.parent_tool_use_id) return;
+    const model = qualifyModel(message.model, session.model);
+    // Track the responding model even on messages without usage, so the
+    // result event can attribute usage to it rather than the largest-window
+    // model in a multi-model turn.
+    if (model) lastAssistantModel = model;
+    if (message.usage) {
+      // Live window is what an earlier result reported for the model, else
+      // a guess from its id; the `result` event corrects it with the
+      // authoritative modelUsage window.
+      lastMessageUsage = message.usage;
+      emitUsage(toClaudeUsage(message.usage, model, knownContextWindow(session, model)));
+    }
+  };
+
+  const handleUser = (parsed: StreamLine): void => {
+    // A user message's content may be plain text, which answers no call.
+    const content = parsed.message?.content;
+    if (!Array.isArray(content)) return;
+    const results = content.filter(
+      (block): block is ClaudeContentBlock & { tool_use_id: string } =>
+        block.type === "tool_result" && typeof block.tool_use_id === "string",
+    );
+    // The structured output belongs to the message, so it is only one
+    // call's when the message answers one call.
+    const structured = results.length === 1 && parsed.tool_use_result !== undefined
+      ? { structured: parsed.tool_use_result }
+      : {};
+    for (const block of results) {
+      const result = {
+        callId: block.tool_use_id,
+        content: block.content,
+        ...(typeof block.is_error === "boolean" ? { isError: block.is_error } : {}),
+        ...structured,
+        ...(parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}),
+      };
+      safeCallback(() => callbacks.onToolResult?.(result));
+    }
+  };
+
+  const handleResult = (parsed: StreamLine): void => {
+    if (namedPromptUuids(parsed)) echoedPromptUuid = true;
+    if (isForeignResult(parsed)) return;
+    // Remembered whether or not this result reports usage, so the next
+    // turn's live window is the one Claude Code really runs the model at.
+    for (const [key, entry] of Object.entries(parsed.modelUsage ?? {})) {
+      if (!entry || typeof entry !== "object") continue;
+      const window = toContextWindow(entry.contextWindow);
+      if (window !== undefined) session.contextWindows.set(key, window);
+    }
+    // A follow-up that answers a notification with nothing to add leaves
+    // the turn's last words in place.
+    const followUp = resultSeen;
+    resultSeen = true;
+    followUpPending = false;
+    answeringQueued = false;
+    if (parsed.origin?.kind === "task-notification" && typeof parsed.origin.runId === "string") {
+      owedRuns.delete(parsed.origin.runId);
+      notifiedMidAnswer.delete(parsed.origin.runId);
+    }
+    const named = namedPromptUuids(parsed);
+    if (named) {
+      const last = Math.max(...named.map((uuid) => expected.indexOf(uuid)));
+      answeredCount = Math.max(answeredCount, last + 1);
+    } else if (echoesPromptUuid()) {
+      // An echoing CLI names what it answers; this one answers a subagent's
+      // notification, which leaves any steer still owed.
+      answeredCount = Math.max(answeredCount, 1);
+    } else {
+      answeredCount = expected.length;
+    }
+    if (parsed.session_id) emitSessionId(parsed.session_id);
+    if (typeof parsed.result === "string" && (!followUp || parsed.result)) {
+      resultText = parsed.result;
+    }
+    isError = resultFailed(parsed);
+    errors = Array.isArray(parsed.errors)
+      ? parsed.errors.filter((entry): entry is string => typeof entry === "string")
+      : [];
+    // The result event's usage sums every request in the turn, so it does
+    // not describe context occupancy on a multi-request turn — the last
+    // per-message usage does. Take only the authoritative model/window
+    // from here, falling back to the summed counts when no message carried
+    // usage (then the turn had a single request and they coincide).
+    // A result with no reply before it — a turn stopped before any output —
+    // counts nothing, and reporting that would zero the host's occupancy.
+    // Nor after a compaction: summed across it, they describe nothing.
+    const occupancy = lastMessageUsage
+      ?? (!compacted && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : undefined);
+    if (occupancy) {
+      // Without a reply to name the model, the session's own beats the
+      // largest-window guess: Claude Code's helper calls (Haiku) appear in
+      // modelUsage too, first, and can tie on window.
+      const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? session.model);
+      const model = primary?.model ?? lastAssistantModel;
+      const contextWindow =
+        primary?.contextWindow ?? knownContextWindow(session, model);
+      emitUsage(toClaudeUsage(occupancy, model, contextWindow));
+    }
+  };
+
+  const handle = (message: unknown): void => {
+    if (!isRecord(message)) return;
+    const parsed = message as StreamLine;
+    switch (parsed.type) {
+      // First: with --include-partial-messages these outnumber every other
+      // line type by an order of magnitude.
+      case "stream_event":
+        return handleStreamEvent(parsed);
+      case "system":
+        return handleSystem(parsed);
+      case "assistant":
+        return handleAssistant(parsed);
+      case "user":
+        return handleUser(parsed);
+      case "result":
+        return handleResult(parsed);
+    }
+  };
 
   const allAnswered = (): boolean => answeredCount >= expected.length;
+  /** The turn's own result is in and no subagent it started is still live. */
+  const agentsSettled = (): boolean => resultSeen && liveAgentTaskIds.size === 0;
+  /** The CLI still owes a result: a subagent's answer, or a steer's. */
+  const owesFollowUp = (): boolean =>
+    followUpPending || owedTasks.size > 0 || owedRuns.size > 0 || !allAnswered();
 
   return {
     handle,
@@ -795,18 +814,16 @@ const handle = (message: unknown): void => {
       expected.push(uuid);
     },
     get done() {
-      return resultSeen && allAnswered() && liveAgentTaskIds.size === 0 && !followUpPending
-        && owedTasks.size === 0 && owedRuns.size === 0;
+      return agentsSettled() && !owesFollowUp();
     },
     get resultSeen() {
       return resultSeen;
     },
     get awaitingFollowUp() {
-      return resultSeen && liveAgentTaskIds.size === 0
-        && (followUpPending || owedTasks.size > 0 || owedRuns.size > 0 || !allAnswered());
+      return agentsSettled() && owesFollowUp();
     },
     get followUpMayBeAbsorbed() {
-      return resultSeen && liveAgentTaskIds.size === 0 && !followUpPending && allAnswered()
+      return agentsSettled() && !followUpPending && allAnswered()
         && !answeringQueued && owedTasks.size === 0 && owedRuns.size > 0
         && [...owedRuns].every((runId) => notifiedMidAnswer.has(runId));
     },

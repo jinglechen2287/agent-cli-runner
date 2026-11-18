@@ -1256,6 +1256,46 @@ describe("createClaudeSession MCP status", () => {
     await session.close();
   });
 
+  it("queues a steer made from the turn-start status after the turn's own prompt", async () => {
+    const fake = makeFakeQuery();
+    fake.mcpServerStatus.mockImplementation(() => new Promise(() => {}));
+    const session = await startSession(fake);
+    const first = session.runTurn({ prompt: "one", onMcpStatus: () => {} });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([{ name: "docs", status: "connected" }]));
+    fake.emit(result("done"));
+    await first;
+
+    let steered = false;
+    const second = session.runTurn({
+      prompt: "two",
+      onMcpStatus: () => {
+        if (steered) return;
+        steered = true;
+        void session.steer({ prompt: "also" });
+      },
+    });
+    await fake.waitForPrompt(3);
+    expect(fake.prompts).toEqual(["one", "two", "also"]);
+    fake.emit(result("done"));
+    await session.close();
+    await second.catch(() => {});
+  });
+
+  it("reports only the statuses it knows", async () => {
+    const fake = makeFakeQuery();
+    fake.mcpServerStatus.mockImplementation(() => new Promise(() => {}));
+    const session = await startSession(fake);
+    const snapshots: unknown[] = [];
+    const turn = session.runTurn({ prompt: "x", onMcpStatus: (servers) => snapshots.push(servers) });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([{ name: "odd", status: "constructor" }, { name: "docs", status: "connected" }]));
+    await vi.waitFor(() => expect(snapshots).toEqual([[{ name: "docs", status: "connected" }]]));
+    fake.emit(result("done"));
+    await turn;
+    await session.close();
+  });
+
   it("hands the next turn an empty server list at its start", async () => {
     const fake = makeFakeQuery();
     // The second turn's own refresh never answers, so only the kept list can reach it.

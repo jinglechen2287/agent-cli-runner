@@ -24,6 +24,9 @@ function answerMcpElicitation(callback, request, signals) {
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+function optionalString(value) {
+  return typeof value === "string" ? value : void 0;
+}
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -114,6 +117,91 @@ function toTokenCount(value) {
 }
 function toContextWindow(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : void 0;
+}
+
+// src/claude-mcp-status.ts
+var MCP_STATUS_TIMEOUT_MS = 5e3;
+var MCP_STATUS_POLL_MS = 2e3;
+var MCP_STATUS_POLL_LIMIT_MS = 3e4;
+var CLAUDE_MCP_STATUSES = {
+  pending: "connecting",
+  connected: "connected",
+  failed: "failed",
+  "needs-auth": "needs-auth",
+  disabled: "disabled"
+};
+function claudeMcpStatuses(servers, known = []) {
+  return servers.flatMap((server) => {
+    if (!isRecord(server) || typeof server.name !== "string" || typeof server.status !== "string") {
+      return [];
+    }
+    if (!Object.hasOwn(CLAUDE_MCP_STATUSES, server.status)) return [];
+    const status = CLAUDE_MCP_STATUSES[server.status];
+    if (!status) return [];
+    const stated = typeof server.error === "string" && server.error ? server.error : void 0;
+    const previous = known.find((entry) => entry.name === server.name && entry.status === status);
+    const error = stated ?? previous?.error;
+    return [{ name: server.name, status, ...error ? { error } : {} }];
+  });
+}
+function createClaudeMcpStatus(runtime, activeTurn) {
+  let mcpStatuses;
+  let mcpStatusInFlight = false;
+  let mcpPollTimer;
+  const emitMcpStatus = () => {
+    const callbacks = activeTurn()?.callbacks;
+    const snapshot = mcpStatuses;
+    if (!callbacks?.onMcpStatus || !snapshot) return;
+    safeCallback(() => callbacks.onMcpStatus?.(snapshot.map((status) => ({ ...status }))));
+  };
+  const updateMcpStatus = (next) => {
+    if (JSON.stringify(next) === JSON.stringify(mcpStatuses)) return;
+    mcpStatuses = next;
+    emitMcpStatus();
+  };
+  const stopPoll = () => {
+    if (mcpPollTimer) clearTimeout(mcpPollTimer);
+    mcpPollTimer = void 0;
+  };
+  const refreshMcpStatus = async () => {
+    const turn = activeTurn();
+    if (!turn?.callbacks.onMcpStatus || !runtime.mcpServerStatus || mcpStatusInFlight) return;
+    mcpStatusInFlight = true;
+    try {
+      const servers = await raceTimeout(
+        [runtime.mcpServerStatus()],
+        MCP_STATUS_TIMEOUT_MS,
+        () => new Error("timed out"),
+        { unref: true }
+      );
+      if (activeTurn() === turn) updateMcpStatus(claudeMcpStatuses(servers, mcpStatuses));
+    } catch {
+    } finally {
+      mcpStatusInFlight = false;
+    }
+    const active = activeTurn();
+    if (active && active !== turn) {
+      void refreshMcpStatus();
+      return;
+    }
+    if (active === turn && Date.now() < turn.mcpPollDeadline && mcpStatuses?.some(({ status }) => status === "connecting")) {
+      stopPoll();
+      mcpPollTimer = setTimeout(() => void refreshMcpStatus(), MCP_STATUS_POLL_MS);
+      mcpPollTimer.unref?.();
+    }
+  };
+  return {
+    fromInit(servers) {
+      updateMcpStatus(claudeMcpStatuses(servers, mcpStatuses));
+      void refreshMcpStatus();
+    },
+    turnStarted() {
+      if (!mcpStatuses) return;
+      emitMcpStatus();
+      void refreshMcpStatus();
+    },
+    stopPoll
+  };
 }
 
 // src/usage.ts
@@ -235,18 +323,13 @@ function summarizeClaudeTool(name, input) {
   }
 }
 function claudeTodoPlanItems(name, input) {
-  if (name !== "TodoWrite" || !input || !Array.isArray(input.todos)) return void 0;
-  const items = [];
-  for (const raw of input.todos) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return void 0;
-    const record2 = raw;
-    const text2 = normalizeSummary(record2.content) ?? normalizeSummary(record2.activeForm);
-    const status = normalizeSummary(record2.status)?.toLowerCase().replace(/\s+/g, "_");
-    if (!text2 || !status) return void 0;
-    items.push({ text: text2, status });
-  }
-  return items.length > 0 ? items : void 0;
+  if (name !== "TodoWrite" || !input) return void 0;
+  return toPlanItems(input.todos, (todo) => planItem(
+    normalizeSummary(todo.content) ?? normalizeSummary(todo.activeForm),
+    todo.status
+  ));
 }
+var AGENT_TOOL_NAMES = /* @__PURE__ */ new Set(["Agent", "Task"]);
 function claudeBackgroundAgentStatus(status) {
   switch (status) {
     case "pending":
@@ -268,14 +351,12 @@ function toClaudeUsage(usage, model, contextWindow) {
   const input = toTokenCount(usage.input_tokens);
   const cacheRead = toTokenCount(usage.cache_read_input_tokens);
   const cacheCreation = toTokenCount(usage.cache_creation_input_tokens);
-  return {
+  return tokenUsage({
     contextTokens: input + cacheRead + cacheCreation,
     inputTokens: input,
     cachedInputTokens: cacheRead,
-    outputTokens: toTokenCount(usage.output_tokens),
-    ...model ? { model } : {},
-    ...contextWindow !== void 0 ? { contextWindow } : {}
-  };
+    outputTokens: toTokenCount(usage.output_tokens)
+  }, model, contextWindow);
 }
 function baseModelId(model) {
   return model.replace(/\[[^\]]*\]$/, "");
@@ -311,6 +392,9 @@ function isTerminalTaskStatus(status) {
 function createClaudeSessionState() {
   return { contextWindows: /* @__PURE__ */ new Map() };
 }
+function knownContextWindow(session, model) {
+  return (model !== void 0 ? session.contextWindows.get(model) : void 0) ?? contextWindowForModel(model);
+}
 function namedPromptUuids(parsed) {
   const named = [];
   if (typeof parsed.user_message_uuid === "string") named.push(parsed.user_message_uuid);
@@ -324,7 +408,6 @@ function namedPromptUuids(parsed) {
 function createClaudeTurnTranslator(callbacks, options = {}) {
   const { promptUuid } = options;
   const session = options.session ?? createClaudeSessionState();
-  const knownContextWindow = (model) => (model !== void 0 ? session.contextWindows.get(model) : void 0) ?? contextWindowForModel(model);
   const expected = promptUuid !== void 0 ? [promptUuid] : [];
   let answeredCount = 0;
   let resultSeen = false;
@@ -369,9 +452,8 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
     const named = namedPromptUuids(parsed);
     if (named) return !named.some((uuid) => expected.includes(uuid));
     if (resultSeen) return false;
-    if (options.cliEchoesPromptUuid || echoedPromptUuid) return true;
-    const failed = parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
-    return !failed && !outputSeen && !parsed.result;
+    if (echoesPromptUuid()) return true;
+    return !resultFailed(parsed) && !outputSeen && !parsed.result;
   };
   const emitBackgroundAgent = (agent) => {
     backgroundAgents.set(agent.id, agent);
@@ -387,221 +469,255 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
     sessionIdEmitted = true;
     safeCallback(() => callbacks.onSessionId?.(id));
   };
+  const resultFailed = (parsed) => parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
+  const echoesPromptUuid = () => options.cliEchoesPromptUuid === true || echoedPromptUuid;
+  const handleStreamEvent = (parsed) => {
+    if (parsed.parent_tool_use_id) return;
+    const delta = parsed.event?.type === "content_block_delta" ? parsed.event.delta : void 0;
+    if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+      const text2 = delta.text;
+      safeCallback(() => callbacks.onAssistantTextDelta?.(text2));
+    }
+  };
+  const handleCompactBoundary = (parsed) => {
+    if (parsed.parent_tool_use_id) return;
+    const metadata = isRecord(parsed.compact_metadata) ? parsed.compact_metadata : {};
+    const preTokens = optionalTokenCount(metadata.pre_tokens);
+    const postTokens = optionalTokenCount(metadata.post_tokens);
+    compacted = true;
+    outputSeen = true;
+    lastMessageUsage = void 0;
+    lastUsage = void 0;
+    const info = {
+      trigger: metadata.trigger === "auto" ? "auto" : "manual",
+      ...preTokens !== void 0 ? { preTokens } : {},
+      ...postTokens !== void 0 ? { postTokens } : {}
+    };
+    safeCallback(() => callbacks.onCompaction?.(info));
+  };
+  const handleInit = (parsed) => {
+    if (resultSeen) answeringQueued = true;
+    if (typeof parsed.model === "string" && parsed.model) session.model = parsed.model;
+    if (parsed.session_id) emitSessionId(parsed.session_id);
+  };
+  const handleTaskStarted = (parsed, taskId) => {
+    liveTaskIds.add(taskId);
+    const isAgent = parsed.task_type === "local_agent" || parsed.task_type === "remote_agent" || typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id);
+    if (!isAgent) return;
+    liveAgentTaskIds.add(taskId);
+    const now = Date.now();
+    emitBackgroundAgent({
+      id: taskId,
+      provider: "claude",
+      ...withoutUndefined({
+        parentToolCallId: optionalString(parsed.tool_use_id),
+        description: optionalString(parsed.description),
+        agentType: optionalString(parsed.task_type)
+      }),
+      status: "running",
+      startedAt: now,
+      updatedAt: now
+    });
+  };
+  const handleTaskProgress = (parsed, taskId) => {
+    const current = backgroundAgents.get(taskId);
+    if (!current) return;
+    const usage = parsed.usage;
+    const progress = {
+      ...current.progress ?? {},
+      ...typeof usage?.total_tokens === "number" ? { totalTokens: usage.total_tokens } : {},
+      ...typeof usage?.tool_uses === "number" ? { toolUses: usage.tool_uses } : {},
+      ...typeof usage?.duration_ms === "number" ? { durationMs: usage.duration_ms } : {},
+      ...typeof parsed.last_tool_name === "string" ? { lastToolName: parsed.last_tool_name } : {}
+    };
+    emitBackgroundAgent({
+      ...current,
+      ...withoutUndefined({
+        parentToolCallId: optionalString(parsed.tool_use_id),
+        description: optionalString(parsed.description),
+        agentType: optionalString(parsed.subagent_type),
+        summary: optionalString(parsed.summary)
+      }),
+      ...Object.keys(progress).length > 0 ? { progress } : {},
+      // A trailing progress rollup can arrive after the terminal
+      // task_updated; it must not resurrect a finished agent.
+      status: isTerminalAgentStatus(current.status) ? current.status : "running",
+      updatedAt: Date.now()
+    });
+  };
+  const handleTaskUpdated = (parsed, taskId) => {
+    const patch = parsed.patch;
+    if (isTerminalTaskStatus(patch?.status)) settleTask(taskId);
+    const current = backgroundAgents.get(taskId);
+    if (!current || !patch) return;
+    const status = claudeBackgroundAgentStatus(patch.status) ?? current.status;
+    const now = Date.now();
+    emitBackgroundAgent({
+      ...current,
+      ...withoutUndefined({
+        description: optionalString(patch.description),
+        error: optionalString(patch.error)
+      }),
+      status,
+      updatedAt: now,
+      ...isTerminalAgentStatus(status) ? {
+        endedAt: current.endedAt ?? (typeof patch.end_time === "number" ? patch.end_time : now)
+      } : {}
+    });
+  };
+  const handleSystem = (parsed) => {
+    switch (parsed.subtype) {
+      case "compact_boundary":
+        return handleCompactBoundary(parsed);
+      case "init":
+        return handleInit(parsed);
+    }
+    const taskId = parsed.task_id;
+    if (typeof taskId !== "string") return;
+    switch (parsed.subtype) {
+      case "task_started":
+        return handleTaskStarted(parsed, taskId);
+      case "task_progress":
+        return handleTaskProgress(parsed, taskId);
+      case "task_updated":
+        return handleTaskUpdated(parsed, taskId);
+      case "task_notification":
+        if (isTerminalTaskStatus(parsed.status)) notifyTask(taskId, optionalString(parsed.run_id));
+        return;
+    }
+  };
+  const handleAssistant = (parsed) => {
+    const message = parsed.message;
+    if (!message?.content) return;
+    const texts = [];
+    for (const block of message.content) {
+      if (block.type === "text" && typeof block.text === "string") {
+        texts.push(block.text);
+      } else if (block.type === "tool_use" && typeof block.name === "string") {
+        if (AGENT_TOOL_NAMES.has(block.name) && typeof block.id === "string") {
+          agentToolCallIds.add(block.id);
+        }
+        const planItems2 = claudeTodoPlanItems(block.name, block.input);
+        const summary = planItems2 ? planCompletionSummary(planItems2) : summarizeClaudeTool(block.name, block.input);
+        const info = {
+          ...typeof block.id === "string" ? { callId: block.id } : {},
+          name: block.name,
+          ...summary !== void 0 ? { summary } : {},
+          ...block.input ? { input: block.input } : {},
+          ...planItems2 ? { planItems: planItems2 } : {},
+          ...parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}
+        };
+        safeCallback(() => callbacks.onToolUse?.(info));
+      }
+    }
+    if (!parsed.parent_tool_use_id) outputSeen = true;
+    if (texts.length > 0 && !parsed.parent_tool_use_id) {
+      const text2 = texts.join("");
+      lastAssistantText = text2;
+      safeCallback(() => callbacks.onAssistantText?.(text2));
+    }
+    if (parsed.parent_tool_use_id) return;
+    const model = qualifyModel(message.model, session.model);
+    if (model) lastAssistantModel = model;
+    if (message.usage) {
+      lastMessageUsage = message.usage;
+      emitUsage(toClaudeUsage(message.usage, model, knownContextWindow(session, model)));
+    }
+  };
+  const handleUser = (parsed) => {
+    const content = parsed.message?.content;
+    if (!Array.isArray(content)) return;
+    const results = content.filter(
+      (block) => block.type === "tool_result" && typeof block.tool_use_id === "string"
+    );
+    const structured = results.length === 1 && parsed.tool_use_result !== void 0 ? { structured: parsed.tool_use_result } : {};
+    for (const block of results) {
+      const result = {
+        callId: block.tool_use_id,
+        content: block.content,
+        ...typeof block.is_error === "boolean" ? { isError: block.is_error } : {},
+        ...structured,
+        ...parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}
+      };
+      safeCallback(() => callbacks.onToolResult?.(result));
+    }
+  };
+  const handleResult = (parsed) => {
+    if (namedPromptUuids(parsed)) echoedPromptUuid = true;
+    if (isForeignResult(parsed)) return;
+    for (const [key, entry] of Object.entries(parsed.modelUsage ?? {})) {
+      if (!entry || typeof entry !== "object") continue;
+      const window = toContextWindow(entry.contextWindow);
+      if (window !== void 0) session.contextWindows.set(key, window);
+    }
+    const followUp = resultSeen;
+    resultSeen = true;
+    followUpPending = false;
+    answeringQueued = false;
+    if (parsed.origin?.kind === "task-notification" && typeof parsed.origin.runId === "string") {
+      owedRuns.delete(parsed.origin.runId);
+      notifiedMidAnswer.delete(parsed.origin.runId);
+    }
+    const named = namedPromptUuids(parsed);
+    if (named) {
+      const last = Math.max(...named.map((uuid) => expected.indexOf(uuid)));
+      answeredCount = Math.max(answeredCount, last + 1);
+    } else if (echoesPromptUuid()) {
+      answeredCount = Math.max(answeredCount, 1);
+    } else {
+      answeredCount = expected.length;
+    }
+    if (parsed.session_id) emitSessionId(parsed.session_id);
+    if (typeof parsed.result === "string" && (!followUp || parsed.result)) {
+      resultText = parsed.result;
+    }
+    isError = resultFailed(parsed);
+    errors = Array.isArray(parsed.errors) ? parsed.errors.filter((entry) => typeof entry === "string") : [];
+    const occupancy = lastMessageUsage ?? (!compacted && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : void 0);
+    if (occupancy) {
+      const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? session.model);
+      const model = primary?.model ?? lastAssistantModel;
+      const contextWindow = primary?.contextWindow ?? knownContextWindow(session, model);
+      emitUsage(toClaudeUsage(occupancy, model, contextWindow));
+    }
+  };
   const handle = (message) => {
     if (!isRecord(message)) return;
     const parsed = message;
-    if (parsed.type === "stream_event") {
-      if (parsed.parent_tool_use_id) return;
-      const delta = parsed.event?.type === "content_block_delta" ? parsed.event.delta : void 0;
-      if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
-        const text2 = delta.text;
-        safeCallback(() => callbacks.onAssistantTextDelta?.(text2));
-      }
-      return;
-    }
-    if (parsed.type === "system" && parsed.subtype === "compact_boundary") {
-      if (parsed.parent_tool_use_id) return;
-      const metadata = isRecord(parsed.compact_metadata) ? parsed.compact_metadata : {};
-      const preTokens = optionalTokenCount(metadata.pre_tokens);
-      const postTokens = optionalTokenCount(metadata.post_tokens);
-      compacted = true;
-      outputSeen = true;
-      lastMessageUsage = void 0;
-      lastUsage = void 0;
-      const info = {
-        trigger: metadata.trigger === "auto" ? "auto" : "manual",
-        ...preTokens !== void 0 ? { preTokens } : {},
-        ...postTokens !== void 0 ? { postTokens } : {}
-      };
-      safeCallback(() => callbacks.onCompaction?.(info));
-      return;
-    }
-    if (parsed.type === "system" && parsed.subtype === "init") {
-      if (resultSeen) answeringQueued = true;
-      if (typeof parsed.model === "string" && parsed.model) session.model = parsed.model;
-      if (parsed.session_id) emitSessionId(parsed.session_id);
-      return;
-    }
-    if (parsed.type === "system" && parsed.subtype === "task_started" && typeof parsed.task_id === "string") {
-      liveTaskIds.add(parsed.task_id);
-      const isAgent = parsed.task_type === "local_agent" || parsed.task_type === "remote_agent" || typeof parsed.tool_use_id === "string" && agentToolCallIds.has(parsed.tool_use_id);
-      if (!isAgent) return;
-      liveAgentTaskIds.add(parsed.task_id);
-      const now = Date.now();
-      emitBackgroundAgent({
-        id: parsed.task_id,
-        provider: "claude",
-        ...typeof parsed.tool_use_id === "string" ? { parentToolCallId: parsed.tool_use_id } : {},
-        ...typeof parsed.description === "string" ? { description: parsed.description } : {},
-        ...typeof parsed.task_type === "string" ? { agentType: parsed.task_type } : {},
-        status: "running",
-        startedAt: now,
-        updatedAt: now
-      });
-      return;
-    }
-    if (parsed.type === "system" && parsed.subtype === "task_progress" && typeof parsed.task_id === "string") {
-      const current = backgroundAgents.get(parsed.task_id);
-      if (!current) return;
-      const usage = parsed.usage;
-      const progress = {
-        ...current.progress ?? {},
-        ...typeof usage?.total_tokens === "number" ? { totalTokens: usage.total_tokens } : {},
-        ...typeof usage?.tool_uses === "number" ? { toolUses: usage.tool_uses } : {},
-        ...typeof usage?.duration_ms === "number" ? { durationMs: usage.duration_ms } : {},
-        ...typeof parsed.last_tool_name === "string" ? { lastToolName: parsed.last_tool_name } : {}
-      };
-      emitBackgroundAgent({
-        ...current,
-        ...typeof parsed.tool_use_id === "string" ? { parentToolCallId: parsed.tool_use_id } : {},
-        ...typeof parsed.description === "string" ? { description: parsed.description } : {},
-        ...typeof parsed.subagent_type === "string" ? { agentType: parsed.subagent_type } : {},
-        ...typeof parsed.summary === "string" ? { summary: parsed.summary } : {},
-        ...Object.keys(progress).length > 0 ? { progress } : {},
-        // A trailing progress rollup can arrive after the terminal
-        // task_updated; it must not resurrect a finished agent.
-        status: current.status === "completed" || current.status === "failed" || current.status === "interrupted" ? current.status : "running",
-        updatedAt: Date.now()
-      });
-      return;
-    }
-    if (parsed.type === "system" && parsed.subtype === "task_updated" && typeof parsed.task_id === "string") {
-      if (isTerminalTaskStatus(parsed.patch?.status)) settleTask(parsed.task_id);
-      const current = backgroundAgents.get(parsed.task_id);
-      if (!current || !parsed.patch) return;
-      const status = claudeBackgroundAgentStatus(parsed.patch.status) ?? current.status;
-      const now = Date.now();
-      emitBackgroundAgent({
-        ...current,
-        ...typeof parsed.patch.description === "string" ? { description: parsed.patch.description } : {},
-        ...typeof parsed.patch.error === "string" ? { error: parsed.patch.error } : {},
-        status,
-        updatedAt: now,
-        ...status === "completed" || status === "failed" || status === "interrupted" ? {
-          endedAt: current.endedAt ?? (typeof parsed.patch.end_time === "number" ? parsed.patch.end_time : now)
-        } : {}
-      });
-      return;
-    }
-    if (parsed.type === "system" && parsed.subtype === "task_notification" && typeof parsed.task_id === "string") {
-      if (isTerminalTaskStatus(parsed.status)) {
-        notifyTask(parsed.task_id, typeof parsed.run_id === "string" ? parsed.run_id : void 0);
-      }
-      return;
-    }
-    if (parsed.type === "assistant" && parsed.message?.content) {
-      const texts = [];
-      for (const block of parsed.message.content) {
-        if (block.type === "text" && typeof block.text === "string") {
-          texts.push(block.text);
-        } else if (block.type === "tool_use" && typeof block.name === "string") {
-          if ((block.name === "Agent" || block.name === "Task") && typeof block.id === "string") {
-            agentToolCallIds.add(block.id);
-          }
-          const planItems2 = claudeTodoPlanItems(block.name, block.input);
-          const summary = planItems2 ? planCompletionSummary(planItems2) : summarizeClaudeTool(block.name, block.input);
-          const info = {
-            ...typeof block.id === "string" ? { callId: block.id } : {},
-            name: block.name,
-            ...summary !== void 0 ? { summary } : {},
-            ...block.input ? { input: block.input } : {},
-            ...planItems2 ? { planItems: planItems2 } : {},
-            ...parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}
-          };
-          safeCallback(() => callbacks.onToolUse?.(info));
-        }
-      }
-      if (!parsed.parent_tool_use_id) outputSeen = true;
-      if (texts.length > 0 && !parsed.parent_tool_use_id) {
-        const text2 = texts.join("");
-        lastAssistantText = text2;
-        safeCallback(() => callbacks.onAssistantText?.(text2));
-      }
-      if (parsed.parent_tool_use_id) return;
-      const model = qualifyModel(parsed.message.model, session.model);
-      if (model) lastAssistantModel = model;
-      if (parsed.message.usage) {
-        lastMessageUsage = parsed.message.usage;
-        emitUsage(
-          toClaudeUsage(parsed.message.usage, model, knownContextWindow(model))
-        );
-      }
-      return;
-    }
-    if (parsed.type === "user" && Array.isArray(parsed.message?.content)) {
-      const results = parsed.message.content.filter(
-        (block) => block.type === "tool_result" && typeof block.tool_use_id === "string"
-      );
-      const structured = results.length === 1 && parsed.tool_use_result !== void 0 ? { structured: parsed.tool_use_result } : {};
-      for (const block of results) {
-        const result = {
-          callId: block.tool_use_id,
-          content: block.content,
-          ...typeof block.is_error === "boolean" ? { isError: block.is_error } : {},
-          ...structured,
-          ...parsed.parent_tool_use_id ? { parentToolCallId: parsed.parent_tool_use_id } : {}
-        };
-        safeCallback(() => callbacks.onToolResult?.(result));
-      }
-      return;
-    }
-    if (parsed.type === "result") {
-      if (namedPromptUuids(parsed)) echoedPromptUuid = true;
-      if (isForeignResult(parsed)) return;
-      for (const [key, entry] of Object.entries(parsed.modelUsage ?? {})) {
-        if (!entry || typeof entry !== "object") continue;
-        const window = toContextWindow(entry.contextWindow);
-        if (window !== void 0) session.contextWindows.set(key, window);
-      }
-      const followUp = resultSeen;
-      resultSeen = true;
-      followUpPending = false;
-      answeringQueued = false;
-      if (parsed.origin?.kind === "task-notification" && typeof parsed.origin.runId === "string") {
-        owedRuns.delete(parsed.origin.runId);
-        notifiedMidAnswer.delete(parsed.origin.runId);
-      }
-      const named = namedPromptUuids(parsed);
-      if (named) {
-        const last = Math.max(...named.map((uuid) => expected.indexOf(uuid)));
-        answeredCount = Math.max(answeredCount, last + 1);
-      } else if (options.cliEchoesPromptUuid || echoedPromptUuid) {
-        answeredCount = Math.max(answeredCount, 1);
-      } else {
-        answeredCount = expected.length;
-      }
-      if (parsed.session_id) emitSessionId(parsed.session_id);
-      if (typeof parsed.result === "string" && (!followUp || parsed.result)) {
-        resultText = parsed.result;
-      }
-      isError = parsed.is_error === true || typeof parsed.subtype === "string" && parsed.subtype !== "success";
-      errors = Array.isArray(parsed.errors) ? parsed.errors.filter((entry) => typeof entry === "string") : [];
-      const occupancy = lastMessageUsage ?? (!compacted && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : void 0);
-      if (occupancy) {
-        const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? session.model);
-        const model = primary?.model ?? lastAssistantModel;
-        const contextWindow = primary?.contextWindow ?? knownContextWindow(model);
-        emitUsage(toClaudeUsage(occupancy, model, contextWindow));
-      }
+    switch (parsed.type) {
+      // First: with --include-partial-messages these outnumber every other
+      // line type by an order of magnitude.
+      case "stream_event":
+        return handleStreamEvent(parsed);
+      case "system":
+        return handleSystem(parsed);
+      case "assistant":
+        return handleAssistant(parsed);
+      case "user":
+        return handleUser(parsed);
+      case "result":
+        return handleResult(parsed);
     }
   };
   const allAnswered = () => answeredCount >= expected.length;
+  const agentsSettled = () => resultSeen && liveAgentTaskIds.size === 0;
+  const owesFollowUp = () => followUpPending || owedTasks.size > 0 || owedRuns.size > 0 || !allAnswered();
   return {
     handle,
     expectUserMessage(uuid) {
       expected.push(uuid);
     },
     get done() {
-      return resultSeen && allAnswered() && liveAgentTaskIds.size === 0 && !followUpPending && owedTasks.size === 0 && owedRuns.size === 0;
+      return agentsSettled() && !owesFollowUp();
     },
     get resultSeen() {
       return resultSeen;
     },
     get awaitingFollowUp() {
-      return resultSeen && liveAgentTaskIds.size === 0 && (followUpPending || owedTasks.size > 0 || owedRuns.size > 0 || !allAnswered());
+      return agentsSettled() && owesFollowUp();
     },
     get followUpMayBeAbsorbed() {
-      return resultSeen && liveAgentTaskIds.size === 0 && !followUpPending && allAnswered() && !answeringQueued && owedTasks.size === 0 && owedRuns.size > 0 && [...owedRuns].every((runId) => notifiedMidAnswer.has(runId));
+      return agentsSettled() && !followUpPending && allAnswered() && !answeringQueued && owedTasks.size === 0 && owedRuns.size > 0 && [...owedRuns].every((runId) => notifiedMidAnswer.has(runId));
     },
     get echoedPromptUuid() {
       return echoedPromptUuid;
@@ -937,29 +1053,6 @@ var CLAUDE_INTERRUPT_GRACE_MS = 5e3;
 var CLAUDE_FOLLOW_UP_GRACE_MS = 6e4;
 var CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS = 5e3;
 var CONTEXT_MEASURE_TIMEOUT_MS = 1e4;
-var MCP_STATUS_TIMEOUT_MS = 5e3;
-var MCP_STATUS_POLL_MS = 2e3;
-var MCP_STATUS_POLL_LIMIT_MS = 3e4;
-var CLAUDE_MCP_STATUSES = {
-  pending: "connecting",
-  connected: "connected",
-  failed: "failed",
-  "needs-auth": "needs-auth",
-  disabled: "disabled"
-};
-function claudeMcpStatuses(servers, known = []) {
-  return servers.flatMap((server) => {
-    if (!isRecord(server) || typeof server.name !== "string" || typeof server.status !== "string") {
-      return [];
-    }
-    const status = CLAUDE_MCP_STATUSES[server.status];
-    if (!status) return [];
-    const stated = typeof server.error === "string" && server.error ? server.error : void 0;
-    const previous = known.find((entry) => entry.name === server.name && entry.status === status);
-    const error = stated ?? previous?.error;
-    return [{ name: server.name, status, ...error ? { error } : {} }];
-  });
-}
 function claudeElicitationRequest(request) {
   const { serverName, message } = request;
   if (request.mode === "url") {
@@ -980,12 +1073,10 @@ function validateSessionOptions(opts) {
       "newSessionId and resumeSessionId are mutually exclusive \u2014 pass one or the other"
     );
   }
-  if (opts.forkSessionId) {
-    if (opts.newSessionId || opts.resumeSessionId) {
-      throw new Error(
-        "forkSessionId is mutually exclusive with newSessionId and resumeSessionId"
-      );
-    }
+  if (opts.forkSessionId && (opts.newSessionId || opts.resumeSessionId)) {
+    throw new Error(
+      "forkSessionId is mutually exclusive with newSessionId and resumeSessionId"
+    );
   }
   if (opts.isolated && opts.resumeSessionId) {
     throw new Error("isolated Claude runs cannot resume a session");
@@ -1050,6 +1141,42 @@ function claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeC
     ...opts.isolated ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } } : opts.forkSessionId ? { persistSession: false } : {}
   };
 }
+function userMessage(prompt, uuid, priority) {
+  return {
+    type: "user",
+    message: { role: "user", content: prompt },
+    parent_tool_use_id: null,
+    uuid,
+    ...priority ? { priority } : {}
+  };
+}
+function toSpawnedProcess(child) {
+  if (!child.stdin || !child.stdout) {
+    throw new Error("Claude process was spawned without stdio pipes");
+  }
+  const stdin = child.stdin;
+  const stdout = child.stdout;
+  return {
+    stdin,
+    stdout,
+    get killed() {
+      return child.killed;
+    },
+    get exitCode() {
+      return child.exitCode;
+    },
+    get signalCode() {
+      return child.signalCode;
+    },
+    kill(signal) {
+      signalProcessTree(child, signal);
+      return true;
+    },
+    on: child.on.bind(child),
+    once: child.once.bind(child),
+    off: child.off.bind(child)
+  };
+}
 function createInputQueue() {
   const pending = [];
   let ended = false;
@@ -1096,30 +1223,24 @@ async function createClaudeSession(opts) {
   const sessionState = createClaudeSessionState();
   let closed = false;
   let child;
-  let childExited = false;
+  let childExit;
   let active;
   let stderrTail = "";
   const closeHandlers = /* @__PURE__ */ new Set();
-  const exitWaiters = /* @__PURE__ */ new Set();
   const input = createInputQueue();
   const spawnClaudeCodeProcess = (spawnOptions) => {
-    const cwd = spawnOptions.cwd ?? opts.cwd;
-    const launch = launchCommand(spawnOptions.command, spawnOptions.args, spawnOptions.env, { cwd });
-    const spawned = spawnFn(launch.command, launch.args, {
-      ...launch.options,
-      cwd,
-      env: spawnOptions.env,
-      stdio: ["pipe", "pipe", "pipe"],
-      // Process-group leader (POSIX), so killing the session reaches tool
-      // children (a running Bash) as well as the CLI.
-      detached: process.platform !== "win32"
+    const spawned = spawnCli({
+      cli: "claude",
+      spawnFn,
+      command: spawnOptions.command,
+      args: spawnOptions.args,
+      cwd: spawnOptions.cwd ?? opts.cwd,
+      env: spawnOptions.env
     });
+    const exited = createDeferred();
     child = spawned;
-    spawned.once("exit", () => {
-      childExited = true;
-      for (const waiter of exitWaiters) waiter();
-      exitWaiters.clear();
-    });
+    childExit = exited;
+    spawned.once("exit", () => exited.resolve());
     const stderr = createChunkDecoder((text2) => {
       stderrTail = (stderrTail + text2).slice(-STDERR_TAIL_CHARS);
       const callbacks = active?.callbacks;
@@ -1130,31 +1251,7 @@ async function createClaudeSession(opts) {
     spawnOptions.signal.addEventListener("abort", () => signalProcessTree(spawned, "SIGKILL"), {
       once: true
     });
-    if (!spawned.stdin || !spawned.stdout) {
-      throw new Error("Claude process was spawned without stdio pipes");
-    }
-    const stdin = spawned.stdin;
-    const stdout = spawned.stdout;
-    return {
-      stdin,
-      stdout,
-      get killed() {
-        return spawned.killed;
-      },
-      get exitCode() {
-        return spawned.exitCode;
-      },
-      get signalCode() {
-        return spawned.signalCode;
-      },
-      kill(signal) {
-        signalProcessTree(spawned, signal);
-        return true;
-      },
-      on: spawned.on.bind(spawned),
-      once: spawned.once.bind(spawned),
-      off: spawned.off.bind(spawned)
-    };
+    return toSpawnedProcess(spawned);
   };
   const onElicitation = (request, { signal }) => {
     const turn = active;
@@ -1170,76 +1267,14 @@ async function createClaudeSession(opts) {
     ...opts.isolated ? {} : { onElicitation }
   };
   const runtime = queryFn({ prompt: input.iterable, options });
-  let mcpStatuses;
-  let mcpStatusInFlight = false;
-  let mcpPollTimer;
-  const emitMcpStatus = () => {
-    const callbacks = active?.callbacks;
-    const snapshot = mcpStatuses;
-    if (!callbacks?.onMcpStatus || !snapshot) return;
-    safeCallback(() => callbacks.onMcpStatus?.(snapshot.map((status) => ({ ...status }))));
-  };
-  const updateMcpStatus = (next) => {
-    if (JSON.stringify(next) === JSON.stringify(mcpStatuses)) return;
-    mcpStatuses = next;
-    emitMcpStatus();
-  };
-  const stopMcpPoll = () => {
-    if (mcpPollTimer) clearTimeout(mcpPollTimer);
-    mcpPollTimer = void 0;
-  };
-  const refreshMcpStatus = async () => {
-    const turn = active;
-    if (!turn?.callbacks.onMcpStatus || !runtime.mcpServerStatus || mcpStatusInFlight) return;
-    mcpStatusInFlight = true;
-    let stall;
-    try {
-      const servers = await Promise.race([
-        runtime.mcpServerStatus(),
-        new Promise((_resolve, reject) => {
-          stall = setTimeout(() => reject(new Error("timed out")), MCP_STATUS_TIMEOUT_MS);
-          stall.unref?.();
-        })
-      ]);
-      if (active === turn) updateMcpStatus(claudeMcpStatuses(servers, mcpStatuses));
-    } catch {
-    } finally {
-      if (stall) clearTimeout(stall);
-      mcpStatusInFlight = false;
-    }
-    if (active && active !== turn) {
-      void refreshMcpStatus();
-      return;
-    }
-    if (active === turn && Date.now() < turn.mcpPollDeadline && mcpStatuses?.some(({ status }) => status === "connecting")) {
-      stopMcpPoll();
-      mcpPollTimer = setTimeout(() => void refreshMcpStatus(), MCP_STATUS_POLL_MS);
-      mcpPollTimer.unref?.();
-    }
-  };
+  const mcpStatus = createClaudeMcpStatus(runtime, () => active);
   const killTree = () => {
     const current = child;
-    if (!current || childExited) return Promise.resolve();
-    return new Promise((resolve) => {
-      let killTimer;
-      let giveUpTimer;
-      const done = () => {
-        if (killTimer) clearTimeout(killTimer);
-        if (giveUpTimer) clearTimeout(giveUpTimer);
-        exitWaiters.delete(done);
-        resolve();
-      };
-      exitWaiters.add(done);
-      signalProcessTree(current, "SIGTERM");
-      killTimer = setTimeout(() => {
-        signalProcessTree(current, "SIGKILL");
-        giveUpTimer = setTimeout(done, SIGTERM_GRACE_MS);
-        giveUpTimer.unref?.();
-      }, SIGTERM_GRACE_MS);
-      killTimer.unref?.();
-    });
+    const exited = childExit;
+    if (!current || !exited || exited.settled) return Promise.resolve();
+    return terminateTree((signal) => signalProcessTree(current, signal), exited, { unref: true });
   };
-  const interruptionError = (turn) => turn.interruption === "timeout" ? new TimeoutError(`claude run timed out after ${turn.timeoutMs}ms`) : new AbortError("claude run aborted");
+  const interruptionError = (turn) => turn.interruption === "timeout" ? runTimedOut("claude", turn.timeoutMs) : runAborted("claude");
   let closing;
   let closeReason;
   const closeWith = (reason) => {
@@ -1261,32 +1296,24 @@ async function createClaudeSession(opts) {
   };
   const measureContext = async () => {
     if (!runtime.getContextUsage) return void 0;
-    let stall;
     try {
-      const measured = await Promise.race([
-        runtime.getContextUsage({ detail: "full" }),
-        new Promise((_resolve, reject) => {
-          stall = setTimeout(() => reject(new Error("timed out")), CONTEXT_MEASURE_TIMEOUT_MS);
-          stall.unref?.();
-        })
-      ]);
+      const measured = await raceTimeout(
+        [runtime.getContextUsage({ detail: "full" })],
+        CONTEXT_MEASURE_TIMEOUT_MS,
+        () => new Error("timed out"),
+        { unref: true }
+      );
       const total = measured.totalTokens;
       if (typeof total !== "number" || !Number.isFinite(total) || total <= 0) return void 0;
       const model = sessionState.model ?? measured.model;
       const reported = typeof measured.maxTokens === "number" && measured.maxTokens > 0 ? measured.maxTokens : void 0;
-      const contextWindow = (model !== void 0 ? sessionState.contextWindows.get(model) : void 0) ?? contextWindowForModel(model) ?? reported;
-      return {
-        contextTokens: Math.round(total),
-        inputTokens: 0,
-        cachedInputTokens: 0,
-        outputTokens: 0,
-        ...model ? { model } : {},
-        ...contextWindow !== void 0 ? { contextWindow } : {}
-      };
+      return tokenUsage(
+        { contextTokens: Math.round(total), inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+        model,
+        knownContextWindow(sessionState, model) ?? reported
+      );
     } catch {
       return void 0;
-    } finally {
-      if (stall) clearTimeout(stall);
     }
   };
   const exitError = (cause) => {
@@ -1314,12 +1341,10 @@ async function createClaudeSession(opts) {
     if (turn.interruption) {
       turn.reject(interruptionError(turn));
     } else {
-      const usage = measured ?? outcome.usage;
       turn.resolve({
         text: outcome.text,
         exitCode: outcome.isError ? 1 : 0,
-        ...outcome.sessionId !== void 0 ? { sessionId: outcome.sessionId } : {},
-        ...usage !== void 0 ? { usage } : {}
+        ...withoutUndefined({ sessionId: outcome.sessionId, usage: measured ?? outcome.usage })
       });
     }
     if (turn.interruption) {
@@ -1343,8 +1368,7 @@ async function createClaudeSession(opts) {
           continue;
         }
         if (isRecord(message) && message.type === "system" && message.subtype === "init" && Array.isArray(message.mcp_servers)) {
-          updateMcpStatus(claudeMcpStatuses(message.mcp_servers, mcpStatuses));
-          void refreshMcpStatus();
+          mcpStatus.fromInit(message.mcp_servers);
         }
         turn.translator.handle(message);
         if (turn.translator.echoedPromptUuid) cliEchoesPromptUuid = true;
@@ -1370,7 +1394,7 @@ async function createClaudeSession(opts) {
     if (closed) return Promise.reject(closeReason ?? new Error("Claude session is closed"));
     if (active) return Promise.reject(new Error("Claude session already has an active turn"));
     const { prompt, signal, timeoutMs, ...callbacks } = turnOptions;
-    if (signal?.aborted) return Promise.reject(new AbortError("claude run aborted"));
+    if (signal?.aborted) return Promise.reject(runAborted("claude"));
     return new Promise((resolve, reject) => {
       let timeoutTimer;
       let graceTimer;
@@ -1379,7 +1403,7 @@ async function createClaudeSession(opts) {
         if (graceTimer) clearTimeout(graceTimer);
         if (turn.followUpTimer) clearTimeout(turn.followUpTimer);
         signal?.removeEventListener("abort", onAbort);
-        stopMcpPoll();
+        mcpStatus.stopPoll();
         turn.elicitations.abort();
       };
       const promptUuid = randomUUID();
@@ -1430,16 +1454,8 @@ async function createClaudeSession(opts) {
         timeoutTimer = setTimeout(() => interrupt("timeout"), timeoutMs);
       }
       active = turn;
-      if (mcpStatuses) {
-        emitMcpStatus();
-        void refreshMcpStatus();
-      }
-      input.push({
-        type: "user",
-        message: { role: "user", content: prompt },
-        parent_tool_use_id: null,
-        uuid: promptUuid
-      });
+      input.push(userMessage(prompt, promptUuid));
+      mcpStatus.turnStarted();
     });
   };
   return {
@@ -1470,14 +1486,7 @@ async function createClaudeSession(opts) {
       }
       const uuid = randomUUID();
       turn.translator.expectUserMessage(uuid);
-      input.push({
-        type: "user",
-        message: { role: "user", content: prompt },
-        parent_tool_use_id: null,
-        uuid,
-        // Read between tool rounds of the running turn, not held until it ends.
-        priority: "next"
-      });
+      input.push(userMessage(prompt, uuid, "next"));
       return Promise.resolve();
     },
     onClose(handler) {
@@ -1522,33 +1531,32 @@ async function runClaude(opts) {
     forkSessionId,
     ...callbacks
   } = opts;
-  if (signal?.aborted) throw new AbortError("claude run aborted");
-  const session = await createClaudeSession({
+  if (signal?.aborted) throw runAborted("claude");
+  const session = await createClaudeSession(withoutUndefined({
     cwd,
-    ...executablePath !== void 0 ? { executablePath } : {},
-    ...env !== void 0 ? { env } : {},
-    ...spawnFn !== void 0 ? { spawnFn } : {},
-    ...queryFn !== void 0 ? { queryFn } : {},
-    ...model !== void 0 ? { model } : {},
-    ...effort !== void 0 ? { effort } : {},
-    ...appendSystemPrompt !== void 0 ? { appendSystemPrompt } : {},
-    ...permissionMode !== void 0 ? { permissionMode } : {},
-    ...disallowedTools !== void 0 ? { disallowedTools } : {},
-    ...tools !== void 0 ? { tools } : {},
-    ...allowedTools !== void 0 ? { allowedTools } : {},
-    ...settingSources !== void 0 ? { settingSources } : {},
-    ...settings !== void 0 ? { settings } : {},
-    ...hooks !== void 0 ? { hooks } : {},
-    ...newSessionId !== void 0 ? { newSessionId } : {},
-    ...resumeSessionId !== void 0 ? { resumeSessionId } : {},
-    ...isolated !== void 0 ? { isolated } : {},
-    ...forkSessionId !== void 0 ? { forkSessionId } : {}
-  });
+    executablePath,
+    env,
+    spawnFn,
+    queryFn,
+    model,
+    effort,
+    appendSystemPrompt,
+    permissionMode,
+    disallowedTools,
+    tools,
+    allowedTools,
+    settingSources,
+    settings,
+    hooks,
+    newSessionId,
+    resumeSessionId,
+    isolated,
+    forkSessionId
+  }));
   try {
     return await session.runTurn({
       prompt,
-      ...signal !== void 0 ? { signal } : {},
-      ...timeoutMs !== void 0 ? { timeoutMs } : {},
+      ...withoutUndefined({ signal, timeoutMs }),
       ...callbacks
     });
   } finally {

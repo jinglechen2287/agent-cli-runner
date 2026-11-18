@@ -426,6 +426,24 @@ describe("createClaudeTurnTranslator", () => {
     );
   });
 
+  it("normalizes a camelCase todo status the way Codex statuses are", () => {
+    const onToolUse = vi.fn();
+    feed({ onToolUse }, [{
+      type: "assistant",
+      message: {
+        content: [{
+          type: "tool_use",
+          id: "t",
+          name: "TodoWrite",
+          input: { todos: [{ content: "Wire endpoint", status: "inProgress" }] },
+        }],
+      },
+    }]);
+    expect(onToolUse).toHaveBeenCalledWith(expect.objectContaining({
+      planItems: [{ text: "Wire endpoint", status: "in_progress" }],
+    }));
+  });
+
   it("leaves an empty TodoWrite without a plan snapshot", () => {
     const onToolUse = vi.fn();
     feed({ onToolUse }, [{

@@ -4,7 +4,8 @@ import {
   type ClaudePermissionMode,
   type ClaudeQueryFn,
 } from "./claude-session.js";
-import { AbortError } from "./errors.js";
+import { runAborted } from "./errors.js";
+import { withoutUndefined } from "./internal.js";
 import type { CommonRunOptions, RunResult } from "./types.js";
 
 export type { ClaudePermissionMode } from "./claude-session.js";
@@ -91,33 +92,32 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     ...callbacks
   } = opts;
   // Checked before the session exists, so an aborted run never spawns.
-  if (signal?.aborted) throw new AbortError("claude run aborted");
-  const session = await createClaudeSession({
+  if (signal?.aborted) throw runAborted("claude");
+  const session = await createClaudeSession(withoutUndefined({
     cwd,
-    ...(executablePath !== undefined ? { executablePath } : {}),
-    ...(env !== undefined ? { env } : {}),
-    ...(spawnFn !== undefined ? { spawnFn } : {}),
-    ...(queryFn !== undefined ? { queryFn } : {}),
-    ...(model !== undefined ? { model } : {}),
-    ...(effort !== undefined ? { effort } : {}),
-    ...(appendSystemPrompt !== undefined ? { appendSystemPrompt } : {}),
-    ...(permissionMode !== undefined ? { permissionMode } : {}),
-    ...(disallowedTools !== undefined ? { disallowedTools } : {}),
-    ...(tools !== undefined ? { tools } : {}),
-    ...(allowedTools !== undefined ? { allowedTools } : {}),
-    ...(settingSources !== undefined ? { settingSources } : {}),
-    ...(settings !== undefined ? { settings } : {}),
-    ...(hooks !== undefined ? { hooks } : {}),
-    ...(newSessionId !== undefined ? { newSessionId } : {}),
-    ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
-    ...(isolated !== undefined ? { isolated } : {}),
-    ...(forkSessionId !== undefined ? { forkSessionId } : {}),
-  });
+    executablePath,
+    env,
+    spawnFn,
+    queryFn,
+    model,
+    effort,
+    appendSystemPrompt,
+    permissionMode,
+    disallowedTools,
+    tools,
+    allowedTools,
+    settingSources,
+    settings,
+    hooks,
+    newSessionId,
+    resumeSessionId,
+    isolated,
+    forkSessionId,
+  }));
   try {
     return await session.runTurn({
       prompt,
-      ...(signal !== undefined ? { signal } : {}),
-      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...withoutUndefined({ signal, timeoutMs }),
       ...callbacks,
     });
   } finally {
