@@ -1,6 +1,4 @@
-import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
-import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
   CODEX_FORK_CONFIG,
@@ -11,53 +9,7 @@ import {
   type CodexAppServerSession,
 } from "../src/index.js";
 import { toolName } from "../src/codex-items.js";
-
-interface FakeChild extends EventEmitter {
-  stdin: PassThrough;
-  stdout: PassThrough;
-  stderr: PassThrough;
-  kill: ReturnType<typeof vi.fn>;
-}
-
-interface RpcMessage {
-  id?: number | undefined;
-  method?: string;
-  params?: Record<string, unknown>;
-  result?: unknown;
-  error?: unknown;
-}
-
-function makeFakeChild(): FakeChild {
-  const child = new EventEmitter() as FakeChild;
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.kill = vi.fn();
-  return child;
-}
-
-function send(child: FakeChild, message: RpcMessage): void {
-  child.stdout.write(`${JSON.stringify(message)}\n`);
-}
-
-function captureRequests(
-  child: FakeChild,
-  handle: (message: RpcMessage) => void,
-): RpcMessage[] {
-  const requests: RpcMessage[] = [];
-  let buffer = "";
-  child.stdin.on("data", (chunk: Buffer | string) => {
-    buffer += chunk.toString();
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const message = JSON.parse(line) as RpcMessage;
-      requests.push(message);
-      handle(message);
-    }
-  });
-  return requests;
-}
+import { captureRequests, makeFakeChild, send, type FakeChild } from "./helpers/fake-child.js";
 
 function completedTurn(id: string, status = "completed") {
   return {

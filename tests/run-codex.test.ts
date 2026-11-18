@@ -1,23 +1,7 @@
-import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCodex } from "../src/index.js";
-
-interface FakeChild extends EventEmitter {
-  stdin: PassThrough;
-  stdout: PassThrough;
-  stderr: PassThrough;
-  kill: ReturnType<typeof vi.fn>;
-}
-
-function makeFakeChild(): FakeChild {
-  const child = new EventEmitter() as FakeChild;
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.kill = vi.fn();
-  return child;
-}
+import { makeFakeChild, type FakeChild } from "./helpers/fake-child.js";
 
 function readAll(stream: PassThrough): Promise<string> {
   return new Promise((resolve) => {

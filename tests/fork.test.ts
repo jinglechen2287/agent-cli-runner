@@ -1,5 +1,3 @@
-import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 
 const sdk = vi.hoisted(() => ({
@@ -13,19 +11,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (original) => ({
 }));
 
 import { AbortError, deleteClaudeSession, forkClaudeSession, forkCodexThread, TimeoutError } from "../src/index.js";
-
-interface FakeChild extends EventEmitter {
-  stdin: PassThrough;
-  stdout: PassThrough;
-  stderr: PassThrough;
-  kill: ReturnType<typeof vi.fn>;
-}
-
-interface RpcMessage {
-  id?: number;
-  method?: string;
-  params?: Record<string, unknown>;
-}
+import { captureRequests, makeFakeChild, send } from "./helpers/fake-child.js";
 
 /** An app-server that answers initialize, and thread/fork as `fork` says;
  * undefined leaves the fork unanswered. `initialize` waits `initDelayMs`, or
@@ -34,31 +20,17 @@ function fakeAppServer(
   fork: (params: Record<string, unknown> | undefined) => unknown,
   timing: { initDelayMs?: number | null; forkDelayMs?: number } = {},
 ) {
-  const child = new EventEmitter() as FakeChild;
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.kill = vi.fn();
-  const requests: RpcMessage[] = [];
-  let buffer = "";
-  const reply = (message: Record<string, unknown>) => child.stdout.write(`${JSON.stringify(message)}\n`);
-  child.stdin.on("data", (chunk: Buffer | string) => {
-    buffer += chunk.toString();
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const message = JSON.parse(line) as RpcMessage;
-      requests.push(message);
-      if (message.method === "initialize" && timing.initDelayMs !== null) {
-        setTimeout(() => reply({ id: message.id, result: {} }), timing.initDelayMs ?? 0);
-      }
-      if (message.method === "thread/fork") {
-        const answer = fork(message.params);
-        setTimeout(() => {
-          if (answer instanceof Error) reply({ id: message.id, error: { code: -32600, message: answer.message } });
-          else if (answer !== undefined) reply({ id: message.id, result: answer });
-        }, timing.forkDelayMs ?? 0);
-      }
+  const child = makeFakeChild();
+  const requests = captureRequests(child, (message) => {
+    if (message.method === "initialize" && timing.initDelayMs !== null) {
+      setTimeout(() => send(child, { id: message.id, result: {} }), timing.initDelayMs ?? 0);
+    }
+    if (message.method === "thread/fork") {
+      const answer = fork(message.params);
+      setTimeout(() => {
+        if (answer instanceof Error) send(child, { id: message.id, error: { code: -32600, message: answer.message } });
+        else if (answer !== undefined) send(child, { id: message.id, result: answer });
+      }, timing.forkDelayMs ?? 0);
     }
   });
   const spawnFn = vi.fn(() => child);

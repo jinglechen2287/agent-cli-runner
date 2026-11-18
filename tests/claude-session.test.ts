@@ -1,8 +1,6 @@
-import { EventEmitter } from "node:events";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import {
   AbortError,
@@ -15,6 +13,7 @@ import {
   type ClaudeQueryFn,
   type CreateClaudeSessionOptions,
 } from "../src/index.js";
+import { makeFakeChild } from "./helpers/fake-child.js";
 
 /** A real executable for path resolution; the fake query never runs it. */
 const EXECUTABLE = process.execPath;
@@ -929,34 +928,9 @@ describe("createClaudeSession options", () => {
 });
 
 describe("createClaudeSession process", () => {
-  interface FakeChild extends EventEmitter {
-    stdin: PassThrough;
-    stdout: PassThrough;
-    stderr: PassThrough;
-    kill: ReturnType<typeof vi.fn>;
-    killed: boolean;
-    exitCode: number | null;
-    signalCode: NodeJS.Signals | null;
-  }
-
-  function makeFakeChild(): FakeChild {
-    const child = new EventEmitter() as FakeChild;
-    child.stdin = new PassThrough();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.kill = vi.fn(() => {
-      queueMicrotask(() => child.emit("exit", null, "SIGTERM"));
-      return true;
-    });
-    child.killed = false;
-    child.exitCode = null;
-    child.signalCode = null;
-    return child;
-  }
-
   it("spawns the CLI as a process-group leader and kills its tree on close", async () => {
     const fake = makeFakeQuery();
-    const child = makeFakeChild();
+    const child = makeFakeChild({ exitOnKill: true });
     const spawnFn = vi.fn().mockReturnValue(child);
     const session = await startSession(fake, { spawnFn: spawnFn as never });
     const controller = new AbortController();
@@ -986,7 +960,7 @@ describe("createClaudeSession process", () => {
 
   it("routes stderr to the active turn", async () => {
     const fake = makeFakeQuery();
-    const child = makeFakeChild();
+    const child = makeFakeChild({ exitOnKill: true });
     const session = await startSession(fake, { spawnFn: vi.fn().mockReturnValue(child) as never });
     fake.options().spawnClaudeCodeProcess!({
       command: EXECUTABLE,
@@ -1004,7 +978,7 @@ describe("createClaudeSession process", () => {
 
   it("includes the stderr tail when the CLI exits mid-turn", async () => {
     const fake = makeFakeQuery();
-    const child = makeFakeChild();
+    const child = makeFakeChild({ exitOnKill: true });
     const session = await startSession(fake, { spawnFn: vi.fn().mockReturnValue(child) as never });
     fake.options().spawnClaudeCodeProcess!({
       command: EXECUTABLE,
