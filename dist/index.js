@@ -1131,6 +1131,7 @@ var CLIENT_INFO = {
   version: "0.1.0"
 };
 var clientExitPromises = /* @__PURE__ */ new WeakMap();
+var ARCHIVE_TIMEOUT_MS = 2e3;
 function rpcError(value, fallback) {
   if (!isRecord(value)) return new Error(fallback);
   const message = typeof value.message === "string" ? value.message : fallback;
@@ -2059,6 +2060,7 @@ async function runCodexAppServerTurn(opts, client, openedThread, ownedClient = f
     const turnStartTimeoutMs = runDeadline === void 0 ? TURN_START_TIMEOUT_MS : Math.max(1, Math.min(TURN_START_TIMEOUT_MS, runDeadline - Date.now()));
     let turnResult;
     turnStartSent = true;
+    safeCallback(() => continuity?.onTurnStartSent?.());
     try {
       turnResult = await Promise.race([
         client.request("turn/start", {
@@ -2144,9 +2146,25 @@ async function createCodexAppServerSession(options) {
   let steerRunning = null;
   const previousTurnIds = /* @__PURE__ */ new Set();
   let closePromise;
+  let exited = false;
+  let turnStarted = false;
   client.onClose(() => {
+    if (!closed) exited = true;
     closed = true;
   });
+  const archives = () => !!options.archive && turnStarted;
+  const archiveThread = async () => {
+    const failed = (error) => safeCallback(() => options.onArchiveError?.(
+      opened.threadId,
+      error instanceof Error ? error : new Error(String(error))
+    ));
+    if (exited) return failed(new Error("Codex app-server exited before the thread was archived"));
+    try {
+      await client.request("thread/archive", { threadId: opened.threadId }, options.archiveTimeoutMs ?? ARCHIVE_TIMEOUT_MS);
+    } catch (error) {
+      failed(error);
+    }
+  };
   return {
     threadId: opened.threadId,
     cwd: options.cwd,
@@ -2173,6 +2191,9 @@ async function createCodexAppServerSession(options) {
           onTurnId: (turnId) => {
             previousTurnIds.add(turnId);
           },
+          onTurnStartSent: () => {
+            turnStarted = true;
+          },
           onSteerable: (steer) => {
             steerRunning = steer;
           }
@@ -2191,9 +2212,13 @@ async function createCodexAppServerSession(options) {
       return client.onClose(handler);
     },
     close() {
-      closePromise ??= clientExitPromises.get(client) ?? Promise.resolve();
-      if (!closed) closed = true;
-      client.close();
+      if (closePromise) return closePromise;
+      closed = true;
+      const exit = () => {
+        client.close();
+        return clientExitPromises.get(client) ?? Promise.resolve();
+      };
+      closePromise = archives() ? Promise.resolve().then(archiveThread).then(exit) : exit();
       return closePromise;
     }
   };

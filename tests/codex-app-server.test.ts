@@ -2526,3 +2526,157 @@ describe("CodexAppServerSession.steer", () => {
     await close();
   });
 });
+
+describe("CodexAppServerSession archive", () => {
+  /** An app-server that answers one turn on thread-arch, and archive as `archive` says. */
+  function archiveServer(child: FakeChild, archive: (id: number | undefined) => void = (id) => send(child, { id, result: {} })) {
+    child.kill = vi.fn(() => {
+      child.emit("close", 0);
+      return true;
+    });
+    return captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-arch" } } });
+      } else if (message.method === "thread/archive") {
+        archive(message.id);
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("turn-a", "inProgress") } });
+        send(child, {
+          method: "item/completed",
+          params: { threadId: "thread-arch", turnId: "turn-a", item: { type: "agentMessage", id: "m-a", text: "Done" } },
+        });
+        send(child, { method: "turn/completed", params: { threadId: "thread-arch", turn: completedTurn("turn-a") } });
+      }
+    });
+  }
+
+  it("archives the thread before the app-server goes", async () => {
+    const child = makeFakeChild();
+    const requests = archiveServer(child);
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", archive: true, spawnFn: (() => child) as never });
+    await session.runTurn({ prompt: "hi" });
+    await session.close();
+    expect(requests.find(({ method }) => method === "thread/archive")?.params).toEqual({ threadId: "thread-arch" });
+    const archivedAt = requests.findIndex(({ method }) => method === "thread/archive");
+    expect(archivedAt).toBeGreaterThan(requests.findIndex(({ method }) => method === "turn/start"));
+    expect(child.kill).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends one archive to two closes, which share a promise, and refuses a turn once closing", async () => {
+    const child = makeFakeChild();
+    let answer: (() => void) | undefined;
+    const requests = archiveServer(child, (id) => {
+      answer = () => send(child, { id, result: {} });
+    });
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", archive: true, spawnFn: (() => child) as never });
+    await session.runTurn({ prompt: "hi" });
+    const first = session.close();
+    const second = session.close();
+    expect(second).toBe(first);
+    expect(session.closed).toBe(true);
+    await expect(session.runTurn({ prompt: "again" })).rejects.toThrow(/closed/);
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    answer?.();
+    await first;
+    expect(requests.filter(({ method }) => method === "thread/archive")).toHaveLength(1);
+    expect(requests.filter(({ method }) => method === "turn/start")).toHaveLength(1);
+  });
+
+  it("closes anyway when the archive fails, and names the thread", async () => {
+    const child = makeFakeChild();
+    archiveServer(child, (id) => send(child, { id, error: { code: -32600, message: "no rollout found" } }));
+    const onArchiveError = vi.fn();
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", archive: true, onArchiveError, spawnFn: (() => child) as never });
+    await session.runTurn({ prompt: "hi" });
+    await session.close();
+    expect(onArchiveError).toHaveBeenCalledWith("thread-arch", expect.any(Error));
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it("closes within its bound when the archive is never answered", async () => {
+    const child = makeFakeChild();
+    archiveServer(child, () => {});
+    const onArchiveError = vi.fn();
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", archive: true, archiveTimeoutMs: 50, onArchiveError, spawnFn: (() => child) as never });
+    await session.runTurn({ prompt: "hi" });
+    await session.close();
+    expect(onArchiveError).toHaveBeenCalledWith("thread-arch", expect.any(Error));
+  });
+
+  it("names the thread when the app-server is gone before close", async () => {
+    const child = makeFakeChild();
+    const requests = archiveServer(child);
+    const onArchiveError = vi.fn();
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", archive: true, onArchiveError, spawnFn: (() => child) as never });
+    await session.runTurn({ prompt: "hi" });
+    child.emit("close", 1);
+    await session.close();
+    expect(requests.filter(({ method }) => method === "thread/archive")).toHaveLength(0);
+    expect(onArchiveError).toHaveBeenCalledWith("thread-arch", expect.any(Error));
+  });
+
+  it("tells a failed archive once, when its callback closes the session again", async () => {
+    const child = makeFakeChild();
+    archiveServer(child);
+    let session: CodexAppServerSession | undefined;
+    const onArchiveError = vi.fn(() => {
+      void session?.close();
+    });
+    session = await createCodexAppServerSession({ cwd: "/tmp/project", archive: true, onArchiveError, spawnFn: (() => child) as never });
+    await session.runTurn({ prompt: "hi" });
+    child.emit("close", 1);
+    await session.close();
+    expect(onArchiveError).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the thread when its turn was sent but never acknowledged", async () => {
+    const child = makeFakeChild();
+    child.kill = vi.fn(() => {
+      child.emit("close", 0);
+      return true;
+    });
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") send(child, { id: message.id, result: {} });
+      else if (message.method === "thread/start") send(child, { id: message.id, result: { thread: { id: "thread-arch" } } });
+      // turn/start is never answered
+    });
+    const onArchiveError = vi.fn();
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", archive: true, onArchiveError, spawnFn: (() => child) as never });
+    await session.runTurn({ prompt: "hi", timeoutMs: 50 }).catch(() => {});
+    await session.close();
+    expect(onArchiveError).toHaveBeenCalledWith("thread-arch", expect.any(Error));
+  });
+
+  it("archives nothing when the only turn was stopped before it was sent", async () => {
+    const child = makeFakeChild();
+    const requests = archiveServer(child);
+    const onArchiveError = vi.fn();
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", archive: true, onArchiveError, spawnFn: (() => child) as never });
+    await session.runTurn({ prompt: "hi", signal: AbortSignal.abort() }).catch(() => {});
+    await session.close();
+    expect(requests.filter(({ method }) => method === "turn/start")).toHaveLength(0);
+    expect(requests.filter(({ method }) => method === "thread/archive")).toHaveLength(0);
+    expect(onArchiveError).not.toHaveBeenCalled();
+  });
+
+  it("archives nothing for a thread that never ran a turn", async () => {
+    const child = makeFakeChild();
+    const requests = archiveServer(child);
+    const onArchiveError = vi.fn();
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", archive: true, onArchiveError, spawnFn: (() => child) as never });
+    await session.close();
+    expect(requests.filter(({ method }) => method === "thread/archive")).toHaveLength(0);
+    expect(onArchiveError).not.toHaveBeenCalled();
+  });
+
+  it("archives nothing without the option", async () => {
+    const child = makeFakeChild();
+    const requests = archiveServer(child);
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", spawnFn: (() => child) as never });
+    await session.runTurn({ prompt: "hi" });
+    await session.close();
+    expect(requests.filter(({ method }) => method === "thread/archive")).toHaveLength(0);
+  });
+});
