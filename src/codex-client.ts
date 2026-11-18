@@ -2,17 +2,18 @@
  * A JSON-RPC connection to one `codex app-server --stdio` process: requests,
  * notifications, server-initiated requests, and the process's lifecycle.
  */
-import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { spawn as nodeSpawn } from "node:child_process";
+import { version } from "../package.json";
 import { AbortError, MissingCliError, TimeoutError, UnsupportedServerRequestError } from "./errors.js";
-import { isRecord, safeCallback } from "./internal.js";
+import { createDeferred, isRecord, safeCallback } from "./internal.js";
 import {
   childEnv,
   createChunkDecoder,
   createLineSplitter,
   isMissingExecutable,
-  launchCommand,
-  SIGTERM_GRACE_MS,
   signalProcessTree,
+  spawnCli,
+  terminateTree,
 } from "./process.js";
 import type { RunCodexOptions } from "./run-codex.js";
 
@@ -85,7 +86,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const CLIENT_INFO = {
   name: "agent_cli_runner",
   title: "Agent CLI Runner",
-  version: "0.1.0",
+  version,
 };
 
 function rpcError(value: unknown, fallback: string): Error {
@@ -103,24 +104,14 @@ function rpcError(value: unknown, fallback: string): Error {
 export async function startCodexAppServer(
   options: CreateCodexAppServerClientOptions,
 ): Promise<{ client: CodexAppServerClient; whenExited: Promise<void> }> {
-  const spawnFn = options.spawnFn ?? nodeSpawn;
-  let child: ChildProcess;
-  try {
-    const env = childEnv("codex", options.env ?? process.env);
-    const launch = launchCommand(options.executablePath ?? "codex", ["app-server", "--stdio"], env, {
-      cwd: options.cwd,
-    });
-    child = spawnFn(launch.command, launch.args, {
-      ...launch.options,
-      cwd: options.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env,
-      detached: process.platform !== "win32",
-    });
-  } catch (error) {
-    if (error instanceof Error && isMissingExecutable(error)) throw new MissingCliError("codex");
-    throw error;
-  }
+  const child = spawnCli({
+    cli: "codex",
+    spawnFn: options.spawnFn ?? nodeSpawn,
+    command: options.executablePath ?? "codex",
+    args: ["app-server", "--stdio"],
+    cwd: options.cwd,
+    env: childEnv("codex", options.env ?? process.env),
+  });
 
   const pending = new Map<number, PendingRequest>();
   const notificationHandlers = new Set<(method: string, params: unknown) => void>();
@@ -135,15 +126,11 @@ export async function startCodexAppServer(
   let nextId = 1;
   let closed = false;
   let closeError: Error | undefined;
-  let childExited = false;
   let terminationRequested = false;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
-  let exitFallbackTimer: ReturnType<typeof setTimeout> | undefined;
   let stderr = "";
-  let resolveExit!: () => void;
-  const exitPromise = new Promise<void>((resolve) => {
-    resolveExit = resolve;
-  });
+  /** Settled by the process closing or, once close() has asked it to go, by
+   * termination giving up on it. Settled before that only by a real close. */
+  const whenExited = createDeferred();
 
   const send = (message: Record<string, unknown>): void => {
     if (closed) return;
@@ -240,10 +227,7 @@ export async function startCodexAppServer(
     fail(isMissingExecutable(error) ? new MissingCliError("codex") : error);
   });
   child.on("close", (code) => {
-    childExited = true;
-    resolveExit();
-    if (killTimer) clearTimeout(killTimer);
-    if (exitFallbackTimer) clearTimeout(exitFallbackTimer);
+    whenExited.resolve();
     splitter.flush();
     stderrDecoder.flush();
     const detail = stderr.trim();
@@ -297,17 +281,11 @@ export async function startCodexAppServer(
       return () => closeHandlers.delete(handler);
     },
     close() {
-      if (terminationRequested || childExited) return;
+      if (terminationRequested || whenExited.settled) return;
       terminationRequested = true;
       if (!closed) fail(new Error("Codex app-server was closed"));
-      signalProcessTree(child, "SIGTERM");
-      killTimer = setTimeout(() => {
-        if (childExited) return;
-        signalProcessTree(child, "SIGKILL");
-        exitFallbackTimer = setTimeout(resolveExit, SIGTERM_GRACE_MS);
-        exitFallbackTimer.unref();
-      }, SIGTERM_GRACE_MS);
-      killTimer.unref();
+      void terminateTree((signal) => signalProcessTree(child, signal), whenExited, { unref: true })
+        .then(whenExited.resolve);
     },
   };
 
@@ -323,7 +301,7 @@ export async function startCodexAppServer(
       },
     });
     client.notify("initialized", {});
-    return { client, whenExited: exitPromise };
+    return { client, whenExited: whenExited.promise };
   } catch (error) {
     client.close();
     throw options.signal?.aborted ? new AbortError() : error;

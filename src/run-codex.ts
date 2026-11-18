@@ -2,13 +2,15 @@ import { spawn } from "node:child_process";
 import { CodexTurnError, MissingCliError } from "./errors.js";
 import { runCodexAppServer, type CodexAppServerSession } from "./codex-app-server.js";
 import type { CodexAppServerClient, CodexConfigOverrides } from "./codex-client.js";
-import { summarizeTool, toolInput, toolName } from "./codex-items.js";
+import { codexTokenUsage, summarizeTool, toolInput, toolName } from "./codex-items.js";
 import {
+  createDeferred,
   isRecord,
-  normalizePlanStatus,
   normalizeSummary,
   planCompletionSummary,
+  planItem,
   safeCallback,
+  toPlanItems,
   toTokenCount,
 } from "./internal.js";
 import {
@@ -16,8 +18,9 @@ import {
   createChunkDecoder,
   createLineSplitter,
   isMissingExecutable,
-  launchCommand,
   signalProcessTree,
+  spawnCli,
+  terminateTree,
   watchLifecycle,
   writePrompt,
 } from "./process.js";
@@ -124,37 +127,29 @@ function buildIsolatedArgs(opts: RunCodexOptions): string[] {
 /** Plan/todo items are the one item family `codex exec` reports that the
  * app-server expresses as a separate notification instead, so only this
  * mapping stays exec-local; everything else defers to the shared normalizer
- * in codex-app-server.ts so the two paths cannot drift. */
+ * in codex-items.ts so the two paths cannot drift. */
+function isExecPlanItem(item: Record<string, unknown>): boolean {
+  return item.type === "todo_list" || item.type === "plan_update";
+}
+
 function execToolName(item: Record<string, unknown>): string | null {
-  if (item.type === "todo_list" || item.type === "plan_update") return "TodoWrite";
-  return toolName(item);
+  return isExecPlanItem(item) ? "TodoWrite" : toolName(item);
 }
 
 function execPlanItems(item: Record<string, unknown>): ToolPlanItem[] | undefined {
-  const values = Array.isArray(item.items)
-    ? item.items
-    : Array.isArray(item.plan) ? item.plan : undefined;
-  if (!values) return undefined;
-  const items: ToolPlanItem[] = [];
-  for (const value of values) {
-    if (!isRecord(value)) return undefined;
-    const text = normalizeSummary(value.text) ?? normalizeSummary(value.step);
-    const status = typeof value.completed === "boolean"
-      ? value.completed ? "completed" : "pending"
-      : normalizePlanStatus(value.status);
-    if (!text || !status) return undefined;
-    items.push({ text, status });
-  }
-  return items.length > 0 ? items : undefined;
+  return toPlanItems(Array.isArray(item.items) ? item.items : item.plan, (entry) => planItem(
+    normalizeSummary(entry.text) ?? normalizeSummary(entry.step),
+    typeof entry.completed === "boolean"
+      ? entry.completed ? "completed" : "pending"
+      : entry.status,
+  ));
 }
 
 function execToolSummary(
   item: Record<string, unknown>,
   planItems: ToolPlanItem[] | undefined,
 ): string | undefined {
-  if ((item.type === "todo_list" || item.type === "plan_update") && planItems) {
-    return planCompletionSummary(planItems);
-  }
+  if (isExecPlanItem(item) && planItems) return planCompletionSummary(planItems);
   return summarizeTool(item);
 }
 
@@ -171,50 +166,38 @@ function execUsage(
   const cached = toTokenCount(usage.cached_input_tokens);
   const output = toTokenCount(usage.output_tokens);
   if (input + output <= 0) return undefined;
-  const contextWindow = opts.contextWindow ?? contextWindowForModel(opts.model);
-  return {
+  return codexTokenUsage(
     // Input side only (cached included), per the TokenUsage contract — not
     // app-server's totalTokens, which also counts output.
-    contextTokens: input,
-    inputTokens: Math.max(0, input - cached),
-    cachedInputTokens: cached,
-    outputTokens: output,
-    ...(opts.model ? { model: opts.model } : {}),
-    ...(contextWindow !== undefined ? { contextWindow } : {}),
-  };
+    { contextTokens: input, input, cached, output },
+    opts.model,
+    opts.contextWindow ?? contextWindowForModel(opts.model),
+  );
+}
+
+/** The message an `error` or `turn.failed` event carries, wherever it put it. */
+function errorDetail(event: CodexExecEvent): string | undefined {
+  if (typeof event.message === "string") return event.message;
+  if (typeof event.error === "string") return event.error;
+  if (isRecord(event.error) && typeof event.error.message === "string") return event.error.message;
+  return undefined;
 }
 
 function execFatalError(event: CodexExecEvent): CodexTurnError | undefined {
   if (event.type !== "error" && event.type !== "turn.failed") return undefined;
-  const detail = typeof event.message === "string"
-    ? event.message
-    : typeof event.error === "string"
-      ? event.error
-      : isRecord(event.error) && typeof event.error.message === "string"
-        ? event.error.message
-        : undefined;
+  const detail = errorDetail(event);
   return new CodexTurnError(detail ? `Codex error: ${detail}` : "Codex error");
 }
 
 async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
-  const spawnFn = opts.spawnFn ?? spawn;
-  let child;
-  try {
-    const env = childEnv("codex", opts.env ?? process.env);
-    const launch = launchCommand(opts.executablePath ?? "codex", buildIsolatedArgs(opts), env, {
-      cwd: opts.cwd,
-    });
-    child = spawnFn(launch.command, launch.args, {
-      ...launch.options,
-      cwd: opts.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env,
-      detached: process.platform !== "win32",
-    });
-  } catch (error) {
-    if (error instanceof Error && isMissingExecutable(error)) throw new MissingCliError("codex");
-    throw error;
-  }
+  const child = spawnCli({
+    cli: "codex",
+    spawnFn: opts.spawnFn ?? spawn,
+    command: opts.executablePath ?? "codex",
+    args: buildIsolatedArgs(opts),
+    cwd: opts.cwd,
+    env: childEnv("codex", opts.env ?? process.env),
+  });
 
   return new Promise<RunResult>((resolve, reject) => {
     let settled = false;
@@ -223,11 +206,13 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
     let latestUsage: TokenUsage | undefined;
     let fatalError: CodexTurnError | undefined;
     const emittedTools = new Set<string>();
+    /** The child closed or failed: no escalation is owed after that. */
+    const ended = createDeferred();
     const lifecycle = watchLifecycle({
       cli: "codex",
       signal: opts.signal,
       timeoutMs: opts.timeoutMs,
-      kill: (signal) => signalProcessTree(child, signal),
+      terminate: () => void terminateTree((signal) => signalProcessTree(child, signal), ended),
     });
 
     const handleLine = (line: string): void => {
@@ -295,12 +280,14 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
     );
     child.stderr?.on("data", (chunk: Buffer | string) => stderrDecoder.push(chunk));
     child.on("error", (error: Error) => {
+      ended.resolve();
       if (settled) return;
       settled = true;
       lifecycle.cleanup();
       reject(isMissingExecutable(error) ? new MissingCliError("codex") : error);
     });
     child.on("close", (code) => {
+      ended.resolve();
       if (settled) return;
       settled = true;
       splitter.flush();
@@ -333,31 +320,41 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
   if (opts.forkConfig && (!opts.forkSessionId || opts.isolated)) {
     throw new Error("only a guarded fork can take fork config");
   }
-  if (opts.forkSessionId) return runForkedCodex(opts);
-  if (!opts.isolated) {
-    if (opts.appServerClient && opts.appServerSession) {
-      throw new Error("Codex runs cannot use both appServerClient and appServerSession");
-    }
-    if (opts.appServerSession) {
-      if (opts.resumeSessionId) {
-        throw new Error("Session-backed Codex runs cannot resume another session");
-      }
-      if (
-        opts.developerInstructions !== undefined
-        || opts.dangerouslyBypassApprovalsAndSandbox !== undefined
-        || opts.env !== undefined
-        || opts.executablePath !== undefined
-        || opts.spawnFn !== undefined
-      ) {
-        throw new Error("Session-backed Codex runs cannot override thread or client options");
-      }
-      if (opts.cwd !== opts.appServerSession.cwd) {
-        throw new Error("Codex run cwd must match the app-server session cwd");
-      }
-      return opts.appServerSession.runTurn(opts);
-    }
+  if (opts.forkSessionId) {
+    validateForkedRun(opts);
     return runCodexAppServer(opts);
   }
+  if (opts.isolated) {
+    validateIsolatedRun(opts);
+    return runIsolatedCodex(opts);
+  }
+  validateAppServerRun(opts);
+  return opts.appServerSession ? opts.appServerSession.runTurn(opts) : runCodexAppServer(opts);
+}
+
+function validateAppServerRun(opts: RunCodexOptions): void {
+  if (opts.appServerClient && opts.appServerSession) {
+    throw new Error("Codex runs cannot use both appServerClient and appServerSession");
+  }
+  if (!opts.appServerSession) return;
+  if (opts.resumeSessionId) {
+    throw new Error("Session-backed Codex runs cannot resume another session");
+  }
+  if (
+    opts.developerInstructions !== undefined
+    || opts.dangerouslyBypassApprovalsAndSandbox !== undefined
+    || opts.env !== undefined
+    || opts.executablePath !== undefined
+    || opts.spawnFn !== undefined
+  ) {
+    throw new Error("Session-backed Codex runs cannot override thread or client options");
+  }
+  if (opts.cwd !== opts.appServerSession.cwd) {
+    throw new Error("Codex run cwd must match the app-server session cwd");
+  }
+}
+
+function validateIsolatedRun(opts: RunCodexOptions): void {
   if (opts.appServerSession || opts.appServerClient) {
     throw new Error("isolated Codex runs cannot reuse app-server state");
   }
@@ -374,10 +371,9 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunResult> {
   if (opts.serviceTier !== undefined) {
     throw new Error("isolated Codex runs cannot set a service tier — codex exec has no equivalent");
   }
-  return runIsolatedCodex(opts);
 }
 
-function runForkedCodex(opts: RunCodexOptions): Promise<RunResult> {
+function validateForkedRun(opts: RunCodexOptions): void {
   if (opts.appServerSession || opts.appServerClient) {
     throw new Error("forked Codex runs cannot reuse app-server state");
   }
@@ -398,5 +394,4 @@ function runForkedCodex(opts: RunCodexOptions): Promise<RunResult> {
   if (opts.turnCwd !== undefined) {
     throw new Error("forked Codex runs cannot set a turn cwd");
   }
-  return runCodexAppServer(opts);
 }

@@ -248,7 +248,8 @@ export interface LifecycleOptions {
   cli: string;
   signal?: AbortSignal | undefined;
   timeoutMs?: number | undefined;
-  kill: (signal: NodeJS.Signals) => void;
+  /** Stops the process: called once, on the abort or the timeout. */
+  terminate: () => void;
 }
 
 export interface Lifecycle {
@@ -257,22 +258,16 @@ export interface Lifecycle {
   cleanup(): void;
 }
 
-/** Wires abort/timeout to a SIGTERM → grace period → SIGKILL escalation. */
+/** Wires an abort signal and a timeout to one call of `terminate`. */
 export function watchLifecycle(opts: LifecycleOptions): Lifecycle {
   let aborted = false;
   let timedOut = false;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-
-  const terminate = (): void => {
-    opts.kill("SIGTERM");
-    killTimer ??= setTimeout(() => opts.kill("SIGKILL"), SIGTERM_GRACE_MS);
-  };
 
   const abortHandler = (): void => {
     if (aborted || timedOut) return;
     aborted = true;
-    terminate();
+    opts.terminate();
   };
 
   if (opts.signal) {
@@ -284,7 +279,7 @@ export function watchLifecycle(opts: LifecycleOptions): Lifecycle {
     timeoutTimer = setTimeout(() => {
       if (aborted || timedOut) return;
       timedOut = true;
-      terminate();
+      opts.terminate();
     }, opts.timeoutMs);
   }
 
@@ -295,7 +290,6 @@ export function watchLifecycle(opts: LifecycleOptions): Lifecycle {
       return null;
     },
     cleanup(): void {
-      if (killTimer) clearTimeout(killTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       opts.signal?.removeEventListener("abort", abortHandler);
     },

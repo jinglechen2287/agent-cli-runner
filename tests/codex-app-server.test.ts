@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -2680,6 +2681,63 @@ describe("createCodexAppServerSession MCP", () => {
     expect(resumed.requests.find(({ method }) => method === "thread/resume")?.params)
       .not.toHaveProperty("threadSource");
     await resumed.session.close();
+  });
+
+  it("names this package's version when it initializes", async () => {
+    const child = makeFakeChild();
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") send(child, { id: message.id, result: {} });
+    });
+    const client = await createCodexAppServerClient({ cwd: "/tmp", spawnFn: (() => child) as never });
+    client.close();
+    const { version } = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
+    expect(requests.find(({ method }) => method === "initialize")?.params?.clientInfo)
+      .toMatchObject({ version });
+  });
+
+  it("closes the app-server it started when the run is stopped while that server starts", async () => {
+    const child = makeFakeChild();
+    const controller = new AbortController();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+        queueMicrotask(() => controller.abort());
+      }
+    });
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      signal: controller.signal,
+      spawnFn: (() => child) as never,
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("sends no turn when the run is stopped as its thread opens", async () => {
+    const child = makeFakeChild();
+    const requests = captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: "thread-stop-early" } } });
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("turn-late", "inProgress") } });
+      }
+    });
+    const client = await createCodexAppServerClient({ cwd: "/tmp", spawnFn: (() => child) as never });
+    const controller = new AbortController();
+    await expect(runCodex({
+      prompt: "x",
+      cwd: "/tmp",
+      appServerClient: client,
+      signal: controller.signal,
+      onSessionId: () => controller.abort(),
+    })).rejects.toMatchObject({ name: "AbortError" });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(requests.map(({ method }) => method)).toEqual(["initialize", "initialized", "thread/start"]);
+    client.close();
   });
 
   it("leaves a plain run's capabilities alone", async () => {

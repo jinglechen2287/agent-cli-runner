@@ -3,20 +3,24 @@
  * the thread, attributing notifications to the turn, steering, interrupting,
  * and settling.
  */
-import { AbortError, CodexTurnError, SteerRejectedError, TimeoutError } from "./errors.js";
-import { safeCallback } from "./internal.js";
+import {
+  AbortError,
+  CodexTurnError,
+  runAborted,
+  runTimedOut,
+  SteerRejectedError,
+  TimeoutError,
+} from "./errors.js";
+import { createDeferred, errorMessage, raceTimeout, safeCallback } from "./internal.js";
 import type { CodexAppServerClient, CodexConfigOverrides } from "./codex-client.js";
 import {
-  backgroundStatus,
+  createCodexAgentTracker,
+  createWebToolTracker,
   isWebItem,
   itemType,
   planToolInfo,
-  property,
-  rawWebOutputUrl,
   record,
-  singleRawWebCall,
   summarizeTool,
-  terminalBackgroundStatus,
   text,
   threadIdFrom,
   toolInput,
@@ -24,11 +28,9 @@ import {
   toUsage,
   turnIdFrom,
   turnStatus,
-  webUrl,
-  withWebUrl,
 } from "./codex-items.js";
 import type { RunCodexOptions } from "./run-codex.js";
-import type { BackgroundAgentInfo, CompactionInfo, RunResult } from "./types.js";
+import type { CompactionInfo, RunResult } from "./types.js";
 import type { TokenUsage } from "./usage.js";
 
 /** `turn/start` is acked immediately in normal operation, but a busy
@@ -91,49 +93,41 @@ export function requestCodexThread(
     | "isolated"
   > & { config?: CodexConfigOverrides; threadSource?: "user" },
 ): Promise<unknown> {
+  /** Every fork is an ephemeral, read-only copy that asks for no approvals. */
+  const forkParams = (threadId: string, config: CodexConfigOverrides | undefined) => ({
+    threadId,
+    cwd: opts.cwd,
+    ...(opts.model ? { model: opts.model } : {}),
+    ...(opts.developerInstructions
+      ? { developerInstructions: opts.developerInstructions }
+      : {}),
+    ephemeral: true,
+    // Ephemeral forks of paginated threads must skip hydrating history.
+    excludeTurns: true,
+    sandbox: "read-only",
+    approvalPolicy: "never",
+    experimentalRawEvents: true,
+    ...(config ? { config } : {}),
+  });
   if (opts.forkSessionId && !opts.isolated) {
     // A guarded fork keeps Codex's tools: the turn's sandbox policy bounds them.
-    return client.request("thread/fork", {
-      threadId: opts.forkSessionId,
-      cwd: opts.cwd,
-      ...(opts.model ? { model: opts.model } : {}),
-      ...(opts.developerInstructions
-        ? { developerInstructions: opts.developerInstructions }
-        : {}),
-      ephemeral: true,
-      excludeTurns: true,
-      sandbox: "read-only",
-      approvalPolicy: "never",
-      experimentalRawEvents: true,
-      ...(opts.forkConfig ? { config: opts.forkConfig } : {}),
-    });
+    return client.request("thread/fork", forkParams(opts.forkSessionId, opts.forkConfig));
   }
   if (opts.forkSessionId) {
     const forkSessionId = opts.forkSessionId;
     // The user's MCP servers can only be switched off by name — an empty
     // table merges with their config and leaves every one running — so read
     // what applies here first. A config that can't be read forks nothing.
-    return client.request("config/read", { cwd: opts.cwd }).then((read) => client.request("thread/fork", {
-      threadId: forkSessionId,
-      cwd: opts.cwd,
-      ...(opts.model ? { model: opts.model } : {}),
-      ...(opts.developerInstructions
-        ? { developerInstructions: opts.developerInstructions }
-        : {}),
-      ephemeral: true,
-      // Ephemeral forks of paginated threads must skip hydrating history.
-      excludeTurns: true,
-      sandbox: "read-only",
-      approvalPolicy: "never",
-      experimentalRawEvents: true,
-      config: {
+    return client.request("config/read", { cwd: opts.cwd }).then((read) => client.request(
+      "thread/fork",
+      forkParams(forkSessionId, {
         ...CODEX_FORK_CONFIG,
         mcp_servers: Object.fromEntries(
           Object.keys(record(record(record(read)?.config)?.mcp_servers) ?? {})
             .map((name) => [name, { enabled: false }]),
         ),
-      },
-    }));
+      }),
+    ));
   }
   // One shared params object so resumed threads can never silently diverge
   // from fresh ones (e.g. losing raw events, and with them WebFetch URLs).
@@ -176,20 +170,6 @@ export interface TurnContinuity {
   onTurnStartSent?: () => void;
 }
 
-interface PendingCodexWebTool {
-  item: Record<string, unknown>;
-  completed: boolean;
-  rawCallId?: string;
-}
-
-interface RawCodexWebCall {
-  callId: string;
-  inputUrl?: string;
-  outputUrl?: string;
-  outputCompleted: boolean;
-  webItemId?: string;
-}
-
 /** What a turn runs on, and who owns it. */
 export interface CodexTurnContext {
   client: CodexAppServerClient;
@@ -220,7 +200,11 @@ export async function runCodexAppServerTurn(
     start,
   }: CodexTurnContext,
 ): Promise<RunResult> {
-  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  if (opts.signal?.aborted) {
+    // Before the try below: a client made for this run would outlive it.
+    if (ownedClient) client.close();
+    throw runAborted("codex");
+  }
 
   const isPreviousTurn = (turnId: string): boolean =>
     continuity?.previousTurnIds?.has(turnId) ?? false;
@@ -251,7 +235,7 @@ export async function runCodexAppServerTurn(
     const held = pendingTurnError;
     pendingTurnError = undefined;
     if (held.turnId !== turnId) return;
-    flushPendingWebTools();
+    webTools.flush();
     settleError(held.error);
   };
   /** The single gate for turn attribution: validates an event's turn id
@@ -263,16 +247,17 @@ export async function runCodexAppServerTurn(
     if (turnId && eventTurnId !== turnId) return undefined;
     if (!turnId) {
       turnId = eventTurnId;
-      resolveTurnLatched();
+      turnLatched.resolve();
       resolvePendingTurnError();
     }
     return eventTurnId;
   };
+  /** This turn's id when an event belongs to it, latching the id if none is
+   * yet: the event's thread is this one and {@link matchTurn} takes its turn. */
+  const turnScoped = (params: Record<string, unknown>): string | undefined =>
+    params.threadId === threadId ? matchTurn(text(params.turnId)) : undefined;
   /** Resolves once some event names this turn. */
-  let resolveTurnLatched!: () => void;
-  const turnLatched = new Promise<void>((resolve) => {
-    resolveTurnLatched = resolve;
-  });
+  const turnLatched = createDeferred();
   let resolvedModel = opts.model ?? openedThread?.model;
   let finalText = "";
   let latestUsage: TokenUsage | undefined;
@@ -280,32 +265,22 @@ export async function runCodexAppServerTurn(
   let interruption: AbortError | TimeoutError | undefined;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const emittedTools = new Set<string>();
-  const backgroundAgents = new Map<string, BackgroundAgentInfo>();
-  const pendingWebTools = new Map<string, PendingCodexWebTool>();
-  const rawWebCalls = new Map<string, RawCodexWebCall>();
-  const unassignedRawWebCalls: string[] = [];
 
-  let resolveCompletion!: () => void;
-  let rejectCompletion!: (error: Error) => void;
-  const completion = new Promise<void>((resolve, reject) => {
-    resolveCompletion = resolve;
-    rejectCompletion = reject;
-  });
+  const completion = createDeferred();
   // Notification errors can arrive while a request response is still being
   // processed. Attach a handler immediately, then await the original promise
   // below so Node never treats that legitimate ordering as unhandled.
-  void completion.catch(() => {});
+  void completion.promise.catch(() => {});
 
-  let rejectLifecycle!: (error: AbortError | TimeoutError) => void;
-  let lifecycleFailed = false;
-  const lifecycleFailure = new Promise<never>((_resolve, reject) => {
-    rejectLifecycle = reject;
-  });
+  const lifecycle = createDeferred<never>();
+  const lifecycleFailure = lifecycle.promise;
+  // As with completion: a stop that lands before anything races it (say,
+  // from onSessionId) must not count as unhandled.
+  void lifecycleFailure.catch(() => {});
 
   const failLifecycle = (error: AbortError | TimeoutError): void => {
-    if (lifecycleFailed) return;
-    lifecycleFailed = true;
-    rejectLifecycle(error);
+    if (lifecycle.settled) return;
+    lifecycle.reject(error);
   };
 
   const raceLifecycle = <T>(operation: Promise<T>): Promise<T> =>
@@ -314,17 +289,14 @@ export async function runCodexAppServerTurn(
   /** Resolves true once the turn/start ack has named the turn — what
    * `turn/steer` needs as its expected turn id — or false when the run ends
    * without one (a refused start, an ack naming no turn). */
-  let resolveTurnKnown!: (known: boolean) => void;
-  const turnKnown = new Promise<boolean>((resolve) => {
-    resolveTurnKnown = resolve;
-  });
+  const turnKnown = createDeferred<boolean>();
 
   const steer = async (prompt: string): Promise<void> => {
     if (settled || interruption) throw new SteerRejectedError("Codex turn is already finishing");
     try {
       const known = await Promise.race([
-        turnKnown,
-        completion.then(() => {
+        turnKnown.promise,
+        completion.promise.then(() => {
           throw new SteerRejectedError("Codex turn ended before it could be steered");
         }),
         lifecycleFailure,
@@ -332,9 +304,7 @@ export async function runCodexAppServerTurn(
       if (!known) throw new SteerRejectedError("Codex turn ended before it could be steered");
     } catch (error) {
       if (error instanceof SteerRejectedError) throw error;
-      throw new SteerRejectedError(
-        `Codex turn ended before it could be steered: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throw new SteerRejectedError(`Codex turn ended before it could be steered: ${errorMessage(error)}`);
     }
     if (settled || interruption || !threadId || !turnId) {
       throw new SteerRejectedError("Codex turn is already finishing");
@@ -348,24 +318,33 @@ export async function runCodexAppServerTurn(
     } catch (error) {
       // No active turn, a different one, or one that takes no steering: the
       // host sends the words as the next turn instead.
-      throw new SteerRejectedError(
-        `Codex refused the steer: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throw new SteerRejectedError(`Codex refused the steer: ${errorMessage(error)}`);
     }
   };
   continuity?.onSteerable?.(steer);
 
+  const settleOk = (): void => {
+    if (settled) return;
+    settled = true;
+    completion.resolve();
+  };
+
   const settleError = (error: Error): void => {
     if (settled) return;
     settled = true;
-    rejectCompletion(error);
+    completion.reject(error);
   };
 
+  /** Best effort: the turn may already be over. */
+  const sendInterrupt = (): Promise<unknown> =>
+    threadId && turnId
+      ? client.request("turn/interrupt", { threadId, turnId }).catch(() => {})
+      : Promise.resolve();
+
   const requestInterrupt = (): void => {
-    if (!interruption || !threadId || !turnId) return;
-    void client.request("turn/interrupt", { threadId, turnId })
-      .catch(() => {})
-      .finally(() => failLifecycle(interruption as AbortError | TimeoutError));
+    const stopped = interruption;
+    if (!stopped || !threadId || !turnId) return;
+    void sendInterrupt().finally(() => failLifecycle(stopped));
   };
 
   /** A forked side run that starts anything beyond a message or reasoning —
@@ -373,14 +352,12 @@ export async function runCodexAppServerTurn(
    * its config turns every tool off, so one starting means isolation did
    * not hold. An allow-list, so an item type nobody knew of fails closed. */
   const refuseForkedTool = (params: Record<string, unknown>): boolean => {
-    if (params.threadId !== threadId || !matchTurn(text(params.turnId))) return false;
+    if (!turnScoped(params)) return false;
     const item = record(params.item);
     const type = item ? text(item.type) : undefined;
     if (!item || !type || FORK_ALLOWED_ITEMS.has(type)) return false;
     const name = toolName(item) ?? type;
-    if (threadId && turnId) {
-      void client.request("turn/interrupt", { threadId, turnId }).catch(() => {});
-    }
+    void sendInterrupt();
     settleError(new CodexTurnError(`A forked side run tried to use ${name}`));
     return true;
   };
@@ -396,7 +373,7 @@ export async function runCodexAppServerTurn(
     else failLifecycle(error);
   };
 
-  const abortHandler = (): void => interrupt(new AbortError("codex run aborted"));
+  const abortHandler = (): void => interrupt(runAborted("codex"));
   if (opts.signal) {
     if (opts.signal.aborted) abortHandler();
     else opts.signal.addEventListener("abort", abortHandler, { once: true });
@@ -405,7 +382,7 @@ export async function runCodexAppServerTurn(
   if (opts.timeoutMs !== undefined) {
     runDeadline = Date.now() + opts.timeoutMs;
     timeout = setTimeout(
-      () => interrupt(new TimeoutError(`codex run timed out after ${opts.timeoutMs}ms`)),
+      () => interrupt(runTimedOut("codex", opts.timeoutMs)),
       opts.timeoutMs,
     );
   }
@@ -436,112 +413,19 @@ export async function runCodexAppServerTurn(
     }));
   };
 
-  const assignRawWebCall = (id: string, pending: PendingCodexWebTool): void => {
-    if (pending.rawCallId) return;
-    for (let index = unassignedRawWebCalls.length - 1; index >= 0; index -= 1) {
-      const call = rawWebCalls.get(unassignedRawWebCalls[index] as string);
-      if (!call || call.webItemId) unassignedRawWebCalls.splice(index, 1);
-    }
-    if (unassignedRawWebCalls.length !== 1) return;
-    const callId = unassignedRawWebCalls.shift();
-    if (!callId) return;
-    const call = rawWebCalls.get(callId);
-    if (!call) return;
-    call.webItemId = id;
-    pending.rawCallId = callId;
-  };
-
-  const emitPendingWebTool = (id: string, force: boolean): void => {
-    const pending = pendingWebTools.get(id);
-    if (!pending) return;
-    const rawCall = pending.rawCallId ? rawWebCalls.get(pending.rawCallId) : undefined;
-    const item = withWebUrl(pending.item, rawCall?.inputUrl ?? rawCall?.outputUrl);
-    const needsUrl = toolName(item) === "WebFetch" && !webUrl(item);
-    if (!force && needsUrl && rawCall && !rawCall.outputCompleted) return;
-    emitToolUse(id, item);
-    if (pending.completed) emitToolResult(id, item);
-    if (pending.completed || force) pendingWebTools.delete(id);
-  };
-
-  const flushPendingWebTools = (): void => {
-    for (const id of [...pendingWebTools.keys()]) emitPendingWebTool(id, true);
-  };
-
-  const handleRawResponseItem = (params: Record<string, unknown>): void => {
-    const item = record(params.item);
-    if (!item) return;
-    const rawCall = singleRawWebCall(item);
-    if (rawCall) {
-      rawWebCalls.set(rawCall.callId, {
-        ...rawCall,
-        outputCompleted: false,
-      });
-      unassignedRawWebCalls.push(rawCall.callId);
-      return;
-    }
-    if (itemType(item) !== "custom_tool_call_output") return;
-    const callId = text(item.call_id) ?? text(item.callId);
-    if (!callId) return;
-    const call = rawWebCalls.get(callId);
-    if (!call) return;
-    call.outputCompleted = true;
-    const outputUrl = rawWebOutputUrl(item);
-    if (outputUrl) call.outputUrl = outputUrl;
-    if (call.webItemId) {
-      emitPendingWebTool(call.webItemId, false);
-    }
-  };
-
-  const updateBackgroundAgents = (item: Record<string, unknown>, occurredAt: number): void => {
-    const type = itemType(item);
-    if (type !== "collabAgentToolCall" && type !== "collab_tool_call") return;
-    const tool = text(item.tool);
-    const isSpawn = tool === "spawnAgent" || tool === "spawn_agent";
-    const states = record(property(item, "agentsStates", "agents_states")) ?? {};
-    const rawReceiverIds = property(item, "receiverThreadIds", "receiver_thread_ids");
-    const receiverIds = Array.isArray(rawReceiverIds)
-      ? rawReceiverIds.filter((id): id is string => typeof id === "string")
-      : [];
-    for (const id of new Set([...receiverIds, ...Object.keys(states)])) {
-      const current = backgroundAgents.get(id);
-      if (!current && !isSpawn) continue;
-      const state = record(states[id]);
-      const status = backgroundStatus(state?.status) ?? current?.status ?? "pending";
-      const message = text(state?.message);
-      const itemId = text(item.id);
-      const description = current?.description ?? text(item.prompt);
-      const agent: BackgroundAgentInfo = {
-        ...(current ?? {
-          id,
-          provider: "codex" as const,
-          startedAt: occurredAt,
-        }),
-        ...(!current?.parentToolCallId && itemId ? { parentToolCallId: itemId } : {}),
-        ...(description ? { description } : {}),
-        status,
-        ...(message && status === "failed" ? { error: message } : {}),
-        ...(message && status !== "failed" ? { summary: message } : {}),
-        updatedAt: occurredAt,
-        ...(terminalBackgroundStatus(status)
-          ? { endedAt: current?.endedAt ?? occurredAt }
-          : {}),
-      };
-      if (status === "failed") delete agent.summary;
-      else delete agent.error;
-      backgroundAgents.set(id, agent);
-      safeCallback(() => opts.onBackgroundAgentUpdate?.(agent));
-    }
-  };
+  const webTools = createWebToolTracker({ toolUse: emitToolUse, toolResult: emitToolResult });
+  const agents = createCodexAgentTracker((agent) => {
+    safeCallback(() => opts.onBackgroundAgentUpdate?.(agent));
+  });
 
   const handleItem = (method: string, params: Record<string, unknown>): void => {
-    if (params.threadId !== threadId) return;
-    if (!matchTurn(text(params.turnId))) return;
+    if (!turnScoped(params)) return;
     const item = record(params.item);
     if (!item) return;
     const occurredAt = typeof params.startedAtMs === "number"
       ? params.startedAtMs
       : typeof params.completedAtMs === "number" ? params.completedAtMs : Date.now();
-    updateBackgroundAgents(item, occurredAt);
+    agents.update(item, occurredAt);
 
     if (itemType(item) === "contextCompaction") {
       if (method === "item/completed") {
@@ -561,16 +445,7 @@ export async function runCodexAppServerTurn(
     }
 
     if (isWebItem(item)) {
-      const id = text(item.id) ?? `${itemType(item)}:web`;
-      const pending = pendingWebTools.get(id) ?? {
-        item,
-        completed: false,
-      };
-      pending.item = item;
-      pending.completed = method === "item/completed";
-      assignRawWebCall(id, pending);
-      pendingWebTools.set(id, pending);
-      if (pending.completed) emitPendingWebTool(id, false);
+      webTools.onWebItem(item, method === "item/completed");
       return;
     }
 
@@ -595,8 +470,7 @@ export async function runCodexAppServerTurn(
     if (method === "item/agentMessage/delta") {
       // A pooled connection multiplexes threads, and an interrupted turn can
       // trail deltas after the next one starts — both must be filtered out.
-      if (params.threadId !== threadId) return;
-      if (!matchTurn(text(params.turnId))) return;
+      if (!turnScoped(params)) return;
       // Raw, not the trimming text() helper: word boundaries arrive as
       // leading spaces and paragraph breaks as whitespace-only chunks, so
       // trimming here jams the streamed words together.
@@ -605,13 +479,13 @@ export async function runCodexAppServerTurn(
       return;
     }
     if (method === "rawResponseItem/completed") {
-      if (params.threadId !== threadId) return;
-      if (!matchTurn(text(params.turnId))) return;
-      handleRawResponseItem(params);
+      if (!turnScoped(params)) return;
+      const item = record(params.item);
+      if (item) webTools.onRawResponseItem(item);
       return;
     }
-    if (method === "turn/plan/updated" && params.threadId === threadId) {
-      const eventTurnId = matchTurn(text(params.turnId));
+    if (method === "turn/plan/updated") {
+      const eventTurnId = turnScoped(params);
       if (!eventTurnId) return;
       const info = planToolInfo(params, eventTurnId);
       if (info) safeCallback(() => opts.onToolUse?.(info));
@@ -646,23 +520,20 @@ export async function runCodexAppServerTurn(
         }
         if (errorTurnId !== turnId) return;
       }
-      flushPendingWebTools();
+      webTools.flush();
       settleError(new CodexTurnError(`Codex error: ${message}`));
       return;
     }
     if (method !== "turn/completed" || params.threadId !== threadId) return;
     if (!matchTurn(text(record(params.turn)?.id))) return;
-    flushPendingWebTools();
+    webTools.flush();
     if (interruption) {
       failLifecycle(interruption);
       return;
     }
     const status = text(record(params.turn)?.status);
     if (status === "completed") {
-      if (!settled) {
-        settled = true;
-        resolveCompletion();
-      }
+      settleOk();
       return;
     }
     const message = text(record(record(params.turn)?.error)?.message)
@@ -710,15 +581,16 @@ export async function runCodexAppServerTurn(
   const removeStderr = client.onStderr((chunk) => safeCallback(() => opts.onStderr?.(chunk)));
 
   try {
-    if (!openedThread) {
-      const opened = openedCodexThread(
-        await raceLifecycle(requestCodexThread(client, opts)),
-        resolvedModel,
-      );
-      threadId = opened.threadId;
-      resolvedModel = opened.model;
-    }
-    safeCallback(() => opts.onSessionId?.(threadId as string));
+    const thread = openedThread ?? openedCodexThread(
+      await raceLifecycle(requestCodexThread(client, opts)),
+      resolvedModel,
+    );
+    threadId = thread.threadId;
+    if (!openedThread) resolvedModel = thread.model;
+    safeCallback(() => opts.onSessionId?.(thread.threadId));
+    // Stopped by now (by onSessionId, say): send no turn that nothing would
+    // watch.
+    if (interruption) throw interruption;
     const input: Array<Record<string, unknown>> = [
       { type: "text", text: opts.prompt, text_elements: [] },
       ...(opts.imagePaths ?? []).map((path) => ({ type: "localImage", path })),
@@ -751,7 +623,7 @@ export async function runCodexAppServerTurn(
               ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
               ...(opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}),
             }, turnStartTimeoutMs),
-        completion.then(() => {
+        completion.promise.then(() => {
           throw new CodexTurnError("Codex turn settled before turn/start was acknowledged");
         }),
         lifecycleFailure,
@@ -765,24 +637,17 @@ export async function runCodexAppServerTurn(
           dispatchNotification(entry.method, entry.params);
         }
         if (!turnId) {
-          let stall: ReturnType<typeof setTimeout> | undefined;
-          try {
-            await Promise.race([
-              turnLatched,
-              completion.then(() => {
+          await raceTimeout(
+            [
+              turnLatched.promise,
+              completion.promise.then(() => {
                 throw new CodexTurnError("Codex compaction settled before it started");
               }),
               lifecycleFailure,
-              new Promise<never>((_resolve, reject) => {
-                stall = setTimeout(
-                  () => reject(new TimeoutError("Codex app-server did not start the compaction")),
-                  Math.max(1, startDeadline - Date.now()),
-                );
-              }),
-            ]);
-          } finally {
-            if (stall) clearTimeout(stall);
-          }
+            ],
+            Math.max(1, startDeadline - Date.now()),
+            () => new TimeoutError("Codex app-server did not start the compaction"),
+          );
         }
       }
     } catch (error) {
@@ -794,9 +659,7 @@ export async function runCodexAppServerTurn(
       // borrowed shared client stays up — other threads may be mid-turn on
       // it — so its owner decides whether to retire it.
       if ((error instanceof TimeoutError || error instanceof AbortError) && threadId) {
-        if (turnId && !interruption) {
-          void client.request("turn/interrupt", { threadId, turnId }).catch(() => {});
-        }
+        if (!interruption) void sendInterrupt();
         if (retireClientOnUnackedStart) client.close();
       }
       throw error;
@@ -810,7 +673,7 @@ export async function runCodexAppServerTurn(
       dispatchNotification(entry.method, entry.params);
     }
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
-    resolveTurnKnown(true);
+    turnKnown.resolve(true);
     resolvePendingTurnError();
     if (interruption) requestInterrupt();
     const ackStatus = turnStatus(turnResult);
@@ -828,21 +691,21 @@ export async function runCodexAppServerTurn(
       settled = true;
       exitCode = 1;
     } else {
-      await raceLifecycle(completion);
+      await raceLifecycle(completion.promise);
       if (ackTerminal) exitCode = 1;
     }
     return {
       text: finalText.trim(),
       exitCode,
-      sessionId: threadId as string,
+      sessionId: thread.threadId,
       ...(latestUsage ? { usage: latestUsage } : {}),
     };
   } finally {
     continuity?.onSteerable?.(null);
     // A steer still waiting for the turn's id gets none.
-    resolveTurnKnown(false);
+    turnKnown.resolve(false);
     if (timeout) clearTimeout(timeout);
-    flushPendingWebTools();
+    webTools.flush();
     opts.signal?.removeEventListener("abort", abortHandler);
     removeNotification();
     removeClose();

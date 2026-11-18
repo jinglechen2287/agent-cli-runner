@@ -2,8 +2,8 @@
  * Long-lived Codex sessions on one app-server thread, and one-off app-server
  * runs.
  */
-import { AbortError, SteerRejectedError, UnsupportedServerRequestError } from "./errors.js";
-import { answerMcpElicitation, safeCallback } from "./internal.js";
+import { runAborted, SteerRejectedError, UnsupportedServerRequestError } from "./errors.js";
+import { answerMcpElicitation, safeCallback, withoutUndefined } from "./internal.js";
 import {
   createCodexAppServerClient,
   startCodexAppServer,
@@ -100,12 +100,12 @@ export async function createCodexAppServerSession(
 ): Promise<CodexAppServerSession> {
   const { client, whenExited } = await startCodexAppServer({
     cwd: options.cwd,
-    ...(options.executablePath ? { executablePath: options.executablePath } : {}),
-    ...(options.env ? { env: options.env } : {}),
-    ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
-    ...(options.requestTimeoutMs !== undefined
-      ? { requestTimeoutMs: options.requestTimeoutMs }
-      : {}),
+    ...withoutUndefined({
+      executablePath: options.executablePath || undefined,
+      env: options.env,
+      spawnFn: options.spawnFn,
+      requestTimeoutMs: options.requestTimeoutMs,
+    }),
     extensions: { [FORM_INPUT_EXTENSION]: {} },
   });
 
@@ -235,18 +235,13 @@ export async function createCodexAppServerSession(
       return await runCodexAppServerTurn({
         ...turnOptions,
         cwd: options.cwd,
-        ...(options.executablePath ? { executablePath: options.executablePath } : {}),
-        ...(options.env ? { env: options.env } : {}),
-        ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
-        ...(options.dangerouslyBypassApprovalsAndSandbox !== undefined
-          ? {
-              dangerouslyBypassApprovalsAndSandbox:
-                options.dangerouslyBypassApprovalsAndSandbox,
-            }
-          : {}),
-        ...(options.developerInstructions
-          ? { developerInstructions: options.developerInstructions }
-          : {}),
+        ...withoutUndefined({
+          executablePath: options.executablePath || undefined,
+          env: options.env,
+          spawnFn: options.spawnFn,
+          dangerouslyBypassApprovalsAndSandbox: options.dangerouslyBypassApprovalsAndSandbox,
+          developerInstructions: options.developerInstructions || undefined,
+        }),
       }, {
         client,
         thread: opened,
@@ -316,13 +311,15 @@ export async function createCodexAppServerSession(
 }
 
 export async function runCodexAppServer(opts: RunCodexOptions): Promise<RunResult> {
-  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  if (opts.signal?.aborted) throw runAborted("codex");
   const ownedClient = !opts.appServerClient;
   const client = opts.appServerClient ?? await createCodexAppServerClient({
     cwd: opts.cwd,
-    ...(opts.executablePath ? { executablePath: opts.executablePath } : {}),
-    ...(opts.env ? { env: opts.env } : {}),
-    ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
+    ...withoutUndefined({
+      executablePath: opts.executablePath || undefined,
+      env: opts.env,
+      spawnFn: opts.spawnFn,
+    }),
   });
   return runCodexAppServerTurn(opts, {
     client,

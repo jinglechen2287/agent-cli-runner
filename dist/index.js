@@ -24,6 +24,48 @@ function answerMcpElicitation(callback, request, signals) {
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function withoutUndefined(value) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entry]) => entry !== void 0)
+  );
+}
+function createDeferred() {
+  let settled = false;
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return {
+    promise,
+    get settled() {
+      return settled;
+    },
+    resolve(value) {
+      settled = true;
+      resolvePromise(value);
+    },
+    reject(error) {
+      settled = true;
+      rejectPromise(error);
+    }
+  };
+}
+function raceTimeout(contenders, ms, onTimeout, { unref = false } = {}) {
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(onTimeout()), ms);
+    if (unref) timer.unref?.();
+  });
+  const race = Promise.race([...contenders, timeout]);
+  const clear = () => clearTimeout(timer);
+  race.then(clear, clear);
+  return race;
+}
 function safeCallback(use) {
   try {
     const result = use();
@@ -44,6 +86,24 @@ function normalizePlanStatus(value) {
   if (!status) return void 0;
   return status.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
 }
+function planItem(text2, status) {
+  const itemText = normalizeSummary(text2);
+  const itemStatus = normalizePlanStatus(status);
+  return itemText && itemStatus ? { text: itemText, status: itemStatus } : void 0;
+}
+function toPlanItems(values, toItem) {
+  if (!Array.isArray(values)) return void 0;
+  const items = [];
+  for (const value of values) {
+    const item = isRecord(value) ? toItem(value) : void 0;
+    if (!item) return void 0;
+    items.push(item);
+  }
+  return items.length > 0 ? items : void 0;
+}
+function isTerminalAgentStatus(status) {
+  return status === "completed" || status === "failed" || status === "interrupted";
+}
 function normalizeSummary(value) {
   if (typeof value !== "string") return void 0;
   const summary = value.replace(/\s+/g, " ").trim();
@@ -57,6 +117,16 @@ function toContextWindow(value) {
 }
 
 // src/usage.ts
+function tokenUsage(counts, model, contextWindow) {
+  return {
+    contextTokens: counts.contextTokens,
+    inputTokens: counts.inputTokens,
+    cachedInputTokens: counts.cachedInputTokens,
+    outputTokens: counts.outputTokens,
+    ...model ? { model } : {},
+    ...contextWindow !== void 0 ? { contextWindow } : {}
+  };
+}
 var GPT_5_CONTEXT_WINDOW = 272e3;
 var GPT_5_6_CONTEXT_WINDOW = 372e3;
 var KNOWN_CONTEXT_WINDOWS = {
@@ -623,6 +693,21 @@ function childEnv(cli, base = process.env) {
 function isMissingExecutable(error) {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
+function spawnCli(options) {
+  try {
+    const launch = launchCommand(options.command, options.args, options.env, { cwd: options.cwd });
+    return options.spawnFn(launch.command, launch.args, {
+      ...launch.options,
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32"
+    });
+  } catch (error) {
+    if (isMissingExecutable(error)) throw new MissingCliError(options.cli);
+    throw error;
+  }
+}
 function createLineSplitter(onLine) {
   let buffer = "";
   let draining = false;
@@ -670,19 +755,41 @@ function writePrompt(child, prompt) {
   });
   stdin.end(prompt);
 }
+function terminateTree(kill, exited, { graceMs = SIGTERM_GRACE_MS, unref = false } = {}) {
+  let killTimer;
+  let giveUpTimer;
+  const send = (signal) => {
+    try {
+      kill(signal);
+    } catch {
+    }
+  };
+  const gaveUp = new Promise((resolve) => {
+    send("SIGTERM");
+    killTimer = setTimeout(() => {
+      if (exited.settled) return;
+      send("SIGKILL");
+      giveUpTimer = setTimeout(resolve, graceMs);
+      if (unref) giveUpTimer.unref?.();
+    }, graceMs);
+    if (unref) killTimer.unref?.();
+  });
+  const stopped = Promise.race([exited.promise, gaveUp]);
+  const clear = () => {
+    clearTimeout(killTimer);
+    clearTimeout(giveUpTimer);
+  };
+  stopped.then(clear, clear);
+  return stopped;
+}
 function watchLifecycle(opts) {
   let aborted = false;
   let timedOut = false;
-  let killTimer;
   let timeoutTimer;
-  const terminate = () => {
-    opts.kill("SIGTERM");
-    killTimer ??= setTimeout(() => opts.kill("SIGKILL"), SIGTERM_GRACE_MS);
-  };
   const abortHandler = () => {
     if (aborted || timedOut) return;
     aborted = true;
-    terminate();
+    opts.terminate();
   };
   if (opts.signal) {
     if (opts.signal.aborted) abortHandler();
@@ -692,7 +799,7 @@ function watchLifecycle(opts) {
     timeoutTimer = setTimeout(() => {
       if (aborted || timedOut) return;
       timedOut = true;
-      terminate();
+      opts.terminate();
     }, opts.timeoutMs);
   }
   return {
@@ -702,7 +809,6 @@ function watchLifecycle(opts) {
       return null;
     },
     cleanup() {
-      if (killTimer) clearTimeout(killTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       opts.signal?.removeEventListener("abort", abortHandler);
     }
@@ -1455,11 +1561,16 @@ import { deleteSession, forkSession } from "@anthropic-ai/claude-agent-sdk";
 
 // src/codex-client.ts
 import { spawn as nodeSpawn3 } from "child_process";
+
+// package.json
+var version = "0.5.3";
+
+// src/codex-client.ts
 var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;
 var CLIENT_INFO = {
   name: "agent_cli_runner",
   title: "Agent CLI Runner",
-  version: "0.1.0"
+  version
 };
 function rpcError(value, fallback) {
   if (!isRecord(value)) return new Error(fallback);
@@ -1470,24 +1581,14 @@ function rpcError(value, fallback) {
   return error;
 }
 async function startCodexAppServer(options) {
-  const spawnFn = options.spawnFn ?? nodeSpawn3;
-  let child;
-  try {
-    const env = childEnv("codex", options.env ?? process.env);
-    const launch = launchCommand(options.executablePath ?? "codex", ["app-server", "--stdio"], env, {
-      cwd: options.cwd
-    });
-    child = spawnFn(launch.command, launch.args, {
-      ...launch.options,
-      cwd: options.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env,
-      detached: process.platform !== "win32"
-    });
-  } catch (error) {
-    if (error instanceof Error && isMissingExecutable(error)) throw new MissingCliError("codex");
-    throw error;
-  }
+  const child = spawnCli({
+    cli: "codex",
+    spawnFn: options.spawnFn ?? nodeSpawn3,
+    command: options.executablePath ?? "codex",
+    args: ["app-server", "--stdio"],
+    cwd: options.cwd,
+    env: childEnv("codex", options.env ?? process.env)
+  });
   const pending = /* @__PURE__ */ new Map();
   const notificationHandlers = /* @__PURE__ */ new Set();
   let serverRequestRegistration;
@@ -1497,15 +1598,9 @@ async function startCodexAppServer(options) {
   let nextId = 1;
   let closed = false;
   let closeError;
-  let childExited = false;
   let terminationRequested = false;
-  let killTimer;
-  let exitFallbackTimer;
   let stderr = "";
-  let resolveExit;
-  const exitPromise = new Promise((resolve) => {
-    resolveExit = resolve;
-  });
+  const whenExited = createDeferred();
   const send = (message) => {
     if (closed) return;
     child.stdin?.write(`${JSON.stringify(message)}
@@ -1596,10 +1691,7 @@ async function startCodexAppServer(options) {
     fail(isMissingExecutable(error) ? new MissingCliError("codex") : error);
   });
   child.on("close", (code) => {
-    childExited = true;
-    resolveExit();
-    if (killTimer) clearTimeout(killTimer);
-    if (exitFallbackTimer) clearTimeout(exitFallbackTimer);
+    whenExited.resolve();
     splitter.flush();
     stderrDecoder.flush();
     const detail = stderr.trim();
@@ -1653,17 +1745,10 @@ async function startCodexAppServer(options) {
       return () => closeHandlers.delete(handler);
     },
     close() {
-      if (terminationRequested || childExited) return;
+      if (terminationRequested || whenExited.settled) return;
       terminationRequested = true;
       if (!closed) fail(new Error("Codex app-server was closed"));
-      signalProcessTree(child, "SIGTERM");
-      killTimer = setTimeout(() => {
-        if (childExited) return;
-        signalProcessTree(child, "SIGKILL");
-        exitFallbackTimer = setTimeout(resolveExit, SIGTERM_GRACE_MS);
-        exitFallbackTimer.unref();
-      }, SIGTERM_GRACE_MS);
-      killTimer.unref();
+      void terminateTree((signal) => signalProcessTree(child, signal), whenExited, { unref: true }).then(whenExited.resolve);
     }
   };
   const abort = () => client.close();
@@ -1678,7 +1763,7 @@ async function startCodexAppServer(options) {
       }
     });
     client.notify("initialized", {});
-    return { client, whenExited: exitPromise };
+    return { client, whenExited: whenExited.promise };
   } catch (error) {
     client.close();
     throw options.signal?.aborted ? new AbortError() : error;
@@ -1869,16 +1954,7 @@ function withWebUrl(item, url) {
   return { ...item, url };
 }
 function planItems(value) {
-  if (!Array.isArray(value)) return void 0;
-  const items = [];
-  for (const raw of value) {
-    const step = record(raw);
-    const itemText = normalizeSummary(step?.step ?? step?.text);
-    const status = normalizePlanStatus(step?.status);
-    if (!itemText || !status) return void 0;
-    items.push({ text: itemText, status });
-  }
-  return items.length > 0 ? items : void 0;
+  return toPlanItems(value, (step) => planItem(step.step ?? step.text, step.status));
 }
 function planToolInfo(params, turnId) {
   const items = planItems(params.plan);
@@ -1912,30 +1988,31 @@ function backgroundStatus(value) {
       return void 0;
   }
 }
-function terminalBackgroundStatus(status) {
-  return status === "completed" || status === "failed" || status === "interrupted";
-}
 function toUsage(params, threadId, turnId, model, fallbackWindow) {
   if (params.threadId !== threadId || params.turnId !== turnId) return void 0;
-  const tokenUsage = record(params.tokenUsage);
-  const last = record(tokenUsage?.last);
+  const reported = record(params.tokenUsage);
+  const last = record(reported?.last);
   if (!last) return void 0;
   if (toTokenCount(last.totalTokens) <= 0) return void 0;
   const input = toTokenCount(last.inputTokens);
-  const cached = toTokenCount(last.cachedInputTokens);
-  const contextWindow = toContextWindow(tokenUsage?.modelContextWindow) ?? fallbackWindow;
-  return {
+  return codexTokenUsage({
     // Input side only (cached included), per the TokenUsage contract — not
     // last.totalTokens, which also counts output. Matches the Claude and
     // isolated-exec paths. A compaction sends no request: Codex reports its
     // estimate of the compacted history as a total with no input behind it.
     contextTokens: input > 0 ? input : toTokenCount(last.totalTokens),
-    inputTokens: Math.max(0, input - cached),
-    cachedInputTokens: cached,
-    outputTokens: toTokenCount(last.outputTokens),
-    ...model ? { model } : {},
-    ...contextWindow !== void 0 ? { contextWindow } : {}
-  };
+    input,
+    cached: toTokenCount(last.cachedInputTokens),
+    output: toTokenCount(last.outputTokens)
+  }, model, toContextWindow(reported?.modelContextWindow) ?? fallbackWindow);
+}
+function codexTokenUsage(counts, model, contextWindow) {
+  return tokenUsage({
+    contextTokens: counts.contextTokens,
+    inputTokens: Math.max(0, counts.input - counts.cached),
+    cachedInputTokens: counts.cached,
+    outputTokens: counts.output
+  }, model, contextWindow);
 }
 function threadIdFrom(value) {
   return text(record(record(value)?.thread)?.id);
@@ -1981,6 +2058,116 @@ function codexElicitationRequest(params) {
     return url ? { serverName, message, mode: "url", url } : void 0;
   }
   return void 0;
+}
+function createWebToolTracker(emit) {
+  const pendingWebTools = /* @__PURE__ */ new Map();
+  const rawWebCalls = /* @__PURE__ */ new Map();
+  const unassignedRawWebCalls = [];
+  const assignRawWebCall = (id, pending) => {
+    if (pending.rawCallId) return;
+    for (let index = unassignedRawWebCalls.length - 1; index >= 0; index -= 1) {
+      const call2 = rawWebCalls.get(unassignedRawWebCalls[index]);
+      if (!call2 || call2.webItemId) unassignedRawWebCalls.splice(index, 1);
+    }
+    if (unassignedRawWebCalls.length !== 1) return;
+    const callId = unassignedRawWebCalls.shift();
+    if (!callId) return;
+    const call = rawWebCalls.get(callId);
+    if (!call) return;
+    call.webItemId = id;
+    pending.rawCallId = callId;
+  };
+  const emitPendingWebTool = (id, force) => {
+    const pending = pendingWebTools.get(id);
+    if (!pending) return;
+    const rawCall = pending.rawCallId ? rawWebCalls.get(pending.rawCallId) : void 0;
+    const item = withWebUrl(pending.item, rawCall?.inputUrl ?? rawCall?.outputUrl);
+    const needsUrl = toolName(item) === "WebFetch" && !webUrl(item);
+    if (!force && needsUrl && rawCall && !rawCall.outputCompleted) return;
+    emit.toolUse(id, item);
+    if (pending.completed) emit.toolResult(id, item);
+    if (pending.completed || force) pendingWebTools.delete(id);
+  };
+  return {
+    onWebItem(item, completed) {
+      const id = text(item.id) ?? `${itemType(item)}:web`;
+      const pending = pendingWebTools.get(id) ?? {
+        item,
+        completed: false
+      };
+      pending.item = item;
+      pending.completed = completed;
+      assignRawWebCall(id, pending);
+      pendingWebTools.set(id, pending);
+      if (pending.completed) emitPendingWebTool(id, false);
+    },
+    onRawResponseItem(item) {
+      const rawCall = singleRawWebCall(item);
+      if (rawCall) {
+        rawWebCalls.set(rawCall.callId, {
+          ...rawCall,
+          outputCompleted: false
+        });
+        unassignedRawWebCalls.push(rawCall.callId);
+        return;
+      }
+      if (itemType(item) !== "custom_tool_call_output") return;
+      const callId = text(item.call_id) ?? text(item.callId);
+      if (!callId) return;
+      const call = rawWebCalls.get(callId);
+      if (!call) return;
+      call.outputCompleted = true;
+      const outputUrl = rawWebOutputUrl(item);
+      if (outputUrl) call.outputUrl = outputUrl;
+      if (call.webItemId) {
+        emitPendingWebTool(call.webItemId, false);
+      }
+    },
+    flush() {
+      for (const id of [...pendingWebTools.keys()]) emitPendingWebTool(id, true);
+    }
+  };
+}
+function createCodexAgentTracker(onUpdate) {
+  const backgroundAgents = /* @__PURE__ */ new Map();
+  return {
+    update(item, occurredAt) {
+      const type = itemType(item);
+      if (type !== "collabAgentToolCall" && type !== "collab_tool_call") return;
+      const tool = text(item.tool);
+      const isSpawn = tool === "spawnAgent" || tool === "spawn_agent";
+      const states = record(property(item, "agentsStates", "agents_states")) ?? {};
+      const rawReceiverIds = property(item, "receiverThreadIds", "receiver_thread_ids");
+      const receiverIds = Array.isArray(rawReceiverIds) ? rawReceiverIds.filter((id) => typeof id === "string") : [];
+      for (const id of /* @__PURE__ */ new Set([...receiverIds, ...Object.keys(states)])) {
+        const current = backgroundAgents.get(id);
+        if (!current && !isSpawn) continue;
+        const state = record(states[id]);
+        const status = backgroundStatus(state?.status) ?? current?.status ?? "pending";
+        const message = text(state?.message);
+        const itemId = text(item.id);
+        const description = current?.description ?? text(item.prompt);
+        const agent = {
+          ...current ?? {
+            id,
+            provider: "codex",
+            startedAt: occurredAt
+          },
+          ...!current?.parentToolCallId && itemId ? { parentToolCallId: itemId } : {},
+          ...description ? { description } : {},
+          status,
+          ...message && status === "failed" ? { error: message } : {},
+          ...message && status !== "failed" ? { summary: message } : {},
+          updatedAt: occurredAt,
+          ...isTerminalAgentStatus(status) ? { endedAt: current?.endedAt ?? occurredAt } : {}
+        };
+        if (status === "failed") delete agent.summary;
+        else delete agent.error;
+        backgroundAgents.set(id, agent);
+        onUpdate(agent);
+      }
+    }
+  };
 }
 
 // src/fork.ts
@@ -2060,40 +2247,33 @@ var FORK_ALLOWED_ITEMS = /* @__PURE__ */ new Set([
   "contextCompaction"
 ]);
 function requestCodexThread(client, opts) {
+  const forkParams = (threadId, config) => ({
+    threadId,
+    cwd: opts.cwd,
+    ...opts.model ? { model: opts.model } : {},
+    ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
+    ephemeral: true,
+    // Ephemeral forks of paginated threads must skip hydrating history.
+    excludeTurns: true,
+    sandbox: "read-only",
+    approvalPolicy: "never",
+    experimentalRawEvents: true,
+    ...config ? { config } : {}
+  });
   if (opts.forkSessionId && !opts.isolated) {
-    return client.request("thread/fork", {
-      threadId: opts.forkSessionId,
-      cwd: opts.cwd,
-      ...opts.model ? { model: opts.model } : {},
-      ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
-      ephemeral: true,
-      excludeTurns: true,
-      sandbox: "read-only",
-      approvalPolicy: "never",
-      experimentalRawEvents: true,
-      ...opts.forkConfig ? { config: opts.forkConfig } : {}
-    });
+    return client.request("thread/fork", forkParams(opts.forkSessionId, opts.forkConfig));
   }
   if (opts.forkSessionId) {
     const forkSessionId = opts.forkSessionId;
-    return client.request("config/read", { cwd: opts.cwd }).then((read) => client.request("thread/fork", {
-      threadId: forkSessionId,
-      cwd: opts.cwd,
-      ...opts.model ? { model: opts.model } : {},
-      ...opts.developerInstructions ? { developerInstructions: opts.developerInstructions } : {},
-      ephemeral: true,
-      // Ephemeral forks of paginated threads must skip hydrating history.
-      excludeTurns: true,
-      sandbox: "read-only",
-      approvalPolicy: "never",
-      experimentalRawEvents: true,
-      config: {
+    return client.request("config/read", { cwd: opts.cwd }).then((read) => client.request(
+      "thread/fork",
+      forkParams(forkSessionId, {
         ...CODEX_FORK_CONFIG,
         mcp_servers: Object.fromEntries(
           Object.keys(record(record(record(read)?.config)?.mcp_servers) ?? {}).map((name) => [name, { enabled: false }])
         )
-      }
-    }));
+      })
+    ));
   }
   const params = {
     cwd: opts.cwd,
@@ -2122,7 +2302,10 @@ async function runCodexAppServerTurn(opts, {
   continuity,
   start
 }) {
-  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  if (opts.signal?.aborted) {
+    if (ownedClient) client.close();
+    throw runAborted("codex");
+  }
   const isPreviousTurn = (turnId2) => continuity?.previousTurnIds?.has(turnId2) ?? false;
   let threadId = openedThread?.threadId ?? opts.resumeSessionId;
   let turnId;
@@ -2135,7 +2318,7 @@ async function runCodexAppServerTurn(opts, {
     const held = pendingTurnError;
     pendingTurnError = void 0;
     if (held.turnId !== turnId) return;
-    flushPendingWebTools();
+    webTools.flush();
     settleError(held.error);
   };
   const matchTurn = (eventTurnId) => {
@@ -2144,15 +2327,13 @@ async function runCodexAppServerTurn(opts, {
     if (turnId && eventTurnId !== turnId) return void 0;
     if (!turnId) {
       turnId = eventTurnId;
-      resolveTurnLatched();
+      turnLatched.resolve();
       resolvePendingTurnError();
     }
     return eventTurnId;
   };
-  let resolveTurnLatched;
-  const turnLatched = new Promise((resolve) => {
-    resolveTurnLatched = resolve;
-  });
+  const turnScoped = (params) => params.threadId === threadId ? matchTurn(text(params.turnId)) : void 0;
+  const turnLatched = createDeferred();
   let resolvedModel = opts.model ?? openedThread?.model;
   let finalText = "";
   let latestUsage;
@@ -2160,39 +2341,25 @@ async function runCodexAppServerTurn(opts, {
   let interruption;
   let timeout;
   const emittedTools = /* @__PURE__ */ new Set();
-  const backgroundAgents = /* @__PURE__ */ new Map();
-  const pendingWebTools = /* @__PURE__ */ new Map();
-  const rawWebCalls = /* @__PURE__ */ new Map();
-  const unassignedRawWebCalls = [];
-  let resolveCompletion;
-  let rejectCompletion;
-  const completion = new Promise((resolve, reject) => {
-    resolveCompletion = resolve;
-    rejectCompletion = reject;
+  const completion = createDeferred();
+  void completion.promise.catch(() => {
   });
-  void completion.catch(() => {
-  });
-  let rejectLifecycle;
-  let lifecycleFailed = false;
-  const lifecycleFailure = new Promise((_resolve, reject) => {
-    rejectLifecycle = reject;
+  const lifecycle = createDeferred();
+  const lifecycleFailure = lifecycle.promise;
+  void lifecycleFailure.catch(() => {
   });
   const failLifecycle = (error) => {
-    if (lifecycleFailed) return;
-    lifecycleFailed = true;
-    rejectLifecycle(error);
+    if (lifecycle.settled) return;
+    lifecycle.reject(error);
   };
   const raceLifecycle = (operation) => Promise.race([operation, lifecycleFailure]);
-  let resolveTurnKnown;
-  const turnKnown = new Promise((resolve) => {
-    resolveTurnKnown = resolve;
-  });
+  const turnKnown = createDeferred();
   const steer = async (prompt) => {
     if (settled || interruption) throw new SteerRejectedError("Codex turn is already finishing");
     try {
       const known = await Promise.race([
-        turnKnown,
-        completion.then(() => {
+        turnKnown.promise,
+        completion.promise.then(() => {
           throw new SteerRejectedError("Codex turn ended before it could be steered");
         }),
         lifecycleFailure
@@ -2200,9 +2367,7 @@ async function runCodexAppServerTurn(opts, {
       if (!known) throw new SteerRejectedError("Codex turn ended before it could be steered");
     } catch (error) {
       if (error instanceof SteerRejectedError) throw error;
-      throw new SteerRejectedError(
-        `Codex turn ended before it could be steered: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw new SteerRejectedError(`Codex turn ended before it could be steered: ${errorMessage(error)}`);
     }
     if (settled || interruption || !threadId || !turnId) {
       throw new SteerRejectedError("Codex turn is already finishing");
@@ -2214,32 +2379,34 @@ async function runCodexAppServerTurn(opts, {
         input: [{ type: "text", text: prompt, text_elements: [] }]
       });
     } catch (error) {
-      throw new SteerRejectedError(
-        `Codex refused the steer: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw new SteerRejectedError(`Codex refused the steer: ${errorMessage(error)}`);
     }
   };
   continuity?.onSteerable?.(steer);
+  const settleOk = () => {
+    if (settled) return;
+    settled = true;
+    completion.resolve();
+  };
   const settleError = (error) => {
     if (settled) return;
     settled = true;
-    rejectCompletion(error);
+    completion.reject(error);
   };
+  const sendInterrupt = () => threadId && turnId ? client.request("turn/interrupt", { threadId, turnId }).catch(() => {
+  }) : Promise.resolve();
   const requestInterrupt = () => {
-    if (!interruption || !threadId || !turnId) return;
-    void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
-    }).finally(() => failLifecycle(interruption));
+    const stopped = interruption;
+    if (!stopped || !threadId || !turnId) return;
+    void sendInterrupt().finally(() => failLifecycle(stopped));
   };
   const refuseForkedTool = (params) => {
-    if (params.threadId !== threadId || !matchTurn(text(params.turnId))) return false;
+    if (!turnScoped(params)) return false;
     const item = record(params.item);
     const type = item ? text(item.type) : void 0;
     if (!item || !type || FORK_ALLOWED_ITEMS.has(type)) return false;
     const name = toolName(item) ?? type;
-    if (threadId && turnId) {
-      void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
-      });
-    }
+    void sendInterrupt();
     settleError(new CodexTurnError(`A forked side run tried to use ${name}`));
     return true;
   };
@@ -2249,7 +2416,7 @@ async function runCodexAppServerTurn(opts, {
     if (threadId && turnId) requestInterrupt();
     else failLifecycle(error);
   };
-  const abortHandler = () => interrupt(new AbortError("codex run aborted"));
+  const abortHandler = () => interrupt(runAborted("codex"));
   if (opts.signal) {
     if (opts.signal.aborted) abortHandler();
     else opts.signal.addEventListener("abort", abortHandler, { once: true });
@@ -2258,7 +2425,7 @@ async function runCodexAppServerTurn(opts, {
   if (opts.timeoutMs !== void 0) {
     runDeadline = Date.now() + opts.timeoutMs;
     timeout = setTimeout(
-      () => interrupt(new TimeoutError(`codex run timed out after ${opts.timeoutMs}ms`)),
+      () => interrupt(runTimedOut("codex", opts.timeoutMs)),
       opts.timeoutMs
     );
   }
@@ -2284,101 +2451,16 @@ async function runCodexAppServerTurn(opts, {
       ...typeof exitCode === "number" && exitCode !== 0 || status === "failed" ? { isError: true } : {}
     }));
   };
-  const assignRawWebCall = (id, pending) => {
-    if (pending.rawCallId) return;
-    for (let index = unassignedRawWebCalls.length - 1; index >= 0; index -= 1) {
-      const call2 = rawWebCalls.get(unassignedRawWebCalls[index]);
-      if (!call2 || call2.webItemId) unassignedRawWebCalls.splice(index, 1);
-    }
-    if (unassignedRawWebCalls.length !== 1) return;
-    const callId = unassignedRawWebCalls.shift();
-    if (!callId) return;
-    const call = rawWebCalls.get(callId);
-    if (!call) return;
-    call.webItemId = id;
-    pending.rawCallId = callId;
-  };
-  const emitPendingWebTool = (id, force) => {
-    const pending = pendingWebTools.get(id);
-    if (!pending) return;
-    const rawCall = pending.rawCallId ? rawWebCalls.get(pending.rawCallId) : void 0;
-    const item = withWebUrl(pending.item, rawCall?.inputUrl ?? rawCall?.outputUrl);
-    const needsUrl = toolName(item) === "WebFetch" && !webUrl(item);
-    if (!force && needsUrl && rawCall && !rawCall.outputCompleted) return;
-    emitToolUse(id, item);
-    if (pending.completed) emitToolResult(id, item);
-    if (pending.completed || force) pendingWebTools.delete(id);
-  };
-  const flushPendingWebTools = () => {
-    for (const id of [...pendingWebTools.keys()]) emitPendingWebTool(id, true);
-  };
-  const handleRawResponseItem = (params) => {
-    const item = record(params.item);
-    if (!item) return;
-    const rawCall = singleRawWebCall(item);
-    if (rawCall) {
-      rawWebCalls.set(rawCall.callId, {
-        ...rawCall,
-        outputCompleted: false
-      });
-      unassignedRawWebCalls.push(rawCall.callId);
-      return;
-    }
-    if (itemType(item) !== "custom_tool_call_output") return;
-    const callId = text(item.call_id) ?? text(item.callId);
-    if (!callId) return;
-    const call = rawWebCalls.get(callId);
-    if (!call) return;
-    call.outputCompleted = true;
-    const outputUrl = rawWebOutputUrl(item);
-    if (outputUrl) call.outputUrl = outputUrl;
-    if (call.webItemId) {
-      emitPendingWebTool(call.webItemId, false);
-    }
-  };
-  const updateBackgroundAgents = (item, occurredAt) => {
-    const type = itemType(item);
-    if (type !== "collabAgentToolCall" && type !== "collab_tool_call") return;
-    const tool = text(item.tool);
-    const isSpawn = tool === "spawnAgent" || tool === "spawn_agent";
-    const states = record(property(item, "agentsStates", "agents_states")) ?? {};
-    const rawReceiverIds = property(item, "receiverThreadIds", "receiver_thread_ids");
-    const receiverIds = Array.isArray(rawReceiverIds) ? rawReceiverIds.filter((id) => typeof id === "string") : [];
-    for (const id of /* @__PURE__ */ new Set([...receiverIds, ...Object.keys(states)])) {
-      const current = backgroundAgents.get(id);
-      if (!current && !isSpawn) continue;
-      const state = record(states[id]);
-      const status = backgroundStatus(state?.status) ?? current?.status ?? "pending";
-      const message = text(state?.message);
-      const itemId = text(item.id);
-      const description = current?.description ?? text(item.prompt);
-      const agent = {
-        ...current ?? {
-          id,
-          provider: "codex",
-          startedAt: occurredAt
-        },
-        ...!current?.parentToolCallId && itemId ? { parentToolCallId: itemId } : {},
-        ...description ? { description } : {},
-        status,
-        ...message && status === "failed" ? { error: message } : {},
-        ...message && status !== "failed" ? { summary: message } : {},
-        updatedAt: occurredAt,
-        ...terminalBackgroundStatus(status) ? { endedAt: current?.endedAt ?? occurredAt } : {}
-      };
-      if (status === "failed") delete agent.summary;
-      else delete agent.error;
-      backgroundAgents.set(id, agent);
-      safeCallback(() => opts.onBackgroundAgentUpdate?.(agent));
-    }
-  };
+  const webTools = createWebToolTracker({ toolUse: emitToolUse, toolResult: emitToolResult });
+  const agents = createCodexAgentTracker((agent) => {
+    safeCallback(() => opts.onBackgroundAgentUpdate?.(agent));
+  });
   const handleItem = (method, params) => {
-    if (params.threadId !== threadId) return;
-    if (!matchTurn(text(params.turnId))) return;
+    if (!turnScoped(params)) return;
     const item = record(params.item);
     if (!item) return;
     const occurredAt = typeof params.startedAtMs === "number" ? params.startedAtMs : typeof params.completedAtMs === "number" ? params.completedAtMs : Date.now();
-    updateBackgroundAgents(item, occurredAt);
+    agents.update(item, occurredAt);
     if (itemType(item) === "contextCompaction") {
       if (method === "item/completed") {
         const info = { trigger: start === "compact" ? "manual" : "auto" };
@@ -2395,16 +2477,7 @@ async function runCodexAppServerTurn(opts, {
       return;
     }
     if (isWebItem(item)) {
-      const id2 = text(item.id) ?? `${itemType(item)}:web`;
-      const pending = pendingWebTools.get(id2) ?? {
-        item,
-        completed: false
-      };
-      pending.item = item;
-      pending.completed = method === "item/completed";
-      assignRawWebCall(id2, pending);
-      pendingWebTools.set(id2, pending);
-      if (pending.completed) emitPendingWebTool(id2, false);
+      webTools.onWebItem(item, method === "item/completed");
       return;
     }
     const name = toolName(item);
@@ -2425,20 +2498,19 @@ async function runCodexAppServerTurn(opts, {
       return;
     }
     if (method === "item/agentMessage/delta") {
-      if (params.threadId !== threadId) return;
-      if (!matchTurn(text(params.turnId))) return;
+      if (!turnScoped(params)) return;
       const chunk = typeof params.delta === "string" ? params.delta : "";
       if (chunk) safeCallback(() => opts.onAssistantTextDelta?.(chunk));
       return;
     }
     if (method === "rawResponseItem/completed") {
-      if (params.threadId !== threadId) return;
-      if (!matchTurn(text(params.turnId))) return;
-      handleRawResponseItem(params);
+      if (!turnScoped(params)) return;
+      const item = record(params.item);
+      if (item) webTools.onRawResponseItem(item);
       return;
     }
-    if (method === "turn/plan/updated" && params.threadId === threadId) {
-      const eventTurnId = matchTurn(text(params.turnId));
+    if (method === "turn/plan/updated") {
+      const eventTurnId = turnScoped(params);
       if (!eventTurnId) return;
       const info = planToolInfo(params, eventTurnId);
       if (info) safeCallback(() => opts.onToolUse?.(info));
@@ -2466,23 +2538,20 @@ async function runCodexAppServerTurn(opts, {
         }
         if (errorTurnId !== turnId) return;
       }
-      flushPendingWebTools();
+      webTools.flush();
       settleError(new CodexTurnError(`Codex error: ${message2}`));
       return;
     }
     if (method !== "turn/completed" || params.threadId !== threadId) return;
     if (!matchTurn(text(record(params.turn)?.id))) return;
-    flushPendingWebTools();
+    webTools.flush();
     if (interruption) {
       failLifecycle(interruption);
       return;
     }
     const status = text(record(params.turn)?.status);
     if (status === "completed") {
-      if (!settled) {
-        settled = true;
-        resolveCompletion();
-      }
+      settleOk();
       return;
     }
     const message = text(record(record(params.turn)?.error)?.message) ?? `Codex turn ${status ?? "failed"}`;
@@ -2508,15 +2577,14 @@ async function runCodexAppServerTurn(opts, {
   const removeClose = client.onClose((error) => settleError(error));
   const removeStderr = client.onStderr((chunk) => safeCallback(() => opts.onStderr?.(chunk)));
   try {
-    if (!openedThread) {
-      const opened = openedCodexThread(
-        await raceLifecycle(requestCodexThread(client, opts)),
-        resolvedModel
-      );
-      threadId = opened.threadId;
-      resolvedModel = opened.model;
-    }
-    safeCallback(() => opts.onSessionId?.(threadId));
+    const thread = openedThread ?? openedCodexThread(
+      await raceLifecycle(requestCodexThread(client, opts)),
+      resolvedModel
+    );
+    threadId = thread.threadId;
+    if (!openedThread) resolvedModel = thread.model;
+    safeCallback(() => opts.onSessionId?.(thread.threadId));
+    if (interruption) throw interruption;
     const input = [
       { type: "text", text: opts.prompt, text_elements: [] },
       ...(opts.imagePaths ?? []).map((path) => ({ type: "localImage", path }))
@@ -2537,7 +2605,7 @@ async function runCodexAppServerTurn(opts, {
           ...opts.serviceTier !== void 0 ? { serviceTier: opts.serviceTier } : {},
           ...opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}
         }, turnStartTimeoutMs),
-        completion.then(() => {
+        completion.promise.then(() => {
           throw new CodexTurnError("Codex turn settled before turn/start was acknowledged");
         }),
         lifecycleFailure
@@ -2548,32 +2616,22 @@ async function runCodexAppServerTurn(opts, {
           dispatchNotification(entry.method, entry.params);
         }
         if (!turnId) {
-          let stall;
-          try {
-            await Promise.race([
-              turnLatched,
-              completion.then(() => {
+          await raceTimeout(
+            [
+              turnLatched.promise,
+              completion.promise.then(() => {
                 throw new CodexTurnError("Codex compaction settled before it started");
               }),
-              lifecycleFailure,
-              new Promise((_resolve, reject) => {
-                stall = setTimeout(
-                  () => reject(new TimeoutError("Codex app-server did not start the compaction")),
-                  Math.max(1, startDeadline - Date.now())
-                );
-              })
-            ]);
-          } finally {
-            if (stall) clearTimeout(stall);
-          }
+              lifecycleFailure
+            ],
+            Math.max(1, startDeadline - Date.now()),
+            () => new TimeoutError("Codex app-server did not start the compaction")
+          );
         }
       }
     } catch (error) {
       if ((error instanceof TimeoutError || error instanceof AbortError) && threadId) {
-        if (turnId && !interruption) {
-          void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
-          });
-        }
+        if (!interruption) void sendInterrupt();
         if (retireClientOnUnackedStart) client.close();
       }
       throw error;
@@ -2584,7 +2642,7 @@ async function runCodexAppServerTurn(opts, {
       dispatchNotification(entry.method, entry.params);
     }
     if (!turnId) throw new CodexTurnError("Codex app-server did not return a turn ID");
-    resolveTurnKnown(true);
+    turnKnown.resolve(true);
     resolvePendingTurnError();
     if (interruption) requestInterrupt();
     const ackStatus = turnStatus(turnResult);
@@ -2594,20 +2652,20 @@ async function runCodexAppServerTurn(opts, {
       settled = true;
       exitCode = 1;
     } else {
-      await raceLifecycle(completion);
+      await raceLifecycle(completion.promise);
       if (ackTerminal) exitCode = 1;
     }
     return {
       text: finalText.trim(),
       exitCode,
-      sessionId: threadId,
+      sessionId: thread.threadId,
       ...latestUsage ? { usage: latestUsage } : {}
     };
   } finally {
     continuity?.onSteerable?.(null);
-    resolveTurnKnown(false);
+    turnKnown.resolve(false);
     if (timeout) clearTimeout(timeout);
-    flushPendingWebTools();
+    webTools.flush();
     opts.signal?.removeEventListener("abort", abortHandler);
     removeNotification();
     removeClose();
@@ -2624,10 +2682,12 @@ var FORM_INPUT_EXTENSION = "openai/standard-form-input";
 async function createCodexAppServerSession(options) {
   const { client, whenExited } = await startCodexAppServer({
     cwd: options.cwd,
-    ...options.executablePath ? { executablePath: options.executablePath } : {},
-    ...options.env ? { env: options.env } : {},
-    ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
-    ...options.requestTimeoutMs !== void 0 ? { requestTimeoutMs: options.requestTimeoutMs } : {},
+    ...withoutUndefined({
+      executablePath: options.executablePath || void 0,
+      env: options.env,
+      spawnFn: options.spawnFn,
+      requestTimeoutMs: options.requestTimeoutMs
+    }),
     extensions: { [FORM_INPUT_EXTENSION]: {} }
   });
   let activeTurn;
@@ -2737,13 +2797,13 @@ async function createCodexAppServerSession(options) {
       return await runCodexAppServerTurn({
         ...turnOptions,
         cwd: options.cwd,
-        ...options.executablePath ? { executablePath: options.executablePath } : {},
-        ...options.env ? { env: options.env } : {},
-        ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
-        ...options.dangerouslyBypassApprovalsAndSandbox !== void 0 ? {
-          dangerouslyBypassApprovalsAndSandbox: options.dangerouslyBypassApprovalsAndSandbox
-        } : {},
-        ...options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}
+        ...withoutUndefined({
+          executablePath: options.executablePath || void 0,
+          env: options.env,
+          spawnFn: options.spawnFn,
+          dangerouslyBypassApprovalsAndSandbox: options.dangerouslyBypassApprovalsAndSandbox,
+          developerInstructions: options.developerInstructions || void 0
+        })
       }, {
         client,
         thread: opened,
@@ -2806,13 +2866,15 @@ async function createCodexAppServerSession(options) {
   };
 }
 async function runCodexAppServer(opts) {
-  if (opts.signal?.aborted) throw new AbortError("codex run aborted");
+  if (opts.signal?.aborted) throw runAborted("codex");
   const ownedClient = !opts.appServerClient;
   const client = opts.appServerClient ?? await createCodexAppServerClient({
     cwd: opts.cwd,
-    ...opts.executablePath ? { executablePath: opts.executablePath } : {},
-    ...opts.env ? { env: opts.env } : {},
-    ...opts.spawnFn ? { spawnFn: opts.spawnFn } : {}
+    ...withoutUndefined({
+      executablePath: opts.executablePath || void 0,
+      env: opts.env,
+      spawnFn: opts.spawnFn
+    })
   });
   return runCodexAppServerTurn(opts, {
     client,
@@ -2845,27 +2907,20 @@ function buildIsolatedArgs(opts) {
   args.push("-");
   return args;
 }
+function isExecPlanItem(item) {
+  return item.type === "todo_list" || item.type === "plan_update";
+}
 function execToolName(item) {
-  if (item.type === "todo_list" || item.type === "plan_update") return "TodoWrite";
-  return toolName(item);
+  return isExecPlanItem(item) ? "TodoWrite" : toolName(item);
 }
 function execPlanItems(item) {
-  const values = Array.isArray(item.items) ? item.items : Array.isArray(item.plan) ? item.plan : void 0;
-  if (!values) return void 0;
-  const items = [];
-  for (const value of values) {
-    if (!isRecord(value)) return void 0;
-    const text2 = normalizeSummary(value.text) ?? normalizeSummary(value.step);
-    const status = typeof value.completed === "boolean" ? value.completed ? "completed" : "pending" : normalizePlanStatus(value.status);
-    if (!text2 || !status) return void 0;
-    items.push({ text: text2, status });
-  }
-  return items.length > 0 ? items : void 0;
+  return toPlanItems(Array.isArray(item.items) ? item.items : item.plan, (entry) => planItem(
+    normalizeSummary(entry.text) ?? normalizeSummary(entry.step),
+    typeof entry.completed === "boolean" ? entry.completed ? "completed" : "pending" : entry.status
+  ));
 }
 function execToolSummary(item, planItems2) {
-  if ((item.type === "todo_list" || item.type === "plan_update") && planItems2) {
-    return planCompletionSummary(planItems2);
-  }
+  if (isExecPlanItem(item) && planItems2) return planCompletionSummary(planItems2);
   return summarizeTool(item);
 }
 function execUsage(usage, opts) {
@@ -2873,42 +2928,34 @@ function execUsage(usage, opts) {
   const cached = toTokenCount(usage.cached_input_tokens);
   const output = toTokenCount(usage.output_tokens);
   if (input + output <= 0) return void 0;
-  const contextWindow = opts.contextWindow ?? contextWindowForModel(opts.model);
-  return {
+  return codexTokenUsage(
     // Input side only (cached included), per the TokenUsage contract — not
     // app-server's totalTokens, which also counts output.
-    contextTokens: input,
-    inputTokens: Math.max(0, input - cached),
-    cachedInputTokens: cached,
-    outputTokens: output,
-    ...opts.model ? { model: opts.model } : {},
-    ...contextWindow !== void 0 ? { contextWindow } : {}
-  };
+    { contextTokens: input, input, cached, output },
+    opts.model,
+    opts.contextWindow ?? contextWindowForModel(opts.model)
+  );
+}
+function errorDetail(event) {
+  if (typeof event.message === "string") return event.message;
+  if (typeof event.error === "string") return event.error;
+  if (isRecord(event.error) && typeof event.error.message === "string") return event.error.message;
+  return void 0;
 }
 function execFatalError(event) {
   if (event.type !== "error" && event.type !== "turn.failed") return void 0;
-  const detail = typeof event.message === "string" ? event.message : typeof event.error === "string" ? event.error : isRecord(event.error) && typeof event.error.message === "string" ? event.error.message : void 0;
+  const detail = errorDetail(event);
   return new CodexTurnError(detail ? `Codex error: ${detail}` : "Codex error");
 }
 async function runIsolatedCodex(opts) {
-  const spawnFn = opts.spawnFn ?? spawn;
-  let child;
-  try {
-    const env = childEnv("codex", opts.env ?? process.env);
-    const launch = launchCommand(opts.executablePath ?? "codex", buildIsolatedArgs(opts), env, {
-      cwd: opts.cwd
-    });
-    child = spawnFn(launch.command, launch.args, {
-      ...launch.options,
-      cwd: opts.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env,
-      detached: process.platform !== "win32"
-    });
-  } catch (error) {
-    if (error instanceof Error && isMissingExecutable(error)) throw new MissingCliError("codex");
-    throw error;
-  }
+  const child = spawnCli({
+    cli: "codex",
+    spawnFn: opts.spawnFn ?? spawn,
+    command: opts.executablePath ?? "codex",
+    args: buildIsolatedArgs(opts),
+    cwd: opts.cwd,
+    env: childEnv("codex", opts.env ?? process.env)
+  });
   return new Promise((resolve, reject) => {
     let settled = false;
     let sessionId;
@@ -2916,11 +2963,12 @@ async function runIsolatedCodex(opts) {
     let latestUsage;
     let fatalError;
     const emittedTools = /* @__PURE__ */ new Set();
+    const ended = createDeferred();
     const lifecycle = watchLifecycle({
       cli: "codex",
       signal: opts.signal,
       timeoutMs: opts.timeoutMs,
-      kill: (signal) => signalProcessTree(child, signal)
+      terminate: () => void terminateTree((signal) => signalProcessTree(child, signal), ended)
     });
     const handleLine = (line) => {
       let event;
@@ -2980,12 +3028,14 @@ async function runIsolatedCodex(opts) {
     );
     child.stderr?.on("data", (chunk) => stderrDecoder.push(chunk));
     child.on("error", (error) => {
+      ended.resolve();
       if (settled) return;
       settled = true;
       lifecycle.cleanup();
       reject(isMissingExecutable(error) ? new MissingCliError("codex") : error);
     });
     child.on("close", (code) => {
+      ended.resolve();
       if (settled) return;
       settled = true;
       splitter.flush();
@@ -3015,25 +3065,33 @@ async function runCodex(opts) {
   if (opts.forkConfig && (!opts.forkSessionId || opts.isolated)) {
     throw new Error("only a guarded fork can take fork config");
   }
-  if (opts.forkSessionId) return runForkedCodex(opts);
-  if (!opts.isolated) {
-    if (opts.appServerClient && opts.appServerSession) {
-      throw new Error("Codex runs cannot use both appServerClient and appServerSession");
-    }
-    if (opts.appServerSession) {
-      if (opts.resumeSessionId) {
-        throw new Error("Session-backed Codex runs cannot resume another session");
-      }
-      if (opts.developerInstructions !== void 0 || opts.dangerouslyBypassApprovalsAndSandbox !== void 0 || opts.env !== void 0 || opts.executablePath !== void 0 || opts.spawnFn !== void 0) {
-        throw new Error("Session-backed Codex runs cannot override thread or client options");
-      }
-      if (opts.cwd !== opts.appServerSession.cwd) {
-        throw new Error("Codex run cwd must match the app-server session cwd");
-      }
-      return opts.appServerSession.runTurn(opts);
-    }
+  if (opts.forkSessionId) {
+    validateForkedRun(opts);
     return runCodexAppServer(opts);
   }
+  if (opts.isolated) {
+    validateIsolatedRun(opts);
+    return runIsolatedCodex(opts);
+  }
+  validateAppServerRun(opts);
+  return opts.appServerSession ? opts.appServerSession.runTurn(opts) : runCodexAppServer(opts);
+}
+function validateAppServerRun(opts) {
+  if (opts.appServerClient && opts.appServerSession) {
+    throw new Error("Codex runs cannot use both appServerClient and appServerSession");
+  }
+  if (!opts.appServerSession) return;
+  if (opts.resumeSessionId) {
+    throw new Error("Session-backed Codex runs cannot resume another session");
+  }
+  if (opts.developerInstructions !== void 0 || opts.dangerouslyBypassApprovalsAndSandbox !== void 0 || opts.env !== void 0 || opts.executablePath !== void 0 || opts.spawnFn !== void 0) {
+    throw new Error("Session-backed Codex runs cannot override thread or client options");
+  }
+  if (opts.cwd !== opts.appServerSession.cwd) {
+    throw new Error("Codex run cwd must match the app-server session cwd");
+  }
+}
+function validateIsolatedRun(opts) {
   if (opts.appServerSession || opts.appServerClient) {
     throw new Error("isolated Codex runs cannot reuse app-server state");
   }
@@ -3050,9 +3108,8 @@ async function runCodex(opts) {
   if (opts.serviceTier !== void 0) {
     throw new Error("isolated Codex runs cannot set a service tier \u2014 codex exec has no equivalent");
   }
-  return runIsolatedCodex(opts);
 }
-function runForkedCodex(opts) {
+function validateForkedRun(opts) {
   if (opts.appServerSession || opts.appServerClient) {
     throw new Error("forked Codex runs cannot reuse app-server state");
   }
@@ -3071,7 +3128,6 @@ function runForkedCodex(opts) {
   if (opts.turnCwd !== void 0) {
     throw new Error("forked Codex runs cannot set a turn cwd");
   }
-  return runCodexAppServer(opts);
 }
 
 // src/model-catalog.ts

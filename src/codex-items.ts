@@ -5,20 +5,23 @@
  */
 import {
   isRecord,
-  normalizePlanStatus,
+  isTerminalAgentStatus,
   normalizeSummary,
   planCompletionSummary,
+  planItem,
   toContextWindow,
+  toPlanItems,
   toTokenCount,
 } from "./internal.js";
 import type {
+  BackgroundAgentInfo,
   BackgroundAgentStatus,
   McpElicitationRequest,
   McpServerStatusInfo,
   ToolPlanItem,
   ToolUseInfo,
 } from "./types.js";
-import type { TokenUsage } from "./usage.js";
+import { tokenUsage, type TokenUsage } from "./usage.js";
 
 export function record(value: unknown): Record<string, unknown> | undefined {
   return isRecord(value) ? value : undefined;
@@ -220,22 +223,13 @@ export function singleRawWebCall(item: Record<string, unknown>): {
   return { callId, ...(inputUrl ? { inputUrl } : {}) };
 }
 
-export function withWebUrl(item: Record<string, unknown>, url: string | undefined): Record<string, unknown> {
+function withWebUrl(item: Record<string, unknown>, url: string | undefined): Record<string, unknown> {
   if (!url || webUrl(item)) return item;
   return { ...item, url };
 }
 
 function planItems(value: unknown): ToolPlanItem[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const items: ToolPlanItem[] = [];
-  for (const raw of value) {
-    const step = record(raw);
-    const itemText = normalizeSummary(step?.step ?? step?.text);
-    const status = normalizePlanStatus(step?.status);
-    if (!itemText || !status) return undefined;
-    items.push({ text: itemText, status });
-  }
-  return items.length > 0 ? items : undefined;
+  return toPlanItems(value, (step) => planItem(step.step ?? step.text, step.status));
 }
 
 export function planToolInfo(params: Record<string, unknown>, turnId: string): ToolUseInfo | undefined {
@@ -250,7 +244,7 @@ export function planToolInfo(params: Record<string, unknown>, turnId: string): T
   };
 }
 
-export function backgroundStatus(value: unknown): BackgroundAgentStatus | undefined {
+function backgroundStatus(value: unknown): BackgroundAgentStatus | undefined {
   switch (value) {
     case "pending":
     case "pendingInit":
@@ -272,10 +266,6 @@ export function backgroundStatus(value: unknown): BackgroundAgentStatus | undefi
   }
 }
 
-export function terminalBackgroundStatus(status: BackgroundAgentStatus): boolean {
-  return status === "completed" || status === "failed" || status === "interrupted";
-}
-
 export function toUsage(
   params: Record<string, unknown>,
   threadId: string,
@@ -284,25 +274,37 @@ export function toUsage(
   fallbackWindow: number | undefined,
 ): TokenUsage | undefined {
   if (params.threadId !== threadId || params.turnId !== turnId) return undefined;
-  const tokenUsage = record(params.tokenUsage);
-  const last = record(tokenUsage?.last);
+  const reported = record(params.tokenUsage);
+  const last = record(reported?.last);
   if (!last) return undefined;
   if (toTokenCount(last.totalTokens) <= 0) return undefined;
   const input = toTokenCount(last.inputTokens);
-  const cached = toTokenCount(last.cachedInputTokens);
-  const contextWindow = toContextWindow(tokenUsage?.modelContextWindow) ?? fallbackWindow;
-  return {
+  return codexTokenUsage({
     // Input side only (cached included), per the TokenUsage contract — not
     // last.totalTokens, which also counts output. Matches the Claude and
     // isolated-exec paths. A compaction sends no request: Codex reports its
     // estimate of the compacted history as a total with no input behind it.
     contextTokens: input > 0 ? input : toTokenCount(last.totalTokens),
-    inputTokens: Math.max(0, input - cached),
-    cachedInputTokens: cached,
-    outputTokens: toTokenCount(last.outputTokens),
-    ...(model ? { model } : {}),
-    ...(contextWindow !== undefined ? { contextWindow } : {}),
-  };
+    input,
+    cached: toTokenCount(last.cachedInputTokens),
+    output: toTokenCount(last.outputTokens),
+  }, model, toContextWindow(reported?.modelContextWindow) ?? fallbackWindow);
+}
+
+/** A TokenUsage from Codex's counts, whose input includes its cached part.
+ * The caller says what fills the context: app-server's input (or, after a
+ * compaction, its total) and exec's input. */
+export function codexTokenUsage(
+  counts: { contextTokens: number; input: number; cached: number; output: number },
+  model: string | undefined,
+  contextWindow: number | undefined,
+): TokenUsage {
+  return tokenUsage({
+    contextTokens: counts.contextTokens,
+    inputTokens: Math.max(0, counts.input - counts.cached),
+    cachedInputTokens: counts.cached,
+    outputTokens: counts.output,
+  }, model, contextWindow);
 }
 
 export function threadIdFrom(value: unknown): string | undefined {
@@ -355,4 +357,155 @@ export function codexElicitationRequest(params: Record<string, unknown>): McpEli
     return url ? { serverName, message, mode: "url", url } : undefined;
   }
   return undefined;
+}
+
+interface PendingCodexWebTool {
+  item: Record<string, unknown>;
+  completed: boolean;
+  rawCallId?: string;
+}
+
+interface RawCodexWebCall {
+  callId: string;
+  inputUrl?: string;
+  outputUrl?: string;
+  outputCompleted: boolean;
+  webItemId?: string;
+}
+
+export interface WebToolTracker {
+  /** A webSearch item started or completed. */
+  onWebItem(item: Record<string, unknown>, completed: boolean): void;
+  /** A raw response item, which may be the `web__run` call behind one. */
+  onRawResponseItem(item: Record<string, unknown>): void;
+  /** Hand over every web item still held, with what is known of it. */
+  flush(): void;
+}
+
+/** Holds each webSearch item until the single raw `web__run` call behind it,
+ * when there is one, has supplied the page URL the item itself leaves out. */
+export function createWebToolTracker(emit: {
+  toolUse(id: string, item: Record<string, unknown>): void;
+  toolResult(id: string, item: Record<string, unknown>): void;
+}): WebToolTracker {
+  const pendingWebTools = new Map<string, PendingCodexWebTool>();
+  const rawWebCalls = new Map<string, RawCodexWebCall>();
+  const unassignedRawWebCalls: string[] = [];
+
+  const assignRawWebCall = (id: string, pending: PendingCodexWebTool): void => {
+    if (pending.rawCallId) return;
+    for (let index = unassignedRawWebCalls.length - 1; index >= 0; index -= 1) {
+      const call = rawWebCalls.get(unassignedRawWebCalls[index] as string);
+      if (!call || call.webItemId) unassignedRawWebCalls.splice(index, 1);
+    }
+    if (unassignedRawWebCalls.length !== 1) return;
+    const callId = unassignedRawWebCalls.shift();
+    if (!callId) return;
+    const call = rawWebCalls.get(callId);
+    if (!call) return;
+    call.webItemId = id;
+    pending.rawCallId = callId;
+  };
+
+  const emitPendingWebTool = (id: string, force: boolean): void => {
+    const pending = pendingWebTools.get(id);
+    if (!pending) return;
+    const rawCall = pending.rawCallId ? rawWebCalls.get(pending.rawCallId) : undefined;
+    const item = withWebUrl(pending.item, rawCall?.inputUrl ?? rawCall?.outputUrl);
+    const needsUrl = toolName(item) === "WebFetch" && !webUrl(item);
+    if (!force && needsUrl && rawCall && !rawCall.outputCompleted) return;
+    emit.toolUse(id, item);
+    if (pending.completed) emit.toolResult(id, item);
+    if (pending.completed || force) pendingWebTools.delete(id);
+  };
+
+  return {
+    onWebItem(item, completed) {
+      const id = text(item.id) ?? `${itemType(item)}:web`;
+      const pending = pendingWebTools.get(id) ?? {
+        item,
+        completed: false,
+      };
+      pending.item = item;
+      pending.completed = completed;
+      assignRawWebCall(id, pending);
+      pendingWebTools.set(id, pending);
+      if (pending.completed) emitPendingWebTool(id, false);
+    },
+    onRawResponseItem(item) {
+      const rawCall = singleRawWebCall(item);
+      if (rawCall) {
+        rawWebCalls.set(rawCall.callId, {
+          ...rawCall,
+          outputCompleted: false,
+        });
+        unassignedRawWebCalls.push(rawCall.callId);
+        return;
+      }
+      if (itemType(item) !== "custom_tool_call_output") return;
+      const callId = text(item.call_id) ?? text(item.callId);
+      if (!callId) return;
+      const call = rawWebCalls.get(callId);
+      if (!call) return;
+      call.outputCompleted = true;
+      const outputUrl = rawWebOutputUrl(item);
+      if (outputUrl) call.outputUrl = outputUrl;
+      if (call.webItemId) {
+        emitPendingWebTool(call.webItemId, false);
+      }
+    },
+    flush() {
+      for (const id of [...pendingWebTools.keys()]) emitPendingWebTool(id, true);
+    },
+  };
+}
+
+/** Tracks the subagents a turn's collab tool calls start, and reports each
+ * change as a complete snapshot. */
+export function createCodexAgentTracker(onUpdate: (agent: BackgroundAgentInfo) => void): {
+  update(item: Record<string, unknown>, occurredAt: number): void;
+} {
+  const backgroundAgents = new Map<string, BackgroundAgentInfo>();
+  return {
+    update(item, occurredAt) {
+      const type = itemType(item);
+      if (type !== "collabAgentToolCall" && type !== "collab_tool_call") return;
+      const tool = text(item.tool);
+      const isSpawn = tool === "spawnAgent" || tool === "spawn_agent";
+      const states = record(property(item, "agentsStates", "agents_states")) ?? {};
+      const rawReceiverIds = property(item, "receiverThreadIds", "receiver_thread_ids");
+      const receiverIds = Array.isArray(rawReceiverIds)
+        ? rawReceiverIds.filter((id): id is string => typeof id === "string")
+        : [];
+      for (const id of new Set([...receiverIds, ...Object.keys(states)])) {
+        const current = backgroundAgents.get(id);
+        if (!current && !isSpawn) continue;
+        const state = record(states[id]);
+        const status = backgroundStatus(state?.status) ?? current?.status ?? "pending";
+        const message = text(state?.message);
+        const itemId = text(item.id);
+        const description = current?.description ?? text(item.prompt);
+        const agent: BackgroundAgentInfo = {
+          ...(current ?? {
+            id,
+            provider: "codex" as const,
+            startedAt: occurredAt,
+          }),
+          ...(!current?.parentToolCallId && itemId ? { parentToolCallId: itemId } : {}),
+          ...(description ? { description } : {}),
+          status,
+          ...(message && status === "failed" ? { error: message } : {}),
+          ...(message && status !== "failed" ? { summary: message } : {}),
+          updatedAt: occurredAt,
+          ...(isTerminalAgentStatus(status)
+            ? { endedAt: current?.endedAt ?? occurredAt }
+            : {}),
+        };
+        if (status === "failed") delete agent.summary;
+        else delete agent.error;
+        backgroundAgents.set(id, agent);
+        onUpdate(agent);
+      }
+    },
+  };
 }
