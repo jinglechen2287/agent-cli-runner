@@ -10,27 +10,25 @@ import {
   type CodexConfigOverrides,
 } from "./codex-app-server.js";
 import {
-  createChunkDecoder,
-  createLineSplitter,
-  filterEnv,
-  isMissingExecutable,
   isRecord,
-  launchCommand,
   normalizePlanStatus,
   normalizeSummary,
   planCompletionSummary,
   safeCallback,
-  signalProcessTree,
   toTokenCount,
+} from "./internal.js";
+import {
+  childEnv,
+  createChunkDecoder,
+  createLineSplitter,
+  isMissingExecutable,
+  launchCommand,
+  signalProcessTree,
   watchLifecycle,
   writePrompt,
-} from "./internal.js";
+} from "./process.js";
 import type { CommonRunOptions, RunResult, ToolPlanItem } from "./types.js";
 import { contextWindowForModel, type TokenUsage } from "./usage.js";
-
-/** Stripped so a Codex turn spawned from within another Codex session does
- * not inherit the parent's thread. */
-export const CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"] as const;
 
 /** A per-turn sandbox override, mirroring app-server's SandboxPolicy union.
  * `turn/start` documents it as applying "for this turn and subsequent turns",
@@ -208,7 +206,7 @@ async function runIsolatedCodex(opts: RunCodexOptions): Promise<RunResult> {
   const spawnFn = opts.spawnFn ?? spawn;
   let child;
   try {
-    const env = filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS);
+    const env = childEnv("codex", opts.env ?? process.env);
     const launch = launchCommand(opts.executablePath ?? "codex", buildIsolatedArgs(opts), env, {
       cwd: opts.cwd,
     });

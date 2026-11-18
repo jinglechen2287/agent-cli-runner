@@ -1,4 +1,4 @@
-export { runClaude, CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
+export { runClaude } from "./run-claude.js";
 export type { ClaudePermissionMode, RunClaudeOptions } from "./run-claude.js";
 export {
   CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS,
@@ -35,7 +35,8 @@ export type {
 } from "@anthropic-ai/claude-agent-sdk";
 export { deleteClaudeSession, forkClaudeSession, forkCodexThread } from "./fork.js";
 export type { ForkCodexThreadOptions } from "./fork.js";
-export { runCodex, CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
+export { runCodex } from "./run-codex.js";
+export { CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS } from "./process.js";
 export type { CodexSandboxPolicy, RunCodexOptions } from "./run-codex.js";
 export {
   CODEX_FORK_CONFIG,

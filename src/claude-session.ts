@@ -20,17 +20,15 @@ import {
   type ClaudeTurnTranslator,
 } from "./claude-messages.js";
 import { AbortError, MissingCliError, SteerRejectedError, TimeoutError } from "./errors.js";
+import { answerMcpElicitation, isRecord, safeCallback } from "./internal.js";
 import {
-  answerMcpElicitation,
+  childEnv,
   createChunkDecoder,
-  filterEnv,
-  isRecord,
   launchCommand,
   resolveExecutable,
-  safeCallback,
   SIGTERM_GRACE_MS,
   signalProcessTree,
-} from "./internal.js";
+} from "./process.js";
 import type {
   AgentCallbacks,
   McpElicitationRequest,
@@ -39,15 +37,6 @@ import type {
   SpawnFn,
 } from "./types.js";
 import { contextWindowForModel, type TokenUsage } from "./usage.js";
-
-/** Nesting-guard variables the Claude CLI uses to refuse running inside
- * another Claude Code session. Stripped so hosts launched by Claude Code
- * (or exposing it, like a bot) can still spawn turns. */
-export const CLAUDE_STRIPPED_ENV_VARS = [
-  "CLAUDECODE",
-  "CLAUDE_CODE_ENTRYPOINT",
-  "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
-] as const;
 
 /** Claude Code permission modes. `manual` is this package's name for the
  * CLI's `default` (prompt-for-everything) mode. */
@@ -346,7 +335,7 @@ export function claudeSessionQueryOptions(
   const tools = opts.isolated ? [] : sdkTools(opts.tools);
   return {
     cwd: opts.cwd,
-    env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
+    env: childEnv("claude", opts.env ?? process.env),
     pathToClaudeCodeExecutable: executablePath,
     spawnClaudeCodeProcess,
     // A fork names its own id alongside the session it copies.

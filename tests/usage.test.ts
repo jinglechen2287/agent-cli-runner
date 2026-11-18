@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { contextWindowForModel, KNOWN_CONTEXT_WINDOWS } from "../src/index.js";
+import { tokenUsage, type TokenUsage } from "../src/usage.js";
 
 describe("contextWindowForModel", () => {
   it("returns undefined for a missing or empty model", () => {
@@ -77,5 +78,23 @@ describe("contextWindowForModel", () => {
 
   it("returns undefined for unrecognized models", () => {
     expect(contextWindowForModel("llama-3")).toBeUndefined();
+  });
+});
+
+describe("tokenUsage", () => {
+  const counts = { contextTokens: 10, inputTokens: 4, cachedInputTokens: 6, outputTokens: 2 };
+
+  it("carries the model and window when they are known", () => {
+    expect(tokenUsage(counts, "gpt-5.5", 272_000)).toStrictEqual({ ...counts, model: "gpt-5.5", contextWindow: 272_000 });
+  });
+
+  it("takes only the counts from a snapshot it is handed", () => {
+    const previous: TokenUsage = { ...counts, model: "old", contextWindow: 1 };
+    expect(tokenUsage(previous, "new", undefined)).toStrictEqual({ ...counts, model: "new" });
+  });
+
+  it("leaves out a model or window it does not know", () => {
+    expect(tokenUsage(counts, undefined, undefined)).toStrictEqual(counts);
+    expect(tokenUsage(counts, "", 0)).toStrictEqual({ ...counts, contextWindow: 0 });
   });
 });

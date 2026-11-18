@@ -8,21 +8,23 @@ import {
 } from "./errors.js";
 import {
   answerMcpElicitation,
-  createChunkDecoder,
-  createLineSplitter,
-  filterEnv,
-  isMissingExecutable,
   isRecord,
-  launchCommand,
   normalizePlanStatus,
   normalizeSummary,
   planCompletionSummary,
   safeCallback,
-  SIGTERM_GRACE_MS,
-  signalProcessTree,
   toContextWindow,
   toTokenCount,
 } from "./internal.js";
+import {
+  childEnv,
+  createChunkDecoder,
+  createLineSplitter,
+  isMissingExecutable,
+  launchCommand,
+  SIGTERM_GRACE_MS,
+  signalProcessTree,
+} from "./process.js";
 import type { RunCodexOptions } from "./run-codex.js";
 import type {
   AgentCallbacks,
@@ -212,7 +214,7 @@ export async function createCodexAppServerClient(
   const spawnFn = options.spawnFn ?? nodeSpawn;
   let child: ChildProcess;
   try {
-    const env = filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]);
+    const env = childEnv("codex", options.env ?? process.env);
     const launch = launchCommand(options.executablePath ?? "codex", ["app-server", "--stdio"], env, {
       cwd: options.cwd,
     });

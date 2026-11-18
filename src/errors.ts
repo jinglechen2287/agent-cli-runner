@@ -34,3 +34,13 @@ export class CodexTurnError extends Error {
 export class SteerRejectedError extends Error {
   override readonly name = "SteerRejectedError";
 }
+
+/** The error a run stopped by its signal rejects with, e.g. "codex run aborted". */
+export function runAborted(cli: string): AbortError {
+  return new AbortError(`${cli} run aborted`);
+}
+
+/** The error a run stopped by its timeout rejects with. */
+export function runTimedOut(cli: string, timeoutMs: number | undefined): TimeoutError {
+  return new TimeoutError(`${cli} run timed out after ${timeoutMs}ms`);
+}

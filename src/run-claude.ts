@@ -7,7 +7,6 @@ import {
 import { AbortError } from "./errors.js";
 import type { CommonRunOptions, RunResult } from "./types.js";
 
-export { CLAUDE_STRIPPED_ENV_VARS } from "./claude-session.js";
 export type { ClaudePermissionMode } from "./claude-session.js";
 
 export interface RunClaudeOptions extends CommonRunOptions {

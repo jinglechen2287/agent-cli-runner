@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
-import { filterEnv, isMissingExecutable, isRecord, killTreeOnKill, launchCommand } from "./internal.js";
-import { CLAUDE_STRIPPED_ENV_VARS } from "./run-claude.js";
-import { CODEX_STRIPPED_ENV_VARS } from "./run-codex.js";
+import { isRecord } from "./internal.js";
+import { childEnv, isMissingExecutable, killTreeOnKill, launchCommand } from "./process.js";
 
 const CHECK_TIMEOUT_MS = 5_000;
 // Doctor checks the whole installation, including network and database health.
@@ -364,7 +363,7 @@ export function createProviderUpdateService(
 
   async function checkClaude(checkedAt: string): Promise<ProviderUpdateStatus> {
     const executable = config.claudePath ?? "claude";
-    const env = filterEnv(baseEnv, CLAUDE_STRIPPED_ENV_VARS);
+    const env = childEnv("claude", baseEnv);
     // Independent spawns, so run them concurrently — serializing two CLI cold
     // starts roughly doubles every check's latency. The doctor result is only
     // consulted once --version confirms the CLI is installed.
@@ -422,7 +421,7 @@ export function createProviderUpdateService(
 
   async function checkCodex(checkedAt: string): Promise<ProviderUpdateStatus> {
     const executable = config.codexPath ?? "codex";
-    const env = filterEnv(baseEnv, CODEX_STRIPPED_ENV_VARS);
+    const env = childEnv("codex", baseEnv);
     const [installed, doctorResult] = await Promise.all([
       installedVersion("codex", executable, env, checkedAt),
       runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CODEX_DOCTOR_TIMEOUT_MS })
@@ -525,10 +524,7 @@ export function createProviderUpdateService(
     provider: ProviderUpdateProvider,
   ): Promise<ProviderUpdateApplyResult> => {
     const executable = executableFor(provider);
-    const env = filterEnv(
-      baseEnv,
-      provider === "claude" ? CLAUDE_STRIPPED_ENV_VARS : CODEX_STRIPPED_ENV_VARS,
-    );
+    const env = childEnv(provider, baseEnv);
 
     if (provider === "claude") {
       let installMethod: string | null;

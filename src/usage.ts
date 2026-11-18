@@ -38,6 +38,26 @@ export interface TokenUsage {
   contextWindow?: number;
 }
 
+/** A TokenUsage from normalized counts, with the model and window only when
+ * known. */
+export function tokenUsage(
+  counts: Pick<TokenUsage, "contextTokens" | "inputTokens" | "cachedInputTokens" | "outputTokens">,
+  model: string | undefined,
+  contextWindow: number | undefined,
+): TokenUsage {
+  return {
+    contextTokens: counts.contextTokens,
+    inputTokens: counts.inputTokens,
+    cachedInputTokens: counts.cachedInputTokens,
+    outputTokens: counts.outputTokens,
+    ...(model ? { model } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
+}
+
+const GPT_5_CONTEXT_WINDOW = 272_000;
+const GPT_5_6_CONTEXT_WINDOW = 372_000;
+
 /**
  * Context-window sizes for models whose id doesn't follow a simple family rule.
  * Values are best-effort fallbacks for callers without a provider-reported
@@ -45,14 +65,14 @@ export interface TokenUsage {
  * Anthropic models are handled by {@link CLAUDE_CONTEXT_WINDOWS} instead.
  */
 export const KNOWN_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
-  "gpt-5.2": 272_000,
-  "gpt-5.4": 272_000,
-  "gpt-5.4-mini": 272_000,
-  "gpt-5.5": 272_000,
-  "gpt-5.6-luna": 372_000,
-  "gpt-5.6-sol": 372_000,
-  "gpt-5.6-terra": 372_000,
-  "codex-auto-review": 272_000,
+  "gpt-5.2": GPT_5_CONTEXT_WINDOW,
+  "gpt-5.4": GPT_5_CONTEXT_WINDOW,
+  "gpt-5.4-mini": GPT_5_CONTEXT_WINDOW,
+  "gpt-5.5": GPT_5_CONTEXT_WINDOW,
+  "gpt-5.6-luna": GPT_5_6_CONTEXT_WINDOW,
+  "gpt-5.6-sol": GPT_5_6_CONTEXT_WINDOW,
+  "gpt-5.6-terra": GPT_5_6_CONTEXT_WINDOW,
+  "codex-auto-review": GPT_5_CONTEXT_WINDOW,
 };
 
 const CLAUDE_DEFAULT_CONTEXT_WINDOW = 200_000;
@@ -103,7 +123,7 @@ function claudeContextWindow(id: string): number {
   }
   const [, family, major, minor] = match;
   const canonical = `claude-${family}-${major}${minor !== undefined ? `-${minor}` : ""}`;
-  if (Object.prototype.hasOwnProperty.call(CLAUDE_CONTEXT_WINDOWS, canonical)) {
+  if (Object.hasOwn(CLAUDE_CONTEXT_WINDOWS, canonical)) {
     return CLAUDE_CONTEXT_WINDOWS[canonical]!;
   }
   // A model newer than the table: a best-effort guess. Fable and Mythos ship
@@ -124,11 +144,11 @@ export function contextWindowForModel(model: string | undefined): number | undef
   if (!model) return undefined;
   const id = model.trim().toLowerCase();
   if (!id) return undefined;
-  if (Object.prototype.hasOwnProperty.call(KNOWN_CONTEXT_WINDOWS, id)) {
+  if (Object.hasOwn(KNOWN_CONTEXT_WINDOWS, id)) {
     return KNOWN_CONTEXT_WINDOWS[id];
   }
   if (id.includes("claude")) return claudeContextWindow(id);
-  if (id.startsWith("gpt-5.6")) return 372_000;
-  if (id.startsWith("gpt-5")) return 272_000;
+  if (id.startsWith("gpt-5.6")) return GPT_5_6_CONTEXT_WINDOW;
+  if (id.startsWith("gpt-5")) return GPT_5_CONTEXT_WINDOW;
   return undefined;
 }

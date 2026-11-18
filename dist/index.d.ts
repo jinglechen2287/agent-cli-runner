@@ -252,10 +252,6 @@ interface RunResult {
     usage?: TokenUsage;
 }
 
-/** Nesting-guard variables the Claude CLI uses to refuse running inside
- * another Claude Code session. Stripped so hosts launched by Claude Code
- * (or exposing it, like a bot) can still spawn turns. */
-declare const CLAUDE_STRIPPED_ENV_VARS: readonly ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ACCESS_TOKEN"];
 /** Claude Code permission modes. `manual` is this package's name for the
  * CLI's `default` (prompt-for-everything) mode. */
 type ClaudePermissionMode = "acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan";
@@ -654,9 +650,6 @@ declare const CODEX_FORK_CONFIG: {
 };
 declare function createCodexAppServerSession(options: CreateCodexAppServerSessionOptions): Promise<CodexAppServerSession>;
 
-/** Stripped so a Codex turn spawned from within another Codex session does
- * not inherit the parent's thread. */
-declare const CODEX_STRIPPED_ENV_VARS: readonly ["CODEX_THREAD_ID"];
 /** A per-turn sandbox override, mirroring app-server's SandboxPolicy union.
  * `turn/start` documents it as applying "for this turn and subsequent turns",
  * so hosts that flip it (e.g. a read-only plan turn) must send an explicit
@@ -754,6 +747,20 @@ interface ForkCodexThreadOptions {
  * continues, through a one-shot app-server that is closed however the fork
  * ends. Answers the new thread's id. */
 declare function forkCodexThread(options: ForkCodexThreadOptions): Promise<string>;
+
+/**
+ * Child-process plumbing shared by every runner: finding a CLI, launching it
+ * (through cmd.exe for a Windows batch shim), reading its output, and
+ * stopping its whole process tree.
+ */
+
+/** Nesting-guard variables the Claude CLI uses to refuse running inside
+ * another Claude Code session. Stripped so hosts launched by Claude Code
+ * (or exposing it, like a bot) can still spawn turns. */
+declare const CLAUDE_STRIPPED_ENV_VARS: readonly ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ACCESS_TOKEN"];
+/** Stripped so a Codex turn spawned from within another Codex session does
+ * not inherit the parent's thread. */
+declare const CODEX_STRIPPED_ENV_VARS: readonly ["CODEX_THREAD_ID"];
 
 declare class AbortError extends Error {
     readonly name = "AbortError";

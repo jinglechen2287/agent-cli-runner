@@ -1,11 +1,10 @@
-import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { accessSync, constants, statSync } from "node:fs";
-import { delimiter, extname, resolve as resolvePath, win32 } from "node:path";
-import { StringDecoder } from "node:string_decoder";
-import { AbortError, TimeoutError } from "./errors.js";
-import type { AgentCallbacks, McpElicitationRequest, McpElicitationResponse } from "./types.js";
-
-export const SIGTERM_GRACE_MS = 2000;
+import type {
+  AgentCallbacks,
+  BackgroundAgentStatus,
+  McpElicitationRequest,
+  McpElicitationResponse,
+  ToolPlanItem,
+} from "./types.js";
 
 /** Asks a turn's callback for an MCP server's answer. Always settles: no
  * callback declines, a throw or any of `signals` firing cancels, and a late
@@ -34,6 +33,83 @@ export function answerMcpElicitation(
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** The value when it is a string, else undefined. */
+export function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Only string keys: Object.entries, which makes the copy, skips symbols. */
+type WithoutUndefined<T> =
+  { [K in Extract<keyof T, string> as undefined extends T[K] ? never : K]: T[K] }
+  & { [K in Extract<keyof T, string> as undefined extends T[K] ? K : never]?: Exclude<T[K], undefined> };
+
+/** A copy of `value`'s string-keyed entries without the undefined ones, so a
+ * set of maybe-given options fits a type whose optional properties may not
+ * hold undefined. */
+export function withoutUndefined<T extends Record<string, unknown>>(value: T): WithoutUndefined<T> {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entry]) => entry !== undefined),
+  ) as WithoutUndefined<T>;
+}
+
+/** A promise with its settle functions, and whether one has been called. */
+export interface Deferred<T> {
+  readonly promise: Promise<T>;
+  /** True from the first resolve or reject call, synchronously. */
+  readonly settled: boolean;
+  resolve(value: T): void;
+  reject(error: Error): void;
+}
+
+export function createDeferred<T = void>(): Deferred<T> {
+  let settled = false;
+  let resolvePromise!: (value: T) => void;
+  let rejectPromise!: (error: Error) => void;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return {
+    promise,
+    get settled() {
+      return settled;
+    },
+    resolve(value) {
+      settled = true;
+      resolvePromise(value);
+    },
+    reject(error) {
+      settled = true;
+      rejectPromise(error);
+    },
+  };
+}
+
+/** The first of `contenders` to settle, or `onTimeout()`'s error once `ms`
+ * pass. One flat race, returned as it is, so awaiting it costs no more
+ * microtask hops than awaiting `Promise.race` directly. The timer is cleared
+ * as soon as the race settles, and holds the process open unless `unref`. */
+export function raceTimeout<T>(
+  contenders: readonly Promise<T>[],
+  ms: number,
+  onTimeout: () => Error,
+  { unref = false }: { unref?: boolean } = {},
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(onTimeout()), ms);
+    if (unref) timer.unref?.();
+  });
+  const race = Promise.race([...contenders, timeout]);
+  const clear = (): void => clearTimeout(timer);
+  race.then(clear, clear);
+  return race;
 }
 
 /** Run a host callback without letting an exception escape into the provider
@@ -72,6 +148,36 @@ export function normalizePlanStatus(value: unknown): string | undefined {
   return status.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
 }
 
+/** One plan item from a provider's raw text and status, or undefined unless
+ * both are present. */
+export function planItem(text: unknown, status: unknown): ToolPlanItem | undefined {
+  const itemText = normalizeSummary(text);
+  const itemStatus = normalizePlanStatus(status);
+  return itemText && itemStatus ? { text: itemText, status: itemStatus } : undefined;
+}
+
+/** A provider's plan/todo list as plan items, each made by `toItem` from the
+ * provider's own fields. A malformed entry voids the whole list, so a host
+ * never shows a misleading partial plan; an empty list is no plan either. */
+export function toPlanItems(
+  values: unknown,
+  toItem: (entry: Record<string, unknown>) => ToolPlanItem | undefined,
+): ToolPlanItem[] | undefined {
+  if (!Array.isArray(values)) return undefined;
+  const items: ToolPlanItem[] = [];
+  for (const value of values) {
+    const item = isRecord(value) ? toItem(value) : undefined;
+    if (!item) return undefined;
+    items.push(item);
+  }
+  return items.length > 0 ? items : undefined;
+}
+
+/** Whether a background agent has finished, however it ended. */
+export function isTerminalAgentStatus(status: BackgroundAgentStatus): boolean {
+  return status === "completed" || status === "failed" || status === "interrupted";
+}
+
 /** Collapse a raw tool field into the one-line, non-empty form promised by a
  * tool-use summary. Runs of whitespace (including newlines in a multiline
  * command) become single spaces; an empty or whitespace-only value yields
@@ -97,337 +203,4 @@ export function toContextWindow(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
     ? value
     : undefined;
-}
-
-export function filterEnv(
-  base: NodeJS.ProcessEnv,
-  stripped: readonly string[],
-): Record<string, string> {
-  const env: Record<string, string> = {};
-  // Windows environment variable names are case-insensitive.
-  const normalize = (key: string): string =>
-    process.platform === "win32" ? key.toUpperCase() : key;
-  const strippedKeys = new Set(stripped.map(normalize));
-  for (const [key, value] of Object.entries(base)) {
-    if (value !== undefined && !strippedKeys.has(normalize(key))) env[key] = value;
-  }
-  return env;
-}
-
-export function isMissingExecutable(error: unknown): boolean {
-  return error instanceof Error
-    && "code" in error
-    && (error as Error & { code?: unknown }).code === "ENOENT";
-}
-
-/** Buffers stdout chunks and emits complete newline-terminated lines. */
-export function createLineSplitter(onLine: (line: string) => void): {
-  push(chunk: Buffer | string): void;
-  flush(): void;
-} {
-  let buffer = "";
-  // A chunk boundary can fall inside a multibyte UTF-8 sequence; the decoder
-  // holds the partial bytes until the rest arrives.
-  const decoder = new StringDecoder("utf8");
-  return {
-    push(chunk: Buffer | string): void {
-      buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
-      let newline = buffer.indexOf("\n");
-      while (newline !== -1) {
-        onLine(buffer.slice(0, newline));
-        buffer = buffer.slice(newline + 1);
-        newline = buffer.indexOf("\n");
-      }
-    },
-    flush(): void {
-      buffer += decoder.end();
-      if (buffer) onLine(buffer);
-      buffer = "";
-    },
-  };
-}
-
-/** Decodes stderr (or any text stream) chunk-by-chunk without corrupting a
- * multibyte UTF-8 character split across a chunk boundary — the same
- * StringDecoder treatment stdout gets from {@link createLineSplitter}. */
-export function createChunkDecoder(onText: (text: string) => void): {
-  push(chunk: Buffer | string): void;
-  flush(): void;
-} {
-  const decoder = new StringDecoder("utf8");
-  return {
-    push(chunk: Buffer | string): void {
-      const text = typeof chunk === "string" ? chunk : decoder.write(chunk);
-      if (text) onText(text);
-    },
-    flush(): void {
-      const rest = decoder.end();
-      if (rest) onText(rest);
-    },
-  };
-}
-
-/** Sends the prompt on stdin and closes it, so it never appears in argv. */
-export function writePrompt(child: ChildProcess, prompt: string): void {
-  const stdin = child.stdin;
-  if (!stdin) return;
-  // EPIPE arrives when the child exits before draining stdin; the close
-  // handler already reports that outcome.
-  stdin.on("error", () => {});
-  stdin.end(prompt);
-}
-
-export interface LifecycleOptions {
-  /** Used in AbortError/TimeoutError messages, e.g. "claude". */
-  cli: string;
-  signal?: AbortSignal | undefined;
-  timeoutMs?: number | undefined;
-  kill: (signal: NodeJS.Signals) => void;
-}
-
-export interface Lifecycle {
-  /** Error to reject with once the child closes, or null for a normal exit. */
-  interruptionError(): Error | null;
-  cleanup(): void;
-}
-
-/** Wires abort/timeout to a SIGTERM → grace period → SIGKILL escalation. */
-export function watchLifecycle(opts: LifecycleOptions): Lifecycle {
-  let aborted = false;
-  let timedOut = false;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
-  let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-
-  const terminate = (): void => {
-    opts.kill("SIGTERM");
-    killTimer ??= setTimeout(() => opts.kill("SIGKILL"), SIGTERM_GRACE_MS);
-  };
-
-  const abortHandler = (): void => {
-    if (aborted || timedOut) return;
-    aborted = true;
-    terminate();
-  };
-
-  if (opts.signal) {
-    if (opts.signal.aborted) abortHandler();
-    else opts.signal.addEventListener("abort", abortHandler, { once: true });
-  }
-
-  if (opts.timeoutMs !== undefined) {
-    timeoutTimer = setTimeout(() => {
-      if (aborted || timedOut) return;
-      timedOut = true;
-      terminate();
-    }, opts.timeoutMs);
-  }
-
-  return {
-    interruptionError(): Error | null {
-      if (aborted) return new AbortError(`${opts.cli} run aborted`);
-      if (timedOut) {
-        return new TimeoutError(`${opts.cli} run timed out after ${opts.timeoutMs}ms`);
-      }
-      return null;
-    },
-    cleanup(): void {
-      if (killTimer) clearTimeout(killTimer);
-      if (timeoutTimer) clearTimeout(timeoutTimer);
-      opts.signal?.removeEventListener("abort", abortHandler);
-    },
-  };
-}
-
-export function signalProcessTree(
-  child: ChildProcess,
-  signal: NodeJS.Signals,
-  killDirect: (signal: NodeJS.Signals) => void = (direct) => child.kill(direct),
-): void {
-  if (child.pid && process.platform !== "win32") {
-    try {
-      // Codex is spawned as a detached process-group leader. Signaling the
-      // negative pid reaches its shell/tool descendants as well.
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // Fall back to the direct child if the group is already unavailable.
-    }
-  }
-  if (child.pid && process.platform === "win32") {
-    const args = ["/pid", String(child.pid), "/T"];
-    if (signal === "SIGKILL") args.push("/F");
-    const killer = nodeSpawn("taskkill", args, {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    let fellBack = false;
-    const fallback = (): void => {
-      if (fellBack) return;
-      fellBack = true;
-      try {
-        killDirect(signal);
-      } catch {
-        // The process may already have exited.
-      }
-    };
-    killer.once("error", fallback);
-    killer.once("exit", (code) => {
-      if (code !== 0) fallback();
-    });
-    return;
-  }
-  try {
-    killDirect(signal);
-  } catch {
-    // The process may already have exited.
-  }
-}
-
-/** On Windows, route `child.kill` through a forced {@link signalProcessTree},
- * so the kills `execFile` makes itself (timeout, maxBuffer) reach the whole
- * tree: a batch launch's real program is cmd.exe's child, which a plain kill
- * of cmd.exe leaves running. Always forced, whatever signal execFile names —
- * it never escalates, and a console program can refuse an unforced taskkill.
- * The tree kill leaves an exit code behind, so a caller must check `killed`
- * before treating a numeric code as an exit. Elsewhere `execFile` children
- * share our process group, so this is a no-op. */
-export function killTreeOnKill(child: ChildProcess): void {
-  if (process.platform !== "win32") return;
-  const killDirect = child.kill.bind(child);
-  child.kill = (): boolean => {
-    signalProcessTree(child, "SIGKILL", (signal) => {
-      killDirect(signal);
-    });
-    return true;
-  };
-}
-
-/** Resolve a CLI name to an absolute path through `env.PATH`, the way a shell
- * would; a name that already contains a path separator is checked in place.
- * Returns undefined when nothing executable is found. */
-export interface ResolveExecutableOptions {
-  /** The child's working directory: relative names and PATH entries resolve
-   * against it, as spawn would resolve them. Defaults to `process.cwd()`. */
-  cwd?: string | undefined;
-  platform?: NodeJS.Platform;
-}
-
-export function resolveExecutable(
-  name: string,
-  env: NodeJS.ProcessEnv,
-  { cwd = process.cwd(), platform = process.platform }: ResolveExecutableOptions = {},
-): string | undefined {
-  if (platform === "win32") return resolveWindowsExecutable(name, env, cwd);
-  const isExecutable = (candidate: string): boolean => {
-    try {
-      accessSync(candidate, constants.X_OK);
-      return statSync(candidate).isFile();
-    } catch {
-      return false;
-    }
-  };
-  if (name.includes("/")) {
-    const candidate = resolvePath(cwd, name);
-    return isExecutable(candidate) ? candidate : undefined;
-  }
-  for (const dir of (env.PATH ?? "").split(delimiter)) {
-    if (!dir) continue;
-    const candidate = resolvePath(cwd, dir, name);
-    if (isExecutable(candidate)) return candidate;
-  }
-  return undefined;
-}
-
-/** Windows env names are case-insensitive, but a plain env object (unlike
- * `process.env` there) keeps whatever case it was built with — `Path` is common. */
-function windowsEnvValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const upper = name.toUpperCase();
-  for (const [key, value] of Object.entries(env)) {
-    if (key.toUpperCase() === upper && value !== undefined) return value;
-  }
-  return undefined;
-}
-
-/** Windows lookup: a file is runnable by its extension, so a bare name is
- * tried with each PATHEXT extension — never alone, which would pick the
- * extensionless shell script npm installs beside its `.cmd` shim. A name
- * that already has an extension is tried as it is first. */
-function resolveWindowsExecutable(
-  name: string,
-  env: NodeJS.ProcessEnv,
-  cwd: string,
-): string | undefined {
-  const extensions = (windowsEnvValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
-    .split(";")
-    .filter(Boolean)
-    .map((extension) => extension.toLowerCase());
-  const candidates = (base: string): string[] => [
-    ...(extname(base) ? [base] : []),
-    ...extensions.map((extension) => base + extension),
-  ];
-  const isFile = (candidate: string): boolean => {
-    try {
-      return statSync(candidate).isFile();
-    } catch {
-      return false;
-    }
-  };
-  if (/[\\/]/.test(name)) return candidates(resolvePath(cwd, name)).find(isFile);
-  // Windows accepts quoted entries (`"C:\Program Files\x"`); a path itself
-  // cannot contain a quote.
-  for (const entry of (windowsEnvValue(env, "PATH") ?? "").split(win32.delimiter)) {
-    const dir = entry.replace(/"/g, "");
-    if (!dir) continue;
-    const found = candidates(resolvePath(cwd, dir, name)).find(isFile);
-    if (found) return found;
-  }
-  return undefined;
-}
-
-/** cmd.exe metacharacters, escaped with `^` (the set cross-spawn uses). */
-const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
-
-/** Quote one argument for the program a batch file runs, then caret-escape
- * it twice: once for the `cmd.exe /c` line, once more for the batch file's
- * own line where its `%*` expands — npm shims forward arguments that way. */
-function escapeBatchArgument(arg: string): string {
-  const quoted = `"${arg
-    .replace(/(\\*)"/g, '$1$1\\"')
-    .replace(/(\\*)$/, "$1$1")}"`;
-  return quoted.replace(CMD_META_CHARS, "^$1").replace(CMD_META_CHARS, "^$1");
-}
-
-export interface LaunchCommand {
-  command: string;
-  args: string[];
-  options: { windowsVerbatimArguments?: boolean };
-}
-
-/** The command line that actually runs `command` with `args`. Off Windows
- * that is the call unchanged. On Windows, spawn finds only `.exe`/`.com`
- * files on PATH and refuses `.cmd`/`.bat` ones outright without a shell,
- * while npm installs CLIs as `.cmd` shims; so the name is resolved through
- * PATHEXT, and a batch file runs under cmd.exe with its arguments escaped
- * to arrive intact. An unresolved name is left for spawn to report missing. */
-export function launchCommand(
-  command: string,
-  args: readonly string[],
-  env: NodeJS.ProcessEnv,
-  { cwd = process.cwd(), platform = process.platform }: ResolveExecutableOptions = {},
-): LaunchCommand {
-  if (platform !== "win32") return { command, args: [...args], options: {} };
-  const resolved = resolveWindowsExecutable(command, env, cwd) ?? command;
-  if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args], options: {} };
-  if (args.some((arg) => /[\r\n]/.test(arg))) {
-    throw new Error(`cmd.exe cannot pass a line break in an argument to ${resolved}`);
-  }
-  const line = [
-    win32.normalize(resolved).replace(CMD_META_CHARS, "^$1"),
-    ...args.map(escapeBatchArgument),
-  ].join(" ");
-  return {
-    command: windowsEnvValue(env, "ComSpec") ?? windowsEnvValue(process.env, "ComSpec") ?? "cmd.exe",
-    args: ["/d", "/s", "/c", `"${line}"`],
-    options: { windowsVerbatimArguments: true },
-  };
 }

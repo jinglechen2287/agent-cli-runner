@@ -6,43 +6,6 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 
 // src/internal.ts
-import { spawn as nodeSpawn } from "child_process";
-import { accessSync, constants, statSync } from "fs";
-import { delimiter, extname, resolve as resolvePath, win32 } from "path";
-import { StringDecoder } from "string_decoder";
-
-// src/errors.ts
-var AbortError = class extends Error {
-  name = "AbortError";
-  constructor(message = "Aborted") {
-    super(message);
-  }
-};
-var TimeoutError = class extends Error {
-  name = "TimeoutError";
-  constructor(message = "Timed out") {
-    super(message);
-  }
-};
-var MissingCliError = class extends Error {
-  name = "MissingCliError";
-  cli;
-  constructor(cli) {
-    super(`\`${cli}\` CLI not found. Install it and make sure it is on your PATH.`);
-    this.cli = cli;
-  }
-};
-var CodexTurnError = class extends Error {
-  name = "CodexTurnError";
-  /** Exit code of the Codex process, once known. */
-  exitCode;
-};
-var SteerRejectedError = class extends Error {
-  name = "SteerRejectedError";
-};
-
-// src/internal.ts
-var SIGTERM_GRACE_MS = 2e3;
 function answerMcpElicitation(callback, request, signals) {
   if (!callback) return Promise.resolve({ action: "decline" });
   const controller = new AbortController();
@@ -92,226 +55,19 @@ function toTokenCount(value) {
 function toContextWindow(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : void 0;
 }
-function filterEnv(base, stripped) {
-  const env = {};
-  const normalize = (key) => process.platform === "win32" ? key.toUpperCase() : key;
-  const strippedKeys = new Set(stripped.map(normalize));
-  for (const [key, value] of Object.entries(base)) {
-    if (value !== void 0 && !strippedKeys.has(normalize(key))) env[key] = value;
-  }
-  return env;
-}
-function isMissingExecutable(error) {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
-}
-function createLineSplitter(onLine) {
-  let buffer = "";
-  const decoder = new StringDecoder("utf8");
-  return {
-    push(chunk) {
-      buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
-      let newline = buffer.indexOf("\n");
-      while (newline !== -1) {
-        onLine(buffer.slice(0, newline));
-        buffer = buffer.slice(newline + 1);
-        newline = buffer.indexOf("\n");
-      }
-    },
-    flush() {
-      buffer += decoder.end();
-      if (buffer) onLine(buffer);
-      buffer = "";
-    }
-  };
-}
-function createChunkDecoder(onText) {
-  const decoder = new StringDecoder("utf8");
-  return {
-    push(chunk) {
-      const text2 = typeof chunk === "string" ? chunk : decoder.write(chunk);
-      if (text2) onText(text2);
-    },
-    flush() {
-      const rest = decoder.end();
-      if (rest) onText(rest);
-    }
-  };
-}
-function writePrompt(child, prompt) {
-  const stdin = child.stdin;
-  if (!stdin) return;
-  stdin.on("error", () => {
-  });
-  stdin.end(prompt);
-}
-function watchLifecycle(opts) {
-  let aborted = false;
-  let timedOut = false;
-  let killTimer;
-  let timeoutTimer;
-  const terminate = () => {
-    opts.kill("SIGTERM");
-    killTimer ??= setTimeout(() => opts.kill("SIGKILL"), SIGTERM_GRACE_MS);
-  };
-  const abortHandler = () => {
-    if (aborted || timedOut) return;
-    aborted = true;
-    terminate();
-  };
-  if (opts.signal) {
-    if (opts.signal.aborted) abortHandler();
-    else opts.signal.addEventListener("abort", abortHandler, { once: true });
-  }
-  if (opts.timeoutMs !== void 0) {
-    timeoutTimer = setTimeout(() => {
-      if (aborted || timedOut) return;
-      timedOut = true;
-      terminate();
-    }, opts.timeoutMs);
-  }
-  return {
-    interruptionError() {
-      if (aborted) return new AbortError(`${opts.cli} run aborted`);
-      if (timedOut) {
-        return new TimeoutError(`${opts.cli} run timed out after ${opts.timeoutMs}ms`);
-      }
-      return null;
-    },
-    cleanup() {
-      if (killTimer) clearTimeout(killTimer);
-      if (timeoutTimer) clearTimeout(timeoutTimer);
-      opts.signal?.removeEventListener("abort", abortHandler);
-    }
-  };
-}
-function signalProcessTree(child, signal, killDirect = (direct) => child.kill(direct)) {
-  if (child.pid && process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-    }
-  }
-  if (child.pid && process.platform === "win32") {
-    const args = ["/pid", String(child.pid), "/T"];
-    if (signal === "SIGKILL") args.push("/F");
-    const killer = nodeSpawn("taskkill", args, {
-      stdio: "ignore",
-      windowsHide: true
-    });
-    let fellBack = false;
-    const fallback = () => {
-      if (fellBack) return;
-      fellBack = true;
-      try {
-        killDirect(signal);
-      } catch {
-      }
-    };
-    killer.once("error", fallback);
-    killer.once("exit", (code) => {
-      if (code !== 0) fallback();
-    });
-    return;
-  }
-  try {
-    killDirect(signal);
-  } catch {
-  }
-}
-function killTreeOnKill(child) {
-  if (process.platform !== "win32") return;
-  const killDirect = child.kill.bind(child);
-  child.kill = () => {
-    signalProcessTree(child, "SIGKILL", (signal) => {
-      killDirect(signal);
-    });
-    return true;
-  };
-}
-function resolveExecutable(name, env, { cwd = process.cwd(), platform = process.platform } = {}) {
-  if (platform === "win32") return resolveWindowsExecutable(name, env, cwd);
-  const isExecutable = (candidate) => {
-    try {
-      accessSync(candidate, constants.X_OK);
-      return statSync(candidate).isFile();
-    } catch {
-      return false;
-    }
-  };
-  if (name.includes("/")) {
-    const candidate = resolvePath(cwd, name);
-    return isExecutable(candidate) ? candidate : void 0;
-  }
-  for (const dir of (env.PATH ?? "").split(delimiter)) {
-    if (!dir) continue;
-    const candidate = resolvePath(cwd, dir, name);
-    if (isExecutable(candidate)) return candidate;
-  }
-  return void 0;
-}
-function windowsEnvValue(env, name) {
-  const upper = name.toUpperCase();
-  for (const [key, value] of Object.entries(env)) {
-    if (key.toUpperCase() === upper && value !== void 0) return value;
-  }
-  return void 0;
-}
-function resolveWindowsExecutable(name, env, cwd) {
-  const extensions = (windowsEnvValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map((extension) => extension.toLowerCase());
-  const candidates = (base) => [
-    ...extname(base) ? [base] : [],
-    ...extensions.map((extension) => base + extension)
-  ];
-  const isFile = (candidate) => {
-    try {
-      return statSync(candidate).isFile();
-    } catch {
-      return false;
-    }
-  };
-  if (/[\\/]/.test(name)) return candidates(resolvePath(cwd, name)).find(isFile);
-  for (const entry of (windowsEnvValue(env, "PATH") ?? "").split(win32.delimiter)) {
-    const dir = entry.replace(/"/g, "");
-    if (!dir) continue;
-    const found = candidates(resolvePath(cwd, dir, name)).find(isFile);
-    if (found) return found;
-  }
-  return void 0;
-}
-var CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
-function escapeBatchArgument(arg) {
-  const quoted = `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
-  return quoted.replace(CMD_META_CHARS, "^$1").replace(CMD_META_CHARS, "^$1");
-}
-function launchCommand(command, args, env, { cwd = process.cwd(), platform = process.platform } = {}) {
-  if (platform !== "win32") return { command, args: [...args], options: {} };
-  const resolved = resolveWindowsExecutable(command, env, cwd) ?? command;
-  if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args], options: {} };
-  if (args.some((arg) => /[\r\n]/.test(arg))) {
-    throw new Error(`cmd.exe cannot pass a line break in an argument to ${resolved}`);
-  }
-  const line = [
-    win32.normalize(resolved).replace(CMD_META_CHARS, "^$1"),
-    ...args.map(escapeBatchArgument)
-  ].join(" ");
-  return {
-    command: windowsEnvValue(env, "ComSpec") ?? windowsEnvValue(process.env, "ComSpec") ?? "cmd.exe",
-    args: ["/d", "/s", "/c", `"${line}"`],
-    options: { windowsVerbatimArguments: true }
-  };
-}
 
 // src/usage.ts
+var GPT_5_CONTEXT_WINDOW = 272e3;
+var GPT_5_6_CONTEXT_WINDOW = 372e3;
 var KNOWN_CONTEXT_WINDOWS = {
-  "gpt-5.2": 272e3,
-  "gpt-5.4": 272e3,
-  "gpt-5.4-mini": 272e3,
-  "gpt-5.5": 272e3,
-  "gpt-5.6-luna": 372e3,
-  "gpt-5.6-sol": 372e3,
-  "gpt-5.6-terra": 372e3,
-  "codex-auto-review": 272e3
+  "gpt-5.2": GPT_5_CONTEXT_WINDOW,
+  "gpt-5.4": GPT_5_CONTEXT_WINDOW,
+  "gpt-5.4-mini": GPT_5_CONTEXT_WINDOW,
+  "gpt-5.5": GPT_5_CONTEXT_WINDOW,
+  "gpt-5.6-luna": GPT_5_6_CONTEXT_WINDOW,
+  "gpt-5.6-sol": GPT_5_6_CONTEXT_WINDOW,
+  "gpt-5.6-terra": GPT_5_6_CONTEXT_WINDOW,
+  "codex-auto-review": GPT_5_CONTEXT_WINDOW
 };
 var CLAUDE_DEFAULT_CONTEXT_WINDOW = 2e5;
 var CLAUDE_1M_CONTEXT_WINDOW = 1e6;
@@ -347,7 +103,7 @@ function claudeContextWindow(id) {
   }
   const [, family, major, minor] = match;
   const canonical = `claude-${family}-${major}${minor !== void 0 ? `-${minor}` : ""}`;
-  if (Object.prototype.hasOwnProperty.call(CLAUDE_CONTEXT_WINDOWS, canonical)) {
+  if (Object.hasOwn(CLAUDE_CONTEXT_WINDOWS, canonical)) {
     return CLAUDE_CONTEXT_WINDOWS[canonical];
   }
   if (family === "fable" || family === "mythos") return CLAUDE_1M_CONTEXT_WINDOW;
@@ -357,12 +113,12 @@ function contextWindowForModel(model) {
   if (!model) return void 0;
   const id = model.trim().toLowerCase();
   if (!id) return void 0;
-  if (Object.prototype.hasOwnProperty.call(KNOWN_CONTEXT_WINDOWS, id)) {
+  if (Object.hasOwn(KNOWN_CONTEXT_WINDOWS, id)) {
     return KNOWN_CONTEXT_WINDOWS[id];
   }
   if (id.includes("claude")) return claudeContextWindow(id);
-  if (id.startsWith("gpt-5.6")) return 372e3;
-  if (id.startsWith("gpt-5")) return 272e3;
+  if (id.startsWith("gpt-5.6")) return GPT_5_6_CONTEXT_WINDOW;
+  if (id.startsWith("gpt-5")) return GPT_5_CONTEXT_WINDOW;
   return void 0;
 }
 
@@ -798,12 +554,273 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
   };
 }
 
-// src/claude-session.ts
+// src/errors.ts
+var AbortError = class extends Error {
+  name = "AbortError";
+  constructor(message = "Aborted") {
+    super(message);
+  }
+};
+var TimeoutError = class extends Error {
+  name = "TimeoutError";
+  constructor(message = "Timed out") {
+    super(message);
+  }
+};
+var MissingCliError = class extends Error {
+  name = "MissingCliError";
+  cli;
+  constructor(cli) {
+    super(`\`${cli}\` CLI not found. Install it and make sure it is on your PATH.`);
+    this.cli = cli;
+  }
+};
+var CodexTurnError = class extends Error {
+  name = "CodexTurnError";
+  /** Exit code of the Codex process, once known. */
+  exitCode;
+};
+var SteerRejectedError = class extends Error {
+  name = "SteerRejectedError";
+};
+function runAborted(cli) {
+  return new AbortError(`${cli} run aborted`);
+}
+function runTimedOut(cli, timeoutMs) {
+  return new TimeoutError(`${cli} run timed out after ${timeoutMs}ms`);
+}
+
+// src/process.ts
+import { execFile, spawn as nodeSpawn } from "child_process";
+import { accessSync, constants, statSync } from "fs";
+import { delimiter, extname, resolve as resolvePath, win32 } from "path";
+import { StringDecoder } from "string_decoder";
+var SIGTERM_GRACE_MS = 2e3;
 var CLAUDE_STRIPPED_ENV_VARS = [
   "CLAUDECODE",
   "CLAUDE_CODE_ENTRYPOINT",
   "CLAUDE_CODE_SESSION_ACCESS_TOKEN"
 ];
+var CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"];
+function filterEnv(base, stripped) {
+  const env = {};
+  const normalize = (key) => process.platform === "win32" ? key.toUpperCase() : key;
+  const strippedKeys = new Set(stripped.map(normalize));
+  for (const [key, value] of Object.entries(base)) {
+    if (value !== void 0 && !strippedKeys.has(normalize(key))) env[key] = value;
+  }
+  return env;
+}
+function childEnv(cli, base = process.env) {
+  return filterEnv(base, cli === "claude" ? CLAUDE_STRIPPED_ENV_VARS : CODEX_STRIPPED_ENV_VARS);
+}
+function isMissingExecutable(error) {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+function createLineSplitter(onLine) {
+  let buffer = "";
+  let draining = false;
+  const decoder = createChunkDecoder((text2) => {
+    buffer += text2;
+    if (draining) return;
+    draining = true;
+    let start = 0;
+    try {
+      for (let newline = buffer.indexOf("\n"); newline !== -1; newline = buffer.indexOf("\n", start)) {
+        onLine(buffer.slice(start, newline));
+        start = newline + 1;
+      }
+    } finally {
+      draining = false;
+      if (start > 0) buffer = buffer.slice(start);
+    }
+  });
+  return {
+    push: decoder.push,
+    flush() {
+      decoder.flush();
+      if (buffer) onLine(buffer);
+      buffer = "";
+    }
+  };
+}
+function createChunkDecoder(onText) {
+  const decoder = new StringDecoder("utf8");
+  return {
+    push(chunk) {
+      const text2 = typeof chunk === "string" ? chunk : decoder.write(chunk);
+      if (text2) onText(text2);
+    },
+    flush() {
+      const rest = decoder.end();
+      if (rest) onText(rest);
+    }
+  };
+}
+function writePrompt(child, prompt) {
+  const stdin = child.stdin;
+  if (!stdin) return;
+  stdin.on("error", () => {
+  });
+  stdin.end(prompt);
+}
+function watchLifecycle(opts) {
+  let aborted = false;
+  let timedOut = false;
+  let killTimer;
+  let timeoutTimer;
+  const terminate = () => {
+    opts.kill("SIGTERM");
+    killTimer ??= setTimeout(() => opts.kill("SIGKILL"), SIGTERM_GRACE_MS);
+  };
+  const abortHandler = () => {
+    if (aborted || timedOut) return;
+    aborted = true;
+    terminate();
+  };
+  if (opts.signal) {
+    if (opts.signal.aborted) abortHandler();
+    else opts.signal.addEventListener("abort", abortHandler, { once: true });
+  }
+  if (opts.timeoutMs !== void 0) {
+    timeoutTimer = setTimeout(() => {
+      if (aborted || timedOut) return;
+      timedOut = true;
+      terminate();
+    }, opts.timeoutMs);
+  }
+  return {
+    interruptionError() {
+      if (aborted) return runAborted(opts.cli);
+      if (timedOut) return runTimedOut(opts.cli, opts.timeoutMs);
+      return null;
+    },
+    cleanup() {
+      if (killTimer) clearTimeout(killTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      opts.signal?.removeEventListener("abort", abortHandler);
+    }
+  };
+}
+function signalProcessTree(child, signal, killDirect = (direct) => child.kill(direct)) {
+  const killDirectSafely = () => {
+    try {
+      killDirect(signal);
+    } catch {
+    }
+  };
+  if (child.pid && process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+    }
+  }
+  if (child.pid && process.platform === "win32") {
+    const args = ["/pid", String(child.pid), "/T"];
+    if (signal === "SIGKILL") args.push("/F");
+    const killer = nodeSpawn("taskkill", args, {
+      stdio: "ignore",
+      windowsHide: true
+    });
+    let fellBack = false;
+    const fallback = () => {
+      if (fellBack) return;
+      fellBack = true;
+      killDirectSafely();
+    };
+    killer.once("error", fallback);
+    killer.once("exit", (code) => {
+      if (code !== 0) fallback();
+    });
+    return;
+  }
+  killDirectSafely();
+}
+function killTreeOnKill(child) {
+  if (process.platform !== "win32") return;
+  const killDirect = child.kill.bind(child);
+  child.kill = () => {
+    signalProcessTree(child, "SIGKILL", (signal) => {
+      killDirect(signal);
+    });
+    return true;
+  };
+}
+function resolveExecutable(name, env, { cwd = process.cwd(), platform = process.platform } = {}) {
+  if (platform === "win32") return resolveWindowsExecutable(name, env, cwd);
+  const isExecutable = (candidate) => {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (name.includes("/")) {
+    const candidate = resolvePath(cwd, name);
+    return isExecutable(candidate) ? candidate : void 0;
+  }
+  for (const dir of (env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = resolvePath(cwd, dir, name);
+    if (isExecutable(candidate)) return candidate;
+  }
+  return void 0;
+}
+function windowsEnvValue(env, name) {
+  const upper = name.toUpperCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() === upper && value !== void 0) return value;
+  }
+  return void 0;
+}
+function resolveWindowsExecutable(name, env, cwd) {
+  const extensions = (windowsEnvValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map((extension) => extension.toLowerCase());
+  const candidates = (base) => [
+    ...extname(base) ? [base] : [],
+    ...extensions.map((extension) => base + extension)
+  ];
+  const isFile = (candidate) => {
+    try {
+      return statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (/[\\/]/.test(name)) return candidates(resolvePath(cwd, name)).find(isFile);
+  for (const entry of (windowsEnvValue(env, "PATH") ?? "").split(win32.delimiter)) {
+    const dir = entry.replace(/"/g, "");
+    if (!dir) continue;
+    const found = candidates(resolvePath(cwd, dir, name)).find(isFile);
+    if (found) return found;
+  }
+  return void 0;
+}
+var CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
+function escapeBatchArgument(arg) {
+  const quoted = `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
+  return quoted.replace(CMD_META_CHARS, "^$1").replace(CMD_META_CHARS, "^$1");
+}
+function launchCommand(command, args, env, { cwd = process.cwd(), platform = process.platform } = {}) {
+  if (platform !== "win32") return { command, args: [...args], options: {} };
+  const resolved = resolveWindowsExecutable(command, env, cwd) ?? command;
+  if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args], options: {} };
+  if (args.some((arg) => /[\r\n]/.test(arg))) {
+    throw new Error(`cmd.exe cannot pass a line break in an argument to ${resolved}`);
+  }
+  const line = [
+    win32.normalize(resolved).replace(CMD_META_CHARS, "^$1"),
+    ...args.map(escapeBatchArgument)
+  ].join(" ");
+  return {
+    command: windowsEnvValue(env, "ComSpec") ?? windowsEnvValue(process.env, "ComSpec") ?? "cmd.exe",
+    args: ["/d", "/s", "/c", `"${line}"`],
+    options: { windowsVerbatimArguments: true }
+  };
+}
+
+// src/claude-session.ts
 var CLAUDE_INTERRUPT_GRACE_MS = 5e3;
 var CLAUDE_FOLLOW_UP_GRACE_MS = 6e4;
 var CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS = 5e3;
@@ -893,7 +910,7 @@ function claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeC
   const tools = opts.isolated ? [] : sdkTools(opts.tools);
   return {
     cwd: opts.cwd,
-    env: filterEnv(opts.env ?? process.env, CLAUDE_STRIPPED_ENV_VARS),
+    env: childEnv("claude", opts.env ?? process.env),
     pathToClaudeCodeExecutable: executablePath,
     spawnClaudeCodeProcess,
     // A fork names its own id alongside the session it copies.
@@ -1460,7 +1477,7 @@ async function createCodexAppServerClient(options) {
   const spawnFn = options.spawnFn ?? nodeSpawn3;
   let child;
   try {
-    const env = filterEnv(options.env ?? process.env, ["CODEX_THREAD_ID"]);
+    const env = childEnv("codex", options.env ?? process.env);
     const launch = launchCommand(options.executablePath ?? "codex", ["app-server", "--stdio"], env, {
       cwd: options.cwd
     });
@@ -2778,7 +2795,6 @@ async function forkCodexThread(options) {
 
 // src/run-codex.ts
 import { spawn } from "child_process";
-var CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"];
 function buildIsolatedArgs(opts) {
   const args = [
     "exec",
@@ -2850,7 +2866,7 @@ async function runIsolatedCodex(opts) {
   const spawnFn = opts.spawnFn ?? spawn;
   let child;
   try {
-    const env = filterEnv(opts.env ?? process.env, CODEX_STRIPPED_ENV_VARS);
+    const env = childEnv("codex", opts.env ?? process.env);
     const launch = launchCommand(opts.executablePath ?? "codex", buildIsolatedArgs(opts), env, {
       cwd: opts.cwd
     });
@@ -3031,7 +3047,7 @@ function runForkedCodex(opts) {
 }
 
 // src/model-catalog.ts
-import { execFile } from "child_process";
+import { execFile as execFile2 } from "child_process";
 var MAX_CODEX_MODEL_PAGES = 50;
 async function collectCodexModels(requestPage) {
   const models = [];
@@ -3072,10 +3088,10 @@ function parseClaudeCliHelp(help) {
   return { aliases, efforts };
 }
 function readClaudeCliCapabilities(executablePath, cwd) {
-  const env = filterEnv(process.env, CLAUDE_STRIPPED_ENV_VARS);
+  const env = childEnv("claude");
   return new Promise((resolve, reject) => {
     const launch = launchCommand(executablePath, ["--help"], env, { cwd });
-    const child = execFile(
+    const child = execFile2(
       launch.command,
       launch.args,
       {
@@ -3239,7 +3255,7 @@ function createModelCatalogService(config = {}, deps = {}) {
 }
 
 // src/provider-updates.ts
-import { execFile as execFile2 } from "child_process";
+import { execFile as execFile3 } from "child_process";
 var CHECK_TIMEOUT_MS = 5e3;
 var CODEX_DOCTOR_TIMEOUT_MS = 3e4;
 var APPLY_TIMEOUT_MS = 10 * 60 * 1e3;
@@ -3247,7 +3263,7 @@ var CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases"
 function defaultRunCommand(executable, args, options) {
   return new Promise((resolve, reject) => {
     const launch = launchCommand(executable, args, options.env);
-    const child = execFile2(
+    const child = execFile3(
       launch.command,
       launch.args,
       {
@@ -3436,7 +3452,7 @@ ${command.stderr}`) ?? unknownStatus(provider, checkedAt, "version_unavailable")
   }
   async function checkClaude(checkedAt) {
     const executable = config.claudePath ?? "claude";
-    const env = filterEnv(baseEnv, CLAUDE_STRIPPED_ENV_VARS);
+    const env = childEnv("claude", baseEnv);
     const [installed, doctorResult] = await Promise.all([
       installedVersion("claude", executable, env, checkedAt),
       runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS }).then((value) => ({ ok: true, value })).catch(() => ({ ok: false }))
@@ -3488,7 +3504,7 @@ ${doctor.stderr}`);
   }
   async function checkCodex(checkedAt) {
     const executable = config.codexPath ?? "codex";
-    const env = filterEnv(baseEnv, CODEX_STRIPPED_ENV_VARS);
+    const env = childEnv("codex", baseEnv);
     const [installed, doctorResult] = await Promise.all([
       installedVersion("codex", executable, env, checkedAt),
       runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CODEX_DOCTOR_TIMEOUT_MS }).then((value) => ({ ok: true, value })).catch(() => ({ ok: false }))
@@ -3558,10 +3574,7 @@ ${doctor.stderr}` : doctor.stdout;
   }
   const apply = async (provider) => {
     const executable = executableFor(provider);
-    const env = filterEnv(
-      baseEnv,
-      provider === "claude" ? CLAUDE_STRIPPED_ENV_VARS : CODEX_STRIPPED_ENV_VARS
-    );
+    const env = childEnv(provider, baseEnv);
     if (provider === "claude") {
       let installMethod;
       let doctorOutput;
