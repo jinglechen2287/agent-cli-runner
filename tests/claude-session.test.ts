@@ -1256,6 +1256,28 @@ describe("createClaudeSession MCP status", () => {
     await session.close();
   });
 
+  it("hands the next turn an empty server list at its start", async () => {
+    const fake = makeFakeQuery();
+    // The second turn's own refresh never answers, so only the kept list can reach it.
+    fake.mcpServerStatus
+      .mockResolvedValueOnce([])
+      .mockImplementation(() => new Promise(() => {}));
+    const session = await startSession(fake);
+    const first = session.runTurn({ prompt: "x", onMcpStatus: () => {} });
+    await fake.waitForPrompt(1);
+    fake.emit(initWith([]));
+    fake.emit(result("done"));
+    await first;
+
+    const snapshots: unknown[] = [];
+    const second = session.runTurn({ prompt: "y", onMcpStatus: (servers) => snapshots.push(servers) });
+    await fake.waitForPrompt(2);
+    expect(snapshots[0]).toEqual([]);
+    fake.emit(result("done"));
+    await second;
+    await session.close();
+  });
+
   it("keeps the last snapshot when a status call fails, and the turn is unaffected", async () => {
     const fake = makeFakeQuery();
     fake.mcpServerStatus.mockRejectedValue(new Error("nope"));

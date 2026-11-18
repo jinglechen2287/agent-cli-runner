@@ -515,6 +515,36 @@ describe("Codex app-server runner", () => {
     });
   });
 
+  it("fails a resumed run on an untagged thread error that lands before thread/resume answers", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/resume") {
+        // Current Codex tags its errors with a turn; the runner still treats an
+        // untagged one as thread-fatal, matched by the id being resumed.
+        send(child, {
+          method: "error",
+          params: { threadId: "thread-resume-error", error: { message: "rollout unreadable" } },
+        });
+        send(child, { id: message.id, result: { thread: { id: "thread-resume-error" } } });
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("turn-r", "inProgress") } });
+        send(child, {
+          method: "turn/completed",
+          params: { threadId: "thread-resume-error", turn: completedTurn("turn-r") },
+        });
+      }
+    });
+
+    await expect(runCodex({
+      prompt: "continue",
+      cwd: "/tmp/project",
+      resumeSessionId: "thread-resume-error",
+      spawnFn: (() => child) as never,
+    })).rejects.toMatchObject({ name: "CodexTurnError" });
+  });
+
   it("waits for authoritative completed web items before mapping them", async () => {
     const child = makeFakeChild();
     const onToolUse = vi.fn();
@@ -1563,6 +1593,35 @@ describe("Codex app-server runner", () => {
       vi.advanceTimersByTime(2_100);
       await closing;
       expect(closeFinished).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives a close made from an onClose handler the promise of the close that fired it", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeFakeChild();
+      captureRequests(child, (message) => {
+        if (message.method === "initialize") {
+          send(child, { id: message.id, result: {} });
+        } else if (message.method === "thread/start") {
+          send(child, { id: message.id, result: { thread: { id: "thread-reentrant-close" } } });
+        }
+      });
+      const session = await createCodexAppServerSession({
+        cwd: "/tmp/project",
+        spawnFn: (() => child) as never,
+      });
+      let inner: Promise<void> | undefined;
+      session.onClose(() => {
+        inner = session.close();
+      });
+
+      const outer = session.close();
+      expect(inner).toBe(outer);
+      vi.advanceTimersByTime(4_200);
+      await outer;
     } finally {
       vi.useRealTimers();
     }
@@ -2996,6 +3055,30 @@ describe("CodexAppServerSession.compact", () => {
         (error: Error) => { settled = { status: "rejected", error }; },
       );
       await vi.advanceTimersByTimeAsync(1_500);
+      expect(settled).toMatchObject({ status: "rejected", error: expect.objectContaining({ name: "TimeoutError" }) });
+      expect(session.closed).toBe(true);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires the session at the turn/start deadline when the compaction never starts", async () => {
+    vi.useFakeTimers();
+    try {
+      // The reply takes a third of the budget: the wait for turn/started gets
+      // what is left of the deadline set when the request went out, not 60 s more.
+      const { session, child } = await compactSession((c, id) => {
+        setTimeout(() => send(c, { id, result: {} }), 20_000);
+      });
+      let settled: { status: string; error?: Error } | undefined;
+      void session.compact({}).then(
+        () => { settled = { status: "resolved" }; },
+        (error: Error) => { settled = { status: "rejected", error }; },
+      );
+      await vi.advanceTimersByTimeAsync(59_900);
+      expect(settled).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(500);
       expect(settled).toMatchObject({ status: "rejected", error: expect.objectContaining({ name: "TimeoutError" }) });
       expect(session.closed).toBe(true);
       expect(child.kill).toHaveBeenCalledWith("SIGTERM");
