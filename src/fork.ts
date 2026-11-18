@@ -7,6 +7,7 @@ import { deleteSession, forkSession } from "@anthropic-ai/claude-agent-sdk";
 import { createCodexAppServerClient } from "./codex-client.js";
 import { threadIdFrom } from "./codex-items.js";
 import { AbortError, TimeoutError } from "./errors.js";
+import { withoutUndefined } from "./internal.js";
 import type { RunCodexOptions } from "./run-codex.js";
 
 /** Copying a thread is quick; this bounds an app-server that hangs. */
@@ -50,10 +51,12 @@ export async function forkCodexThread(options: ForkCodexThreadOptions): Promise<
   const client = await createCodexAppServerClient({
     cwd: options.cwd,
     requestTimeoutMs: timeoutMs,
-    ...(options.executablePath ? { executablePath: options.executablePath } : {}),
-    ...(options.env ? { env: options.env } : {}),
-    ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
-    ...(signal ? { signal } : {}),
+    ...withoutUndefined({
+      executablePath: options.executablePath || undefined,
+      env: options.env,
+      spawnFn: options.spawnFn,
+      signal,
+    }),
   });
   const abort = () => client.close();
   signal?.addEventListener("abort", abort, { once: true });

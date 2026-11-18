@@ -334,6 +334,34 @@ describe("execCli", () => {
     )).rejects.toMatchObject({ killed: true, stdout: "partial" });
   });
 
+  it.skipIf(process.platform === "win32")("lets a command clean up on SIGTERM, and still reports the timeout", async () => {
+    await expect(execCli(
+      process.execPath,
+      ["-e", "process.on('SIGTERM', () => process.stdout.write('cleaned', () => process.exit(0))); setInterval(() => {}, 1000)"],
+      { env: process.env, timeoutMs: 1_500 },
+    )).rejects.toMatchObject({ killed: true, stdout: "cleaned" });
+  });
+
+  it.skipIf(process.platform === "win32")("settles when something the command started holds its output open", async () => {
+    const script = [
+      "const { spawn } = require('node:child_process');",
+      "const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] });",
+      "process.stdout.write(String(worker.pid));",
+      "process.on('SIGTERM', () => {});",
+      "setInterval(() => {}, 1000);",
+    ].join(" ");
+    const failure = await execCli(process.execPath, ["-e", script], { env: process.env, timeoutMs: 1_000 })
+      .then(() => undefined, (error: { killed?: boolean; stdout?: string }) => error);
+    const workerPid = Number(failure?.stdout);
+    try {
+      process.kill(workerPid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+    expect(failure).toMatchObject({ killed: true });
+    expect(workerPid).toBeGreaterThan(0);
+  }, 15_000);
+
   it.skipIf(process.platform === "win32")("kills a command that ignores SIGTERM at the timeout", async () => {
     await expect(execCli(
       process.execPath,

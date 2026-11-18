@@ -85,13 +85,13 @@ function planCompletionSummary(planItems2) {
 }
 function normalizePlanStatus(value) {
   if (typeof value !== "string") return void 0;
-  const status = value.trim();
-  if (!status) return void 0;
-  return status.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
+  const status2 = value.trim();
+  if (!status2) return void 0;
+  return status2.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/\s+/g, "_");
 }
-function planItem(text2, status) {
+function planItem(text2, status2) {
   const itemText = normalizeSummary(text2);
-  const itemStatus = normalizePlanStatus(status);
+  const itemStatus = normalizePlanStatus(status2);
   return itemText && itemStatus ? { text: itemText, status: itemStatus } : void 0;
 }
 function toPlanItems(values, toItem) {
@@ -104,8 +104,8 @@ function toPlanItems(values, toItem) {
   }
   return items.length > 0 ? items : void 0;
 }
-function isTerminalAgentStatus(status) {
-  return status === "completed" || status === "failed" || status === "interrupted";
+function isTerminalAgentStatus(status2) {
+  return status2 === "completed" || status2 === "failed" || status2 === "interrupted";
 }
 function normalizeSummary(value) {
   if (typeof value !== "string") return void 0;
@@ -136,12 +136,12 @@ function claudeMcpStatuses(servers, known = []) {
       return [];
     }
     if (!Object.hasOwn(CLAUDE_MCP_STATUSES, server.status)) return [];
-    const status = CLAUDE_MCP_STATUSES[server.status];
-    if (!status) return [];
+    const status2 = CLAUDE_MCP_STATUSES[server.status];
+    if (!status2) return [];
     const stated = typeof server.error === "string" && server.error ? server.error : void 0;
-    const previous = known.find((entry) => entry.name === server.name && entry.status === status);
+    const previous = known.find((entry) => entry.name === server.name && entry.status === status2);
     const error = stated ?? previous?.error;
-    return [{ name: server.name, status, ...error ? { error } : {} }];
+    return [{ name: server.name, status: status2, ...error ? { error } : {} }];
   });
 }
 function createClaudeMcpStatus(runtime, activeTurn) {
@@ -152,7 +152,7 @@ function createClaudeMcpStatus(runtime, activeTurn) {
     const callbacks = activeTurn()?.callbacks;
     const snapshot = mcpStatuses;
     if (!callbacks?.onMcpStatus || !snapshot) return;
-    safeCallback(() => callbacks.onMcpStatus?.(snapshot.map((status) => ({ ...status }))));
+    safeCallback(() => callbacks.onMcpStatus?.(snapshot.map((status2) => ({ ...status2 }))));
   };
   const updateMcpStatus = (next) => {
     if (JSON.stringify(next) === JSON.stringify(mcpStatuses)) return;
@@ -184,7 +184,7 @@ function createClaudeMcpStatus(runtime, activeTurn) {
       void refreshMcpStatus();
       return;
     }
-    if (active === turn && Date.now() < turn.mcpPollDeadline && mcpStatuses?.some(({ status }) => status === "connecting")) {
+    if (active === turn && Date.now() < turn.mcpPollDeadline && mcpStatuses?.some(({ status: status2 }) => status2 === "connecting")) {
       stopPoll();
       mcpPollTimer = setTimeout(() => void refreshMcpStatus(), MCP_STATUS_POLL_MS);
       mcpPollTimer.unref?.();
@@ -308,9 +308,9 @@ function summarizeClaudeTool(name, input) {
       return str("subject");
     case "TaskUpdate": {
       const taskId = str("taskId");
-      const status = str("status")?.replace(/_/g, " ");
-      if (taskId && status) return `Task #${taskId} \xB7 ${status}`;
-      return taskId ? `Task #${taskId}` : status;
+      const status2 = str("status")?.replace(/_/g, " ");
+      if (taskId && status2) return `Task #${taskId} \xB7 ${status2}`;
+      return taskId ? `Task #${taskId}` : status2;
     }
     case "Skill": {
       const skill = str("skill");
@@ -330,13 +330,13 @@ function claudeTodoPlanItems(name, input) {
   ));
 }
 var AGENT_TOOL_NAMES = /* @__PURE__ */ new Set(["Agent", "Task"]);
-function claudeBackgroundAgentStatus(status) {
-  switch (status) {
+function claudeBackgroundAgentStatus(status2) {
+  switch (status2) {
     case "pending":
     case "running":
     case "completed":
     case "failed":
-      return status;
+      return status2;
     case "killed":
       return "interrupted";
     default:
@@ -386,8 +386,8 @@ function pickPrimaryModel(modelUsage, preferred) {
 function countsTokens(usage) {
   return (usage.input_tokens ?? 0) > 0 || (usage.output_tokens ?? 0) > 0 || (usage.cache_read_input_tokens ?? 0) > 0 || (usage.cache_creation_input_tokens ?? 0) > 0;
 }
-function isTerminalTaskStatus(status) {
-  return status === "completed" || status === "failed" || status === "stopped" || status === "killed";
+function isTerminalTaskStatus(status2) {
+  return status2 === "completed" || status2 === "failed" || status2 === "stopped" || status2 === "killed";
 }
 function createClaudeSessionState() {
   return { contextWindows: /* @__PURE__ */ new Map() };
@@ -550,7 +550,7 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
     if (isTerminalTaskStatus(patch?.status)) settleTask(taskId);
     const current = backgroundAgents.get(taskId);
     if (!current || !patch) return;
-    const status = claudeBackgroundAgentStatus(patch.status) ?? current.status;
+    const status2 = claudeBackgroundAgentStatus(patch.status) ?? current.status;
     const now = Date.now();
     emitBackgroundAgent({
       ...current,
@@ -558,9 +558,9 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
         description: optionalString(patch.description),
         error: optionalString(patch.error)
       }),
-      status,
+      status: status2,
       updatedAt: now,
-      ...isTerminalAgentStatus(status) ? {
+      ...isTerminalAgentStatus(status2) ? {
         endedAt: current.endedAt ?? (typeof patch.end_time === "number" ? patch.end_time : now)
       } : {}
     });
@@ -823,6 +823,60 @@ function spawnCli(options) {
     if (isMissingExecutable(error)) throw new MissingCliError(options.cli);
     throw error;
   }
+}
+function execCli(executable, args, options) {
+  return new Promise((resolve, reject) => {
+    const launch = launchCommand(executable, args, options.env, { cwd: options.cwd });
+    const exited = createDeferred();
+    let timedOut = false;
+    let deadline;
+    const child = execFile(
+      launch.command,
+      launch.args,
+      {
+        ...launch.options,
+        cwd: options.cwd,
+        env: options.env,
+        maxBuffer: 1e6,
+        // Only execFile's own kill, for outgrowing maxBuffer: the deadline
+        // below stops the CLI itself.
+        killSignal: "SIGKILL",
+        encoding: "utf8"
+      },
+      (error, stdout, stderr) => {
+        exited.resolve();
+        clearTimeout(deadline);
+        if (timedOut) {
+          reject(Object.assign(error ?? new Error(`${executable} timed out`), {
+            killed: true,
+            stdout,
+            stderr
+          }));
+          return;
+        }
+        if (!error) {
+          resolve({ stdout, stderr, exitCode: 0 });
+          return;
+        }
+        if (typeof error.code === "number" && !error.killed) {
+          resolve({ stdout, stderr, exitCode: error.code });
+          return;
+        }
+        reject(Object.assign(error, { stdout, stderr }));
+      }
+    );
+    killTreeOnKill(child);
+    deadline = setTimeout(() => {
+      timedOut = true;
+      void terminateTree((signal) => {
+        child.kill(signal);
+      }, exited).then(() => {
+        if (exited.settled) return;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      });
+    }, options.timeoutMs);
+  });
 }
 function createLineSplitter(onLine) {
   let buffer = "";
@@ -2035,9 +2089,9 @@ function codexMcpStatus(params) {
   const name = text(params.name);
   if (!name) return void 0;
   const error = text(params.error);
-  const failed = (status) => ({
+  const failed = (status2) => ({
     name,
-    status,
+    status: status2,
     ...error ? { error } : {}
   });
   switch (params.status) {
@@ -2151,7 +2205,7 @@ function createCodexAgentTracker(onUpdate) {
         const current = backgroundAgents.get(id);
         if (!current && !isSpawn) continue;
         const state = record(states[id]);
-        const status = backgroundStatus(state?.status) ?? current?.status ?? "pending";
+        const status2 = backgroundStatus(state?.status) ?? current?.status ?? "pending";
         const message = text(state?.message);
         const itemId = text(item.id);
         const description = current?.description ?? text(item.prompt);
@@ -2163,13 +2217,13 @@ function createCodexAgentTracker(onUpdate) {
           },
           ...!current?.parentToolCallId && itemId ? { parentToolCallId: itemId } : {},
           ...description ? { description } : {},
-          status,
-          ...message && status === "failed" ? { error: message } : {},
-          ...message && status !== "failed" ? { summary: message } : {},
+          status: status2,
+          ...message && status2 === "failed" ? { error: message } : {},
+          ...message && status2 !== "failed" ? { summary: message } : {},
           updatedAt: occurredAt,
-          ...isTerminalAgentStatus(status) ? { endedAt: current?.endedAt ?? occurredAt } : {}
+          ...isTerminalAgentStatus(status2) ? { endedAt: current?.endedAt ?? occurredAt } : {}
         };
-        if (status === "failed") delete agent.summary;
+        if (status2 === "failed") delete agent.summary;
         else delete agent.error;
         backgroundAgents.set(id, agent);
         onUpdate(agent);
@@ -2195,10 +2249,12 @@ async function forkCodexThread(options) {
   const client = await createCodexAppServerClient({
     cwd: options.cwd,
     requestTimeoutMs: timeoutMs,
-    ...options.executablePath ? { executablePath: options.executablePath } : {},
-    ...options.env ? { env: options.env } : {},
-    ...options.spawnFn ? { spawnFn: options.spawnFn } : {},
-    ...signal ? { signal } : {}
+    ...withoutUndefined({
+      executablePath: options.executablePath || void 0,
+      env: options.env,
+      spawnFn: options.spawnFn,
+      signal
+    })
   });
   const abort = () => client.close();
   signal?.addEventListener("abort", abort, { once: true });
@@ -2452,11 +2508,11 @@ async function runCodexAppServerTurn(opts, {
   };
   const emitToolResult = (id, item) => {
     const exitCode = item.exitCode;
-    const status = text(item.status);
+    const status2 = text(item.status);
     safeCallback(() => opts.onToolResult?.({
       callId: id,
       content: item,
-      ...typeof exitCode === "number" && exitCode !== 0 || status === "failed" ? { isError: true } : {}
+      ...typeof exitCode === "number" && exitCode !== 0 || status2 === "failed" ? { isError: true } : {}
     }));
   };
   const webTools = createWebToolTracker({ toolUse: emitToolUse, toolResult: emitToolResult });
@@ -2557,12 +2613,12 @@ async function runCodexAppServerTurn(opts, {
       failLifecycle(interruption);
       return;
     }
-    const status = text(record(params.turn)?.status);
-    if (status === "completed") {
+    const status2 = text(record(params.turn)?.status);
+    if (status2 === "completed") {
       settleOk();
       return;
     }
-    const message = text(record(record(params.turn)?.error)?.message) ?? `Codex turn ${status ?? "failed"}`;
+    const message = text(record(record(params.turn)?.error)?.message) ?? `Codex turn ${status2 ?? "failed"}`;
     settleError(new CodexTurnError(message));
   };
   const removeNotification = client.onNotification((method, rawParams) => {
@@ -2707,17 +2763,17 @@ async function createCodexAppServerSession(options) {
   const emitMcpStatus = () => {
     const callbacks = activeTurn?.callbacks;
     if (!callbacks?.onMcpStatus || mcpStatuses.size === 0) return;
-    const snapshot = [...mcpStatuses.values()].map((status) => ({ ...status }));
+    const snapshot = [...mcpStatuses.values()].map((status2) => ({ ...status2 }));
     safeCallback(() => callbacks.onMcpStatus?.(snapshot));
   };
   const applyMcpStatus = (params) => {
     const tagged = text(params.threadId);
     if (tagged && tagged !== threadId) return false;
-    const status = codexMcpStatus(params);
-    if (!status) return false;
-    const previous = mcpStatuses.get(status.name);
-    if (previous && JSON.stringify(previous) === JSON.stringify(status)) return false;
-    mcpStatuses.set(status.name, status);
+    const status2 = codexMcpStatus(params);
+    if (!status2) return false;
+    const previous = mcpStatuses.get(status2.name);
+    if (previous && JSON.stringify(previous) === JSON.stringify(status2)) return false;
+    mcpStatuses.set(status2.name, status2);
     return true;
   };
   client.onNotification((method, rawParams) => {
@@ -3139,7 +3195,6 @@ function validateForkedRun(opts) {
 }
 
 // src/model-catalog.ts
-import { execFile as execFile2 } from "child_process";
 var MAX_CODEX_MODEL_PAGES = 50;
 async function collectCodexModels(requestPage) {
   const models = [];
@@ -3154,7 +3209,7 @@ async function collectCodexModels(requestPage) {
 }
 var CLAUDE_FALLBACK_ALIASES = ["opus", "sonnet", "haiku"];
 var CLAUDE_FALLBACK_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
-function effortLabel(value) {
+function optionLabel(value) {
   if (value === "xhigh") return "Extra High";
   return value.length === 0 ? value : value[0].toUpperCase() + value.slice(1);
 }
@@ -3179,51 +3234,36 @@ function parseClaudeCliHelp(help) {
   const efforts = uniqueValues(effortList.split(","));
   return { aliases, efforts };
 }
-function readClaudeCliCapabilities(executablePath, cwd) {
-  const env = childEnv("claude");
-  return new Promise((resolve, reject) => {
-    const launch = launchCommand(executablePath, ["--help"], env, { cwd });
-    const child = execFile2(
-      launch.command,
-      launch.args,
-      {
-        ...launch.options,
-        cwd,
-        timeout: 5e3,
-        maxBuffer: 1e6,
-        env
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve(parseClaudeCliHelp(`${stdout}
-${stderr}`));
-      }
-    );
-    killTreeOnKill(child);
+async function readClaudeCliCapabilities(executablePath, cwd) {
+  const { stdout, stderr, exitCode } = await execCli(executablePath, ["--help"], {
+    env: childEnv("claude"),
+    cwd,
+    timeoutMs: 5e3
   });
+  if (exitCode !== 0) throw new Error(`${executablePath} --help exited with code ${exitCode}`);
+  return parseClaudeCliHelp(`${stdout}
+${stderr}`);
 }
 function claudeModels(capabilities, defaultEffort) {
   const aliases = capabilities.aliases.length > 0 ? capabilities.aliases : CLAUDE_FALLBACK_ALIASES;
   const discoveredEfforts = capabilities.efforts.length > 0 ? capabilities.efforts : CLAUDE_FALLBACK_EFFORTS;
-  const efforts = uniqueValues([...discoveredEfforts, ...defaultEffort ? [defaultEffort] : []]).map((effort) => ({ id: effort, label: effortLabel(effort) }));
+  const effortIds = uniqueValues([...discoveredEfforts, ...defaultEffort ? [defaultEffort] : []]);
+  const efforts = () => effortIds.map((effort) => ({ id: effort, label: optionLabel(effort) }));
   return [
     {
       id: "default",
       label: "Default",
       description: "Use the model selected by Claude Code and your account",
-      efforts,
+      efforts: efforts(),
       serviceTiers: [],
       defaultEffort: defaultEffort ?? null,
       isDefault: true
     },
     ...aliases.filter((alias) => alias !== "default").map((alias) => ({
       id: alias,
-      label: effortLabel(alias),
+      label: optionLabel(alias),
       description: `Latest model exposed by Claude Code's ${alias} alias`,
-      efforts,
+      efforts: efforts(),
       serviceTiers: [],
       defaultEffort: defaultEffort ?? null,
       isDefault: false
@@ -3245,98 +3285,98 @@ function createModelCatalogService(config = {}, deps = {}) {
   const discoverClaude = deps.getClaudeCapabilities ?? readClaudeCliCapabilities;
   const now = deps.now ?? (() => /* @__PURE__ */ new Date());
   const hostDefaultEffort = config.defaultEffort?.trim() || void 0;
-  return {
-    async getCatalog(provider, cwd) {
-      if (provider === "claude") {
-        let capabilities;
-        let source2 = "claude-cli";
-        try {
-          capabilities = await discoverClaude(config.claudePath ?? "claude", cwd);
-        } catch {
-          source2 = "claude-fallback";
-          capabilities = {
-            aliases: [...CLAUDE_FALLBACK_ALIASES],
-            efforts: [...CLAUDE_FALLBACK_EFFORTS]
-          };
-        }
-        const models = claudeModels(capabilities, hostDefaultEffort);
-        return {
-          provider,
-          source: source2,
-          fetchedAt: now().toISOString(),
-          supportsCustomModel: true,
-          models: models.map((model) => ({
-            ...model,
-            efforts: model.efforts.map((effort) => ({ ...effort }))
-          }))
-        };
-      }
-      const configuredModel = config.codexModel?.trim() || void 0;
-      let source = "codex-app-server";
-      let discovered;
-      try {
-        discovered = await discoverCodex(config.codexPath ?? "codex", cwd);
-      } catch (error) {
-        if (!configuredModel) throw error;
-        source = "codex-config";
-        discovered = [];
-      }
-      const visible = discovered.filter((model) => typeof model.model === "string").map((model) => ({ ...model, model: model.model.trim() })).filter((model) => !model.hidden && model.model);
-      if (configuredModel && !visible.some((model) => model.model === configuredModel)) {
-        visible.unshift({
-          model: configuredModel,
-          displayName: configuredModel,
-          description: config.configuredModelDescription ?? "Configured model",
-          isDefault: true,
-          ...hostDefaultEffort ? {
-            defaultReasoningEffort: hostDefaultEffort,
-            supportedReasoningEfforts: [{ reasoningEffort: hostDefaultEffort }]
-          } : {}
-        });
-      }
-      return {
-        provider,
-        source,
-        fetchedAt: now().toISOString(),
-        supportsCustomModel: false,
-        models: visible.map((model) => {
-          const providerDefaultEffort = model.defaultReasoningEffort?.trim() || void 0;
-          const defaultEffort = hostDefaultEffort ?? providerDefaultEffort ?? null;
-          const efforts = uniqueValues([
-            ...(model.supportedReasoningEfforts ?? []).map(({ reasoningEffort }) => reasoningEffort),
-            ...providerDefaultEffort ? [providerDefaultEffort] : [],
-            ...defaultEffort ? [defaultEffort] : []
-          ]).map((reasoningEffort) => ({
-            id: reasoningEffort,
-            label: effortLabel(reasoningEffort)
-          }));
-          return {
-            id: model.model,
-            label: model.displayName?.trim() || model.model,
-            ...model.description?.trim() ? { description: model.description.trim() } : {},
-            efforts,
-            serviceTiers: (model.serviceTiers ?? []).map((tier) => ({ ...tier })),
-            defaultEffort,
-            isDefault: configuredModel ? model.model === configuredModel : model.isDefault === true
-          };
-        })
+  const claudeCatalog = async (cwd) => {
+    let capabilities;
+    let source = "claude-cli";
+    try {
+      capabilities = await discoverClaude(config.claudePath ?? "claude", cwd);
+    } catch {
+      source = "claude-fallback";
+      capabilities = {
+        aliases: [...CLAUDE_FALLBACK_ALIASES],
+        efforts: [...CLAUDE_FALLBACK_EFFORTS]
       };
+    }
+    return {
+      provider: "claude",
+      source,
+      fetchedAt: now().toISOString(),
+      supportsCustomModel: true,
+      models: claudeModels(capabilities, hostDefaultEffort)
+    };
+  };
+  const codexCatalog = async (cwd) => {
+    const configuredModel = config.codexModel?.trim() || void 0;
+    let source = "codex-app-server";
+    let discovered;
+    try {
+      discovered = await discoverCodex(config.codexPath ?? "codex", cwd);
+    } catch (error) {
+      if (!configuredModel) throw error;
+      source = "codex-config";
+      discovered = [];
+    }
+    const visible = discovered.filter((model) => typeof model.model === "string").map((model) => ({ ...model, model: model.model.trim() })).filter((model) => !model.hidden && model.model);
+    if (configuredModel && !visible.some((model) => model.model === configuredModel)) {
+      visible.unshift({
+        model: configuredModel,
+        displayName: configuredModel,
+        description: config.configuredModelDescription ?? "Configured model",
+        isDefault: true,
+        ...hostDefaultEffort ? {
+          defaultReasoningEffort: hostDefaultEffort,
+          supportedReasoningEfforts: [{ reasoningEffort: hostDefaultEffort }]
+        } : {}
+      });
+    }
+    return {
+      provider: "codex",
+      source,
+      fetchedAt: now().toISOString(),
+      supportsCustomModel: false,
+      models: visible.map((model) => {
+        const providerDefaultEffort = model.defaultReasoningEffort?.trim() || void 0;
+        const defaultEffort = hostDefaultEffort ?? providerDefaultEffort ?? null;
+        const efforts = uniqueValues([
+          ...(model.supportedReasoningEfforts ?? []).map(({ reasoningEffort }) => reasoningEffort),
+          ...providerDefaultEffort ? [providerDefaultEffort] : [],
+          ...defaultEffort ? [defaultEffort] : []
+        ]).map((reasoningEffort) => ({
+          id: reasoningEffort,
+          label: optionLabel(reasoningEffort)
+        }));
+        return {
+          id: model.model,
+          label: model.displayName?.trim() || model.model,
+          ...model.description?.trim() ? { description: model.description.trim() } : {},
+          efforts,
+          serviceTiers: (model.serviceTiers ?? []).map((tier) => ({ ...tier })),
+          defaultEffort,
+          isDefault: configuredModel ? model.model === configuredModel : model.isDefault === true
+        };
+      })
+    };
+  };
+  return {
+    getCatalog(provider, cwd) {
+      return provider === "claude" ? claudeCatalog(cwd) : codexCatalog(cwd);
     },
     validateSelection(catalog, input) {
       const model = input.model?.trim() || null;
-      const option = model ? catalog.models.find((candidate) => candidate.id === model) : catalog.models.find((candidate) => candidate.isDefault) ?? catalog.models[0];
+      const markedDefault = catalog.models.find((candidate) => candidate.isDefault);
+      const defaultOption = markedDefault ?? catalog.models[0];
+      const option = model ? catalog.models.find((candidate) => candidate.id === model) : defaultOption;
       if (model && !option && !catalog.supportsCustomModel) {
         throw new Error(`Model is not available: ${model}`);
       }
-      const defaultOption = catalog.models.find((candidate) => candidate.isDefault) ?? catalog.models[0];
       const requestedEffort = input.effort === void 0 ? (option ?? defaultOption)?.defaultEffort ?? null : input.effort?.trim() || null;
-      const supportedEfforts = option?.efforts.map((candidate) => candidate.id) ?? catalog.models.find((candidate) => candidate.isDefault)?.efforts.map((candidate) => candidate.id) ?? CLAUDE_FALLBACK_EFFORTS;
-      if (requestedEffort && supportedEfforts.length > 0 && !new Set(supportedEfforts).has(requestedEffort)) {
+      const supportedEfforts = (option ?? markedDefault)?.efforts.map((candidate) => candidate.id) ?? CLAUDE_FALLBACK_EFFORTS;
+      if (requestedEffort && supportedEfforts.length > 0 && !supportedEfforts.includes(requestedEffort)) {
         throw new Error(`${model ?? "Default model"} does not support effort ${requestedEffort}`);
       }
       const requestedServiceTier = input.serviceTier?.trim() || null;
       const supportedServiceTiers = option?.serviceTiers.map((candidate) => candidate.id) ?? [];
-      if (requestedServiceTier && !new Set(supportedServiceTiers).has(requestedServiceTier)) {
+      if (requestedServiceTier && !supportedServiceTiers.includes(requestedServiceTier)) {
         throw new Error(
           `${model ?? "Default model"} does not support service tier ${requestedServiceTier}`
         );
@@ -3347,43 +3387,10 @@ function createModelCatalogService(config = {}, deps = {}) {
 }
 
 // src/provider-updates.ts
-import { execFile as execFile3 } from "child_process";
 var CHECK_TIMEOUT_MS = 5e3;
 var CODEX_DOCTOR_TIMEOUT_MS = 3e4;
 var APPLY_TIMEOUT_MS = 10 * 60 * 1e3;
 var CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases";
-function defaultRunCommand(executable, args, options) {
-  return new Promise((resolve, reject) => {
-    const launch = launchCommand(executable, args, options.env);
-    const child = execFile3(
-      launch.command,
-      launch.args,
-      {
-        ...launch.options,
-        env: options.env,
-        timeout: options.timeoutMs,
-        // SIGKILL, not the default SIGTERM: the timeout is a hard ceiling,
-        // and an installer that traps SIGTERM would otherwise keep the
-        // callback (and apply()'s promise) pending forever.
-        killSignal: "SIGKILL",
-        maxBuffer: 1e6,
-        encoding: "utf8"
-      },
-      (error, stdout, stderr) => {
-        if (!error) {
-          resolve({ stdout, stderr, exitCode: 0 });
-          return;
-        }
-        if (typeof error.code === "number" && !error.killed) {
-          resolve({ stdout, stderr, exitCode: error.code });
-          return;
-        }
-        reject(Object.assign(error, { stdout, stderr }));
-      }
-    );
-    killTreeOnKill(child);
-  });
-}
 async function defaultFetchText(url, options) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
@@ -3471,27 +3478,39 @@ function partialOutput(error) {
   const { stdout, stderr } = error;
   return [stdout, stderr].filter((stream) => typeof stream === "string" && stream !== "").join("\n");
 }
-function unknownStatus(provider, checkedAt, reason, installedVersion = null) {
+function combinedOutput(stdout, stderr) {
+  return stderr ? `${stdout}
+${stderr}` : stdout;
+}
+async function settle(promise) {
+  try {
+    return { ok: true, value: await promise };
+  } catch {
+    return { ok: false };
+  }
+}
+function status(provider, checkedAt, fields) {
   return {
     provider,
-    state: "unknown",
-    installedVersion,
-    latestVersion: null,
-    channel: null,
+    state: fields.state,
+    installedVersion: fields.installedVersion ?? null,
+    latestVersion: fields.latestVersion ?? null,
+    channel: fields.channel ?? null,
     checkedAt,
-    reason
+    reason: fields.reason
   };
 }
+function unknownStatus(provider, checkedAt, reason, installedVersion = null) {
+  return status(provider, checkedAt, { state: "unknown", reason, installedVersion });
+}
 function statusFromVersions(input) {
-  return {
-    provider: input.provider,
+  return status(input.provider, input.checkedAt, {
     state: compareVersions(input.installed, input.latest) < 0 ? "update_available" : "current",
     installedVersion: input.installed.version,
     latestVersion: input.latest.version,
     channel: input.channel,
-    checkedAt: input.checkedAt,
     reason: null
-  };
+  });
 }
 function parseClaudeDoctor(output) {
   const installMethod = output.match(/^Config install method:\s*(\S+)\s*$/im)?.[1]?.toLowerCase();
@@ -3514,7 +3533,7 @@ function parseCodexLatestVersion(output) {
   return typeof latest === "string" ? parseVersion(latest) : null;
 }
 function createProviderUpdateService(config = {}, deps = {}) {
-  const runCommand = deps.runCommand ?? defaultRunCommand;
+  const runCommand = deps.runCommand ?? execCli;
   const fetchText = deps.fetchText ?? defaultFetchText;
   const now = deps.now ?? (() => /* @__PURE__ */ new Date());
   const baseEnv = config.env ?? process.env;
@@ -3527,35 +3546,25 @@ function createProviderUpdateService(config = {}, deps = {}) {
       });
     } catch (error) {
       if (isMissingExecutable(error)) {
-        return {
-          provider,
-          state: "not_installed",
-          installedVersion: null,
-          latestVersion: null,
-          channel: null,
-          checkedAt,
-          reason: "cli_not_found"
-        };
+        return status(provider, checkedAt, { state: "not_installed", reason: "cli_not_found" });
       }
       return unknownStatus(provider, checkedAt, "check_failed");
     }
-    return parseVersion(`${command.stdout}
-${command.stderr}`) ?? unknownStatus(provider, checkedAt, "version_unavailable");
+    return parseVersion(combinedOutput(command.stdout, command.stderr)) ?? unknownStatus(provider, checkedAt, "version_unavailable");
   }
   async function checkClaude(checkedAt) {
-    const executable = config.claudePath ?? "claude";
+    const executable = executableFor("claude");
     const env = childEnv("claude", baseEnv);
     const [installed, doctorResult] = await Promise.all([
       installedVersion("claude", executable, env, checkedAt),
-      runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS }).then((value) => ({ ok: true, value })).catch(() => ({ ok: false }))
+      settle(runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS }))
     ]);
     if ("state" in installed) return installed;
     if (!doctorResult.ok) {
       return unknownStatus("claude", checkedAt, "check_failed", installed.version);
     }
     const doctor = doctorResult.value;
-    const metadata = parseClaudeDoctor(`${doctor.stdout}
-${doctor.stderr}`);
+    const metadata = parseClaudeDoctor(combinedOutput(doctor.stdout, doctor.stderr));
     if (!metadata) {
       return unknownStatus("claude", checkedAt, "check_failed", installed.version);
     }
@@ -3595,11 +3604,11 @@ ${doctor.stderr}`);
     });
   }
   async function checkCodex(checkedAt) {
-    const executable = config.codexPath ?? "codex";
+    const executable = executableFor("codex");
     const env = childEnv("codex", baseEnv);
     const [installed, doctorResult] = await Promise.all([
       installedVersion("codex", executable, env, checkedAt),
-      runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CODEX_DOCTOR_TIMEOUT_MS }).then((value) => ({ ok: true, value })).catch(() => ({ ok: false }))
+      settle(runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CODEX_DOCTOR_TIMEOUT_MS }))
     ]);
     if ("state" in installed) return installed;
     if (!doctorResult.ok) {
@@ -3646,7 +3655,7 @@ ${doctor.stderr}`);
       ok: false,
       exitCode: null,
       output,
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage(error),
       reason: null
     };
   }
@@ -3655,8 +3664,7 @@ ${doctor.stderr}`);
       env,
       timeoutMs: CHECK_TIMEOUT_MS
     });
-    const output = doctor.stderr ? `${doctor.stdout}
-${doctor.stderr}` : doctor.stdout;
+    const output = combinedOutput(doctor.stdout, doctor.stderr);
     return {
       installMethod: parseClaudeDoctor(output)?.installMethod ?? null,
       // Kept even on refusal: when the parse fails, the transcript that
@@ -3715,8 +3723,7 @@ ${doctor.stderr}` : doctor.stdout;
       provider,
       ok: command.exitCode === 0,
       exitCode: command.exitCode,
-      output: command.stderr ? `${command.stdout}
-${command.stderr}` : command.stdout,
+      output: combinedOutput(command.stdout, command.stderr),
       error: null,
       reason: null
     };

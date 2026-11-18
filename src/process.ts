@@ -8,7 +8,7 @@ import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, extname, resolve as resolvePath, win32 } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { MissingCliError, runAborted, runTimedOut } from "./errors.js";
-import type { Deferred } from "./internal.js";
+import { createDeferred, type Deferred } from "./internal.js";
 import type { SpawnFn } from "./types.js";
 
 export const SIGTERM_GRACE_MS = 2000;
@@ -97,10 +97,16 @@ export interface ExecCliOptions {
 }
 
 /** Run a CLI to completion. Resolves with any exit code; rejects when it
- * could not start or was killed (timeout, maxBuffer), carrying whatever it
- * printed first as `stdout` and `stderr` on the error. The timeout kills with
- * SIGKILL: it is a hard ceiling, and a CLI that traps SIGTERM would otherwise
- * keep the promise pending. */
+ * could not start, outgrew the output buffer, or ran past its timeout,
+ * carrying whatever it printed first as `stdout` and `stderr` on the error
+ * (and `killed: true` for a timeout).
+ *
+ * At the timeout a POSIX CLI gets SIGTERM, so it can stop what it started,
+ * then SIGKILL after the grace period, so one that traps SIGTERM cannot keep
+ * the promise pending. Should something it started still hold its output
+ * pipes a grace period after that, they are closed and the run settles with
+ * what it printed. On Windows the deadline force-kills the tree at once (see
+ * {@link killTreeOnKill}). Outgrowing the buffer is a SIGKILL straight away. */
 export function execCli(
   executable: string,
   args: readonly string[],
@@ -108,6 +114,9 @@ export function execCli(
 ): Promise<ExecCliResult> {
   return new Promise((resolve, reject) => {
     const launch = launchCommand(executable, args, options.env, { cwd: options.cwd });
+    const exited = createDeferred();
+    let timedOut = false;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
     const child = execFile(
       launch.command,
       launch.args,
@@ -115,12 +124,25 @@ export function execCli(
         ...launch.options,
         cwd: options.cwd,
         env: options.env,
-        timeout: options.timeoutMs,
-        killSignal: "SIGKILL",
         maxBuffer: 1_000_000,
+        // Only execFile's own kill, for outgrowing maxBuffer: the deadline
+        // below stops the CLI itself.
+        killSignal: "SIGKILL",
         encoding: "utf8",
       },
       (error, stdout, stderr) => {
+        exited.resolve();
+        clearTimeout(deadline);
+        // Past its deadline the run failed, however the CLI then exited: one
+        // that handles SIGTERM may well exit 0.
+        if (timedOut) {
+          reject(Object.assign(error ?? new Error(`${executable} timed out`), {
+            killed: true,
+            stdout,
+            stderr,
+          }));
+          return;
+        }
         if (!error) {
           resolve({ stdout, stderr, exitCode: 0 });
           return;
@@ -137,6 +159,16 @@ export function execCli(
       },
     );
     killTreeOnKill(child);
+    deadline = setTimeout(() => {
+      timedOut = true;
+      void terminateTree((signal) => {
+        child.kill(signal);
+      }, exited).then(() => {
+        if (exited.settled) return;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      });
+    }, options.timeoutMs);
   });
 }
 

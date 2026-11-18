@@ -1,6 +1,5 @@
-import { execFile } from "node:child_process";
-import { isRecord } from "./internal.js";
-import { childEnv, isMissingExecutable, killTreeOnKill, launchCommand } from "./process.js";
+import { errorMessage, isRecord } from "./internal.js";
+import { childEnv, execCli, isMissingExecutable } from "./process.js";
 
 const CHECK_TIMEOUT_MS = 5_000;
 // Doctor checks the whole installation, including network and database health.
@@ -107,48 +106,6 @@ interface ParsedSemver {
   patch: number;
   prerelease: string[];
   version: string;
-}
-
-function defaultRunCommand(
-  executable: string,
-  args: readonly string[],
-  options: ProviderUpdateCommandOptions,
-): Promise<ProviderUpdateCommandResult> {
-  return new Promise((resolve, reject) => {
-    const launch = launchCommand(executable, args, options.env);
-    const child = execFile(
-      launch.command,
-      launch.args,
-      {
-        ...launch.options,
-        env: options.env,
-        timeout: options.timeoutMs,
-        // SIGKILL, not the default SIGTERM: the timeout is a hard ceiling,
-        // and an installer that traps SIGTERM would otherwise keep the
-        // callback (and apply()'s promise) pending forever.
-        killSignal: "SIGKILL",
-        maxBuffer: 1_000_000,
-        encoding: "utf8",
-      },
-      (error, stdout, stderr) => {
-        if (!error) {
-          resolve({ stdout, stderr, exitCode: 0 });
-          return;
-        }
-        // `killed` first: a Windows tree kill (timeout, maxBuffer) leaves an
-        // exit code that is not the command's own.
-        if (typeof error.code === "number" && !error.killed) {
-          resolve({ stdout, stderr, exitCode: error.code });
-          return;
-        }
-        // A kill (timeout, maxBuffer) leaves no exit status, but the callback
-        // still hands over what the child printed first. Carry it on the error
-        // so callers can report it rather than losing it here.
-        reject(Object.assign(error, { stdout, stderr }));
-      },
-    );
-    killTreeOnKill(child);
-  });
 }
 
 async function defaultFetchText(
@@ -261,21 +218,45 @@ function partialOutput(error: unknown): string {
     .join("\n");
 }
 
+/** stdout, then stderr on a line of its own when there is any. */
+function combinedOutput(stdout: string, stderr: string): string {
+  return stderr ? `${stdout}\n${stderr}` : stdout;
+}
+
+/** A probe's outcome as data, for a probe whose failure matters only later. */
+async function settle<T>(promise: Promise<T>): Promise<{ ok: true; value: T } | { ok: false }> {
+  try {
+    return { ok: true, value: await promise };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** A status, with what is not known left null. */
+function status(
+  provider: ProviderUpdateProvider,
+  checkedAt: string,
+  fields: Pick<ProviderUpdateStatus, "state" | "reason">
+    & Partial<Pick<ProviderUpdateStatus, "installedVersion" | "latestVersion" | "channel">>,
+): ProviderUpdateStatus {
+  return {
+    provider,
+    state: fields.state,
+    installedVersion: fields.installedVersion ?? null,
+    latestVersion: fields.latestVersion ?? null,
+    channel: fields.channel ?? null,
+    checkedAt,
+    reason: fields.reason,
+  };
+}
+
 function unknownStatus(
   provider: ProviderUpdateProvider,
   checkedAt: string,
   reason: Exclude<ProviderUpdateReason, "cli_not_found" | null>,
   installedVersion: string | null = null,
 ): ProviderUpdateStatus {
-  return {
-    provider,
-    state: "unknown",
-    installedVersion,
-    latestVersion: null,
-    channel: null,
-    checkedAt,
-    reason,
-  };
+  return status(provider, checkedAt, { state: "unknown", reason, installedVersion });
 }
 
 function statusFromVersions(input: {
@@ -285,17 +266,15 @@ function statusFromVersions(input: {
   channel: "stable" | "latest" | null;
   checkedAt: string;
 }): ProviderUpdateStatus {
-  return {
-    provider: input.provider,
+  return status(input.provider, input.checkedAt, {
     state: compareVersions(input.installed, input.latest) < 0
       ? "update_available"
       : "current",
     installedVersion: input.installed.version,
     latestVersion: input.latest.version,
     channel: input.channel,
-    checkedAt: input.checkedAt,
     reason: null,
-  };
+  });
 }
 
 function parseClaudeDoctor(
@@ -326,7 +305,7 @@ export function createProviderUpdateService(
   config: ProviderUpdateServiceConfig = {},
   deps: ProviderUpdateServiceDeps = {},
 ): ProviderUpdateService {
-  const runCommand = deps.runCommand ?? defaultRunCommand;
+  const runCommand = deps.runCommand ?? execCli;
   const fetchText = deps.fetchText ?? defaultFetchText;
   const now = deps.now ?? (() => new Date());
   const baseEnv = config.env ?? process.env;
@@ -345,40 +324,30 @@ export function createProviderUpdateService(
       });
     } catch (error) {
       if (isMissingExecutable(error)) {
-        return {
-          provider,
-          state: "not_installed",
-          installedVersion: null,
-          latestVersion: null,
-          channel: null,
-          checkedAt,
-          reason: "cli_not_found",
-        };
+        return status(provider, checkedAt, { state: "not_installed", reason: "cli_not_found" });
       }
       return unknownStatus(provider, checkedAt, "check_failed");
     }
-    return parseVersion(`${command.stdout}\n${command.stderr}`)
+    return parseVersion(combinedOutput(command.stdout, command.stderr))
       ?? unknownStatus(provider, checkedAt, "version_unavailable");
   }
 
   async function checkClaude(checkedAt: string): Promise<ProviderUpdateStatus> {
-    const executable = config.claudePath ?? "claude";
+    const executable = executableFor("claude");
     const env = childEnv("claude", baseEnv);
     // Independent spawns, so run them concurrently — serializing two CLI cold
     // starts roughly doubles every check's latency. The doctor result is only
     // consulted once --version confirms the CLI is installed.
     const [installed, doctorResult] = await Promise.all([
       installedVersion("claude", executable, env, checkedAt),
-      runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS })
-        .then((value) => ({ ok: true as const, value }))
-        .catch(() => ({ ok: false as const })),
+      settle(runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS })),
     ]);
     if ("state" in installed) return installed;
     if (!doctorResult.ok) {
       return unknownStatus("claude", checkedAt, "check_failed", installed.version);
     }
     const doctor = doctorResult.value;
-    const metadata = parseClaudeDoctor(`${doctor.stdout}\n${doctor.stderr}`);
+    const metadata = parseClaudeDoctor(combinedOutput(doctor.stdout, doctor.stderr));
     if (!metadata) {
       return unknownStatus("claude", checkedAt, "check_failed", installed.version);
     }
@@ -420,13 +389,11 @@ export function createProviderUpdateService(
   }
 
   async function checkCodex(checkedAt: string): Promise<ProviderUpdateStatus> {
-    const executable = config.codexPath ?? "codex";
+    const executable = executableFor("codex");
     const env = childEnv("codex", baseEnv);
     const [installed, doctorResult] = await Promise.all([
       installedVersion("codex", executable, env, checkedAt),
-      runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CODEX_DOCTOR_TIMEOUT_MS })
-        .then((value) => ({ ok: true as const, value }))
-        .catch(() => ({ ok: false as const })),
+      settle(runCommand(executable, ["doctor", "--json"], { env, timeoutMs: CODEX_DOCTOR_TIMEOUT_MS })),
     ]);
     if ("state" in installed) return installed;
     if (!doctorResult.ok) {
@@ -494,7 +461,7 @@ export function createProviderUpdateService(
       ok: false,
       exitCode: null,
       output,
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage(error),
       reason: null,
     };
   }
@@ -511,7 +478,7 @@ export function createProviderUpdateService(
       env,
       timeoutMs: CHECK_TIMEOUT_MS,
     });
-    const output = doctor.stderr ? `${doctor.stdout}\n${doctor.stderr}` : doctor.stdout;
+    const output = combinedOutput(doctor.stdout, doctor.stderr);
     return {
       installMethod: parseClaudeDoctor(output)?.installMethod ?? null,
       // Kept even on refusal: when the parse fails, the transcript that
@@ -578,7 +545,7 @@ export function createProviderUpdateService(
       provider,
       ok: command.exitCode === 0,
       exitCode: command.exitCode,
-      output: command.stderr ? `${command.stdout}\n${command.stderr}` : command.stdout,
+      output: combinedOutput(command.stdout, command.stderr),
       error: null,
       reason: null,
     };
