@@ -686,6 +686,7 @@ export async function createClaudeSession(
           promptUuid,
           cliEchoesPromptUuid,
           session: sessionState,
+          compact,
         }),
         callbacks,
         interruption: null,

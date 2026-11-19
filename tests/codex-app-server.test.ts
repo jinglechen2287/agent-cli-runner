@@ -3011,6 +3011,44 @@ describe("CodexAppServerSession.compact", () => {
     expect(result.usage?.contextTokens).toBe(20_864);
   });
 
+  it("reports the start of the compaction it asked for as manual", async () => {
+    const calls: string[] = [];
+    const { session } = await compactSession((child, id) => {
+      send(child, { id, result: {} });
+      send(child, started("turn-c"));
+      send(child, compaction("item/started", "turn-c"));
+      send(child, compaction("item/completed", "turn-c"));
+      send(child, completed("turn-c"));
+    });
+    const onCompactionStart = vi.fn(() => calls.push("start"));
+    const onCompaction = vi.fn(() => calls.push("done"));
+    await session.compact({ onCompactionStart, onCompaction });
+    expect(onCompactionStart).toHaveBeenCalledWith({ trigger: "manual" });
+    expect(calls).toEqual(["start", "done"]);
+  });
+
+  it("reports a compaction Codex starts mid-turn as automatic", async () => {
+    const child = makeFakeChild();
+    captureRequests(child, (message) => {
+      if (message.method === "initialize") {
+        send(child, { id: message.id, result: {} });
+      } else if (message.method === "thread/start") {
+        send(child, { id: message.id, result: { thread: { id: THREAD }, model: "gpt-test" } });
+      } else if (message.method === "turn/start") {
+        send(child, { id: message.id, result: { turn: completedTurn("turn-1", "inProgress") } });
+        send(child, compaction("item/started", "turn-1"));
+        send(child, compaction("item/completed", "turn-1"));
+        send(child, completed("turn-1"));
+      }
+    });
+    const session = await createCodexAppServerSession({ cwd: "/tmp/project", spawnFn: (() => child) as never });
+    const onCompactionStart = vi.fn();
+    const onCompaction = vi.fn();
+    await session.runTurn({ prompt: "keep going", onCompactionStart, onCompaction });
+    expect(onCompactionStart).toHaveBeenCalledWith({ trigger: "auto" });
+    expect(onCompaction).toHaveBeenCalledWith({ trigger: "auto" });
+  });
+
   it("takes the turn when turn/started arrives before the reply", async () => {
     const { session } = await compactSession((child, id) => {
       send(child, started("turn-c"));

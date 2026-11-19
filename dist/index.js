@@ -424,6 +424,8 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
   let lastMessageUsage;
   let lastUsage;
   let compacted = false;
+  let compacting = false;
+  const compactionTrigger = options.compact === true ? "manual" : "auto";
   const agentToolCallIds = /* @__PURE__ */ new Set();
   const backgroundAgents = /* @__PURE__ */ new Map();
   const liveTaskIds = /* @__PURE__ */ new Set();
@@ -485,15 +487,33 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
     const preTokens = optionalTokenCount(metadata.pre_tokens);
     const postTokens = optionalTokenCount(metadata.post_tokens);
     compacted = true;
+    compacting = false;
     outputSeen = true;
     lastMessageUsage = void 0;
     lastUsage = void 0;
     const info = {
-      trigger: metadata.trigger === "auto" ? "auto" : "manual",
+      // The CLI names it; when it doesn't, the turn does, as the start did.
+      trigger: metadata.trigger === "auto" || metadata.trigger === "manual" ? metadata.trigger : compactionTrigger,
       ...preTokens !== void 0 ? { preTokens } : {},
       ...postTokens !== void 0 ? { postTokens } : {}
     };
     safeCallback(() => callbacks.onCompaction?.(info));
+  };
+  const handleStatus = (parsed) => {
+    if (parsed.parent_tool_use_id) return;
+    if (parsed.status === "compacting") {
+      if (compacting) return;
+      compacting = true;
+      const info2 = { trigger: compactionTrigger };
+      safeCallback(() => callbacks.onCompactionStart?.(info2));
+      return;
+    }
+    if (parsed.status !== null || !compacting) return;
+    compacting = false;
+    if (parsed.compact_result === "success") return;
+    const error = optionalString(parsed.compact_error);
+    const info = { trigger: compactionTrigger, ...error ? { error } : {} };
+    safeCallback(() => callbacks.onCompactionFailed?.(info));
   };
   const handleInit = (parsed) => {
     if (resultSeen) answeringQueued = true;
@@ -569,6 +589,8 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
     switch (parsed.subtype) {
       case "compact_boundary":
         return handleCompactBoundary(parsed);
+      case "status":
+        return handleStatus(parsed);
       case "init":
         return handleInit(parsed);
     }
@@ -1467,7 +1489,8 @@ async function createClaudeSession(opts) {
         translator: createClaudeTurnTranslator(callbacks, {
           promptUuid,
           cliEchoesPromptUuid,
-          session: sessionState
+          session: sessionState,
+          compact
         }),
         callbacks,
         interruption: null,
@@ -1625,7 +1648,7 @@ import { deleteSession, forkSession } from "@anthropic-ai/claude-agent-sdk";
 import { spawn as nodeSpawn3 } from "child_process";
 
 // package.json
-var version = "0.5.3";
+var version = "0.6.0";
 
 // src/codex-client.ts
 var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;
@@ -2526,8 +2549,12 @@ async function runCodexAppServerTurn(opts, {
     const occurredAt = typeof params.startedAtMs === "number" ? params.startedAtMs : typeof params.completedAtMs === "number" ? params.completedAtMs : Date.now();
     agents.update(item, occurredAt);
     if (itemType(item) === "contextCompaction") {
-      if (method === "item/completed") {
-        const info = { trigger: start === "compact" ? "manual" : "auto" };
+      const trigger = start === "compact" ? "manual" : "auto";
+      if (method === "item/started") {
+        const info = { trigger };
+        safeCallback(() => opts.onCompactionStart?.(info));
+      } else if (method === "item/completed") {
+        const info = { trigger };
         safeCallback(() => opts.onCompaction?.(info));
       }
       return;

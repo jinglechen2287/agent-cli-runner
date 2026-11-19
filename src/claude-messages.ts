@@ -15,7 +15,9 @@ import type {
   AgentCallbacks,
   BackgroundAgentInfo,
   BackgroundAgentStatus,
+  CompactionFailureInfo,
   CompactionInfo,
+  CompactionStartInfo,
   ToolPlanItem,
 } from "./types.js";
 import { contextWindowForModel, tokenUsage, type TokenUsage } from "./usage.js";
@@ -152,8 +154,12 @@ interface StreamLine {
   errors?: unknown;
   /** On `compact_boundary`: what the compaction did. */
   compact_metadata?: { trigger?: unknown; pre_tokens?: unknown; post_tokens?: unknown };
-  /** On `task_notification`: the task's terminal state. */
-  status?: string;
+  /** On `task_notification`: the task's terminal state. On a `status` line: `compacting` while the CLI compacts, null once it stops. */
+  status?: string | null;
+  /** On the `status` line that ends a compaction: how it went. */
+  compact_result?: string;
+  /** On the `status` line that ends a failed compaction: the CLI's reason. */
+  compact_error?: string;
   /** On `task_notification`: the run whose notification the CLI will answer
    * with a result naming it in `origin`. */
   run_id?: string;
@@ -277,7 +283,7 @@ function countsTokens(usage: ClaudeUsage): boolean {
     || (usage.cache_creation_input_tokens ?? 0) > 0;
 }
 
-function isTerminalTaskStatus(status: string | undefined): boolean {
+function isTerminalTaskStatus(status: string | null | undefined): boolean {
   return status === "completed"
     || status === "failed"
     || status === "stopped"
@@ -344,6 +350,8 @@ export interface ClaudeTurnTranslatorOptions {
   /** State shared by every turn of one Claude session. Without it, the
    * translator keeps its own, as a one-turn run needs no more. */
   session?: ClaudeSessionState;
+  /** The host asked for this turn to compact (`/compact`), so a compaction it reports is `manual`; otherwise the CLI started it, `auto`. */
+  compact?: boolean;
 }
 
 /** What a Claude session learns in one turn and the next turn needs: the
@@ -416,6 +424,9 @@ export function createClaudeTurnTranslator(
   let lastMessageUsage: ClaudeUsage | undefined;
   let lastUsage: TokenUsage | undefined;
   let compacted = false;
+  /** The CLI said it is compacting and has not yet said it stopped. */
+  let compacting = false;
+  const compactionTrigger = options.compact === true ? "manual" : "auto";
   const agentToolCallIds = new Set<string>();
   const backgroundAgents = new Map<string, BackgroundAgentInfo>();
   const liveTaskIds = new Set<string>();
@@ -521,6 +532,7 @@ export function createClaudeTurnTranslator(
     const preTokens = optionalTokenCount(metadata.pre_tokens);
     const postTokens = optionalTokenCount(metadata.post_tokens);
     compacted = true;
+    compacting = false;
     // The conversation's own doing, though no assistant message says so: a
     // CLI that does not echo prompt uuids must not read this turn's empty
     // result as a leftover.
@@ -530,11 +542,32 @@ export function createClaudeTurnTranslator(
     lastMessageUsage = undefined;
     lastUsage = undefined;
     const info: CompactionInfo = {
-      trigger: metadata.trigger === "auto" ? "auto" : "manual",
+      // The CLI names it; when it doesn't, the turn does, as the start did.
+      trigger: metadata.trigger === "auto" || metadata.trigger === "manual" ? metadata.trigger : compactionTrigger,
       ...(preTokens !== undefined ? { preTokens } : {}),
       ...(postTokens !== undefined ? { postTokens } : {}),
     };
     safeCallback(() => callbacks.onCompaction?.(info));
+  };
+
+  /** A `status` line: `compacting` opens a compaction, and null closes it, saying whether it failed. */
+  const handleStatus = (parsed: StreamLine): void => {
+    // A subagent compacting its own context leaves the turn's alone.
+    if (parsed.parent_tool_use_id) return;
+    if (parsed.status === "compacting") {
+      if (compacting) return;
+      compacting = true;
+      const info: CompactionStartInfo = { trigger: compactionTrigger };
+      safeCallback(() => callbacks.onCompactionStart?.(info));
+      return;
+    }
+    if (parsed.status !== null || !compacting) return;
+    compacting = false;
+    // A success is told by the boundary that follows. Anything else ended the attempt without compacting: it failed, or the CLI gave up on it (a PreCompact hook blocked it, or it was skipped), and no boundary will come.
+    if (parsed.compact_result === "success") return;
+    const error = optionalString(parsed.compact_error);
+    const info: CompactionFailureInfo = { trigger: compactionTrigger, ...(error ? { error } : {}) };
+    safeCallback(() => callbacks.onCompactionFailed?.(info));
   };
 
   const handleInit = (parsed: StreamLine): void => {
@@ -625,6 +658,8 @@ export function createClaudeTurnTranslator(
     switch (parsed.subtype) {
       case "compact_boundary":
         return handleCompactBoundary(parsed);
+      case "status":
+        return handleStatus(parsed);
       case "init":
         return handleInit(parsed);
     }

@@ -117,6 +117,20 @@ export interface CompactionInfo {
   postTokens?: number;
 }
 
+/** The CLI began compacting the conversation. */
+export interface CompactionStartInfo {
+  /** `manual` when the host asked for it, `auto` when the CLI decided to. */
+  trigger: "manual" | "auto";
+}
+
+/** The CLI gave up on a compaction, leaving the conversation as it was. */
+export interface CompactionFailureInfo {
+  /** `manual` when the host asked for it, `auto` when the CLI decided to. */
+  trigger: "manual" | "auto";
+  /** The CLI's reason, when it gave one. */
+  error?: string;
+}
+
 export interface AgentCallbacks {
   /** Fired once with the CLI's session/thread id as soon as it is known. */
   onSessionId?: (id: string) => void;
@@ -157,6 +171,10 @@ export interface AgentCallbacks {
    * (`compact()` on a session) or the CLI did it on its own mid-turn. The
    * size after compacting arrives through {@link onUsage}, when it is known. */
   onCompaction?: (info: CompactionInfo) => void;
+  /** The CLI began compacting; onCompaction or onCompactionFailed ends it, or the turn settling does. */
+  onCompactionStart?: (info: CompactionStartInfo) => void;
+  /** Claude only: the CLI ended a compaction without compacting (it failed, or a hook or the CLI called it off), and the turn may go on. */
+  onCompactionFailed?: (info: CompactionFailureInfo) => void;
   /** Fired with the MCP servers' status at the start of each turn on a
    * long-lived session and whenever one changes during it. Each call is a
    * snapshot that replaces the last, of every server the CLI reports: Claude
