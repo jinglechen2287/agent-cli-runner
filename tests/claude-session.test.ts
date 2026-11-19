@@ -1615,4 +1615,32 @@ describe("ClaudeSession.compact", () => {
     fake.emit(result(""));
     await turn;
   });
+
+  const compactingStatus = { type: "system", subtype: "status", status: "compacting" };
+
+  it("reports the compaction it asked for as manual", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const onCompactionStart = vi.fn();
+    const turn = session.compact({ onCompactionStart });
+    await fake.waitForPrompt(1);
+    fake.emit(compactingStatus);
+    fake.emit(boundary);
+    fake.emit(result(""));
+    await turn;
+    expect(onCompactionStart).toHaveBeenCalledWith({ trigger: "manual" });
+  });
+
+  it("reports a compaction the CLI starts mid-turn as automatic", async () => {
+    const fake = makeFakeQuery();
+    const session = await startSession(fake);
+    const onCompactionStart = vi.fn();
+    const turn = session.runTurn({ prompt: "go on", onCompactionStart });
+    await fake.waitForPrompt(1);
+    fake.emit(compactingStatus);
+    fake.emit({ ...boundary, compact_metadata: { trigger: "auto" } });
+    fake.emit(result("done"));
+    await turn;
+    expect(onCompactionStart).toHaveBeenCalledWith({ trigger: "auto" });
+  });
 });

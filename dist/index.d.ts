@@ -166,6 +166,18 @@ interface CompactionInfo {
      * from {@link TokenUsage.contextTokens}, so it is no stand-in for that. */
     postTokens?: number;
 }
+/** The CLI began compacting the conversation. */
+interface CompactionStartInfo {
+    /** `manual` when the host asked for it, `auto` when the CLI decided to. */
+    trigger: "manual" | "auto";
+}
+/** The CLI gave up on a compaction, leaving the conversation as it was. */
+interface CompactionFailureInfo {
+    /** `manual` when the host asked for it, `auto` when the CLI decided to. */
+    trigger: "manual" | "auto";
+    /** The CLI's reason, when it gave one. */
+    error?: string;
+}
 interface AgentCallbacks {
     /** Fired once with the CLI's session/thread id as soon as it is known. */
     onSessionId?: (id: string) => void;
@@ -206,6 +218,10 @@ interface AgentCallbacks {
      * (`compact()` on a session) or the CLI did it on its own mid-turn. The
      * size after compacting arrives through {@link onUsage}, when it is known. */
     onCompaction?: (info: CompactionInfo) => void;
+    /** The CLI began compacting; onCompaction or onCompactionFailed ends it, or the turn settling does. */
+    onCompactionStart?: (info: CompactionStartInfo) => void;
+    /** Claude only: the CLI ended a compaction without compacting (it failed, or a hook or the CLI called it off), and the turn may go on. */
+    onCompactionFailed?: (info: CompactionFailureInfo) => void;
     /** Fired with the MCP servers' status at the start of each turn on a
      * long-lived session and whenever one changes during it. Each call is a
      * snapshot that replaces the last, of every server the CLI reports: Claude
@@ -515,6 +531,8 @@ interface ClaudeTurnTranslatorOptions {
     /** State shared by every turn of one Claude session. Without it, the
      * translator keeps its own, as a one-turn run needs no more. */
     session?: ClaudeSessionState;
+    /** The host asked for this turn to compact (`/compact`), so a compaction it reports is `manual`; otherwise the CLI started it, `auto`. */
+    compact?: boolean;
 }
 /** What a Claude session learns in one turn and the next turn needs: the
  * start-up line names the qualified model only once per process, and a
@@ -950,4 +968,4 @@ interface ProviderUpdateServiceDeps {
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeContextUsage, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionCompactOptions, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerCompactOptions, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CompactionInfo, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, type ForkCodexThreadOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, deleteClaudeSession, forkClaudeSession, forkCodexThread, parseClaudeCliHelp, runClaude, runCodex };
+export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeContextUsage, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionCompactOptions, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerCompactOptions, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CompactionFailureInfo, type CompactionInfo, type CompactionStartInfo, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, type ForkCodexThreadOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, deleteClaudeSession, forkClaudeSession, forkCodexThread, parseClaudeCliHelp, runClaude, runCodex };

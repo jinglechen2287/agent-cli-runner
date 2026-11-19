@@ -1351,4 +1351,127 @@ describe("Claude compaction", () => {
     ]);
     expect(t.finish().usage?.contextTokens).toBe(12_002);
   });
+
+  const compacting = (extra: Record<string, unknown> = {}) => ({
+    type: "system",
+    subtype: "status",
+    status: "compacting",
+    ...extra,
+  });
+  const compacted = (result: "success" | "failed", extra: Record<string, unknown> = {}) => ({
+    type: "system",
+    subtype: "status",
+    status: null,
+    compact_result: result,
+    ...extra,
+  });
+
+  it("reports the start of a compaction before its boundary", () => {
+    const calls: string[] = [];
+    const onCompactionStart = vi.fn(() => calls.push("start"));
+    const onCompaction = vi.fn(() => calls.push("done"));
+    const onCompactionFailed = vi.fn();
+    feed({ onCompactionStart, onCompaction, onCompactionFailed }, [
+      compacting(),
+      boundary({ trigger: "auto", pre_tokens: 150_000 }),
+      compacted("success"),
+    ]);
+    expect(onCompactionStart).toHaveBeenCalledWith({ trigger: "auto" });
+    expect(calls).toEqual(["start", "done"]);
+    expect(onCompactionFailed).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed compaction with the CLI's error", () => {
+    const onCompactionStart = vi.fn();
+    const onCompaction = vi.fn();
+    const onCompactionFailed = vi.fn();
+    const t = feed({ onCompactionStart, onCompaction, onCompactionFailed }, [
+      compacting(),
+      compacted("failed", { compact_error: "Conversation too long" }),
+    ]);
+    expect(onCompactionStart).toHaveBeenCalledTimes(1);
+    expect(onCompactionFailed).toHaveBeenCalledWith({ trigger: "auto", error: "Conversation too long" });
+    expect(onCompaction).not.toHaveBeenCalled();
+    expect(t.compacted).toBe(false);
+  });
+
+  it("ignores a subagent's compaction status", () => {
+    const onCompactionStart = vi.fn();
+    const onCompactionFailed = vi.fn();
+    feed({ onCompactionStart, onCompactionFailed }, [
+      compacting({ parent_tool_use_id: "toolu_1" }),
+      compacted("failed", { parent_tool_use_id: "toolu_1", compact_error: "nope" }),
+    ]);
+    expect(onCompactionStart).not.toHaveBeenCalled();
+    expect(onCompactionFailed).not.toHaveBeenCalled();
+  });
+
+  it("reports a compaction the CLI called off as ended without compacting", () => {
+    const onCompactionFailed = vi.fn();
+    feed({ onCompactionFailed }, [
+      compacting(),
+      { type: "system", subtype: "status", status: null },
+      assistantWithUsage("carried on", 12_000),
+    ]);
+    expect(onCompactionFailed).toHaveBeenCalledWith({ trigger: "auto" });
+  });
+
+  it("reports a success in the order Claude Code writes it: the close, then the boundary", () => {
+    const events: string[] = [];
+    feed({
+      onCompactionStart: () => events.push("start"),
+      onCompaction: () => events.push("done"),
+      onCompactionFailed: () => events.push("failed"),
+    }, [compacting(), compacted("success"), boundary({ trigger: "auto" })]);
+    expect(events).toEqual(["start", "done"]);
+  });
+
+  it("reports each of two compactions in one turn", () => {
+    const onCompactionStart = vi.fn();
+    const onCompaction = vi.fn();
+    feed({ onCompactionStart, onCompaction }, [
+      compacting(),
+      boundary({ trigger: "auto" }),
+      compacted("success"),
+      assistantWithUsage("carried on", 12_000),
+      compacting(),
+      boundary({ trigger: "auto" }),
+      compacted("success"),
+    ]);
+    expect(onCompactionStart).toHaveBeenCalledTimes(2);
+    expect(onCompaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a second compaction's start even when no status line closed the first", () => {
+    const onCompactionStart = vi.fn();
+    feed({ onCompactionStart }, [compacting(), boundary({ trigger: "auto" }), compacting(), boundary({ trigger: "auto" })]);
+    expect(onCompactionStart).toHaveBeenCalledTimes(2);
+  });
+
+  it("names a boundary that says no trigger as the turn does, as its start did", () => {
+    const auto = vi.fn();
+    feed({ onCompaction: auto }, [compacting(), boundary({})]);
+    expect(auto).toHaveBeenCalledWith(expect.objectContaining({ trigger: "auto" }));
+    const manual = vi.fn();
+    const t = createClaudeTurnTranslator({ onCompaction: manual }, { compact: true });
+    t.handle(compacting());
+    t.handle(boundary({}));
+    expect(manual).toHaveBeenCalledWith(expect.objectContaining({ trigger: "manual" }));
+  });
+
+  it("reports a compaction's start once however often the CLI repeats it", () => {
+    const onCompactionStart = vi.fn();
+    feed({ onCompactionStart }, [compacting(), compacting(), boundary({ trigger: "auto" })]);
+    expect(onCompactionStart).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a host-requested compaction as manual", () => {
+    const onCompactionStart = vi.fn();
+    const onCompactionFailed = vi.fn();
+    const t = createClaudeTurnTranslator({ onCompactionStart, onCompactionFailed }, { compact: true });
+    t.handle(compacting());
+    t.handle(compacted("failed"));
+    expect(onCompactionStart).toHaveBeenCalledWith({ trigger: "manual" });
+    expect(onCompactionFailed).toHaveBeenCalledWith({ trigger: "manual" });
+  });
 });

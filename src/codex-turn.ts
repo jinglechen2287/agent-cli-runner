@@ -30,7 +30,7 @@ import {
   turnStatus,
 } from "./codex-items.js";
 import type { RunCodexOptions } from "./run-codex.js";
-import type { CompactionInfo, RunResult } from "./types.js";
+import type { CompactionInfo, CompactionStartInfo, RunResult } from "./types.js";
 import type { TokenUsage } from "./usage.js";
 
 /** `turn/start` is acked immediately in normal operation, but a busy
@@ -428,8 +428,12 @@ export async function runCodexAppServerTurn(
     agents.update(item, occurredAt);
 
     if (itemType(item) === "contextCompaction") {
-      if (method === "item/completed") {
-        const info: CompactionInfo = { trigger: start === "compact" ? "manual" : "auto" };
+      const trigger = start === "compact" ? "manual" : "auto";
+      if (method === "item/started") {
+        const info: CompactionStartInfo = { trigger };
+        safeCallback(() => opts.onCompactionStart?.(info));
+      } else if (method === "item/completed") {
+        const info: CompactionInfo = { trigger };
         safeCallback(() => opts.onCompaction?.(info));
       }
       return;
