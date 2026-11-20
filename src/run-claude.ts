@@ -46,6 +46,11 @@ export interface RunClaudeOptions extends CommonRunOptions {
   /** In-process hook callbacks (e.g. a PreToolUse guard). A callback that
    * throws counts as no opinion, so a guard must catch its own errors. */
   hooks?: ClaudeHooks;
+  /** Only the MCP servers the session is given: the CLI ignores a project
+   * .mcp.json, local- and user-scope MCP config, and plugins' servers.
+   * claude.ai connectors are a separate switch:
+   * `settings: { disableClaudeAiConnectors: true }`. `isolated` implies it. */
+  strictMcpConfig?: boolean;
   /** Pre-assign a UUID for the new session (turn 1). Mutually exclusive with resumeSessionId. */
   newSessionId?: string;
   /** Resume an existing session by id (turn 2+). Mutually exclusive with newSessionId. */
@@ -85,6 +90,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     settingSources,
     settings,
     hooks,
+    strictMcpConfig,
     newSessionId,
     resumeSessionId,
     isolated,
@@ -109,6 +115,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunResult> {
     settingSources,
     settings,
     hooks,
+    strictMcpConfig,
     newSessionId,
     resumeSessionId,
     isolated,

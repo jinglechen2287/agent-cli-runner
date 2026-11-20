@@ -150,6 +150,11 @@ export interface CreateClaudeSessionOptions {
   /** MCP servers for the session, by name, on top of those the settings
    * sources configure. */
   mcpServers?: Record<string, McpServerConfig>;
+  /** Only the MCP servers in `mcpServers`: the CLI ignores a project .mcp.json,
+   * local- and user-scope MCP config, and plugins' servers. claude.ai connectors
+   * are a separate switch: `settings: { disableClaudeAiConnectors: true }`.
+   * `isolated` implies it. */
+  strictMcpConfig?: boolean;
   /** A non-persistent session with customizations, tools, and MCP disabled,
    * for small metadata tasks such as chat titles. */
   isolated?: boolean;
@@ -332,6 +337,7 @@ export function claudeSessionQueryOptions(
       ? { hooks: { ...opts.hooks, PreToolUse: [DENY_EVERY_TOOL, ...(opts.hooks?.PreToolUse ?? [])] } }
       : opts.hooks ? { hooks: opts.hooks } : {}),
     ...(opts.mcpServers ? { mcpServers: { ...opts.mcpServers } } : {}),
+    ...(opts.strictMcpConfig ? { strictMcpConfig: true } : {}),
     ...(opts.isolated
       ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } }
       : opts.forkSessionId ? { persistSession: false } : {}),

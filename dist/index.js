@@ -1214,6 +1214,7 @@ function claudeSessionQueryOptions(opts, sessionId, executablePath, spawnClaudeC
     // guarded fork keeps the caller's tools and guard as they are.
     ...opts.forkSessionId && opts.isolated ? { hooks: { ...opts.hooks, PreToolUse: [DENY_EVERY_TOOL, ...opts.hooks?.PreToolUse ?? []] } } : opts.hooks ? { hooks: opts.hooks } : {},
     ...opts.mcpServers ? { mcpServers: { ...opts.mcpServers } } : {},
+    ...opts.strictMcpConfig ? { strictMcpConfig: true } : {},
     ...opts.isolated ? { strictMcpConfig: true, persistSession: false, extraArgs: { "safe-mode": null } } : opts.forkSessionId ? { persistSession: false } : {}
   };
 }
@@ -1602,6 +1603,7 @@ async function runClaude(opts) {
     settingSources,
     settings,
     hooks,
+    strictMcpConfig,
     newSessionId,
     resumeSessionId,
     isolated,
@@ -1625,6 +1627,7 @@ async function runClaude(opts) {
     settingSources,
     settings,
     hooks,
+    strictMcpConfig,
     newSessionId,
     resumeSessionId,
     isolated,
@@ -1648,7 +1651,7 @@ import { deleteSession, forkSession } from "@anthropic-ai/claude-agent-sdk";
 import { spawn as nodeSpawn3 } from "child_process";
 
 // package.json
-var version = "0.6.0";
+var version = "0.7.0";
 
 // src/codex-client.ts
 var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;

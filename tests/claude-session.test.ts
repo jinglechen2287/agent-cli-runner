@@ -736,6 +736,7 @@ describe("createClaudeSession options", () => {
       settings: { disableAllHooks: false },
       appendSystemPrompt: "Be brief.",
       hooks,
+      strictMcpConfig: true,
     });
     vi.unstubAllEnvs();
     const options = fake.options();
@@ -754,6 +755,7 @@ describe("createClaudeSession options", () => {
       settingSources: ["user", "project", "local"],
       settings: { disableAllHooks: false },
       hooks,
+      strictMcpConfig: true,
     });
     expect(options.resume).toBeUndefined();
     expect(options.persistSession).toBeUndefined();
@@ -1035,6 +1037,20 @@ describe("runClaude", () => {
     fake.emit(result("ok"));
     await run;
     expect(fake.options()).toMatchObject({ allowedTools: ["Glob"], hooks });
+  });
+
+  it("passes strictMcpConfig through to the session", async () => {
+    const fake = makeFakeQuery();
+    const run = runClaude({
+      prompt: "x",
+      cwd: "/tmp/proj",
+      executablePath: EXECUTABLE,
+      queryFn: fake.queryFn,
+      strictMcpConfig: true,
+    });
+    fake.emit(result("ok"));
+    await run;
+    expect(fake.options()).toMatchObject({ strictMcpConfig: true });
   });
 
   it("never starts a session for an already-aborted signal", async () => {
