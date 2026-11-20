@@ -350,6 +350,11 @@ interface CreateClaudeSessionOptions {
     /** MCP servers for the session, by name, on top of those the settings
      * sources configure. */
     mcpServers?: Record<string, McpServerConfig>;
+    /** Only the MCP servers in `mcpServers`: the CLI ignores a project .mcp.json,
+     * local- and user-scope MCP config, and plugins' servers. claude.ai connectors
+     * are a separate switch: `settings: { disableClaudeAiConnectors: true }`.
+     * `isolated` implies it. */
+    strictMcpConfig?: boolean;
     /** A non-persistent session with customizations, tools, and MCP disabled,
      * for small metadata tasks such as chat titles. */
     isolated?: boolean;
@@ -453,6 +458,11 @@ interface RunClaudeOptions extends CommonRunOptions {
     /** In-process hook callbacks (e.g. a PreToolUse guard). A callback that
      * throws counts as no opinion, so a guard must catch its own errors. */
     hooks?: ClaudeHooks;
+    /** Only the MCP servers the session is given: the CLI ignores a project
+     * .mcp.json, local- and user-scope MCP config, and plugins' servers.
+     * claude.ai connectors are a separate switch:
+     * `settings: { disableClaudeAiConnectors: true }`. `isolated` implies it. */
+    strictMcpConfig?: boolean;
     /** Pre-assign a UUID for the new session (turn 1). Mutually exclusive with resumeSessionId. */
     newSessionId?: string;
     /** Resume an existing session by id (turn 2+). Mutually exclusive with newSessionId. */
