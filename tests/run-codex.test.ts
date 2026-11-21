@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { runCodex } from "../src/index.js";
+import { ProviderTurnError, runCodex } from "../src/index.js";
 import { makeFakeChild, type FakeChild } from "./helpers/fake-child.js";
 
 function readAll(stream: PassThrough): Promise<string> {
@@ -247,7 +247,11 @@ describe("runCodex isolated robustness", () => {
       name: "CodexTurnError",
       message: "Codex error: quota exhausted",
       exitCode: 1,
+      provider: "codex",
+      kind: "provider_error",
+      retryable: false,
     });
+    await expect(run).rejects.toBeInstanceOf(ProviderTurnError);
   });
 
   it("contains a throwing host callback and still settles the run", async () => {

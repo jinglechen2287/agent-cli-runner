@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { agyManifestUrl } from "../src/agy-release.js";
 import {
   createProviderUpdateService,
   type ProviderUpdateCommandResult,
@@ -283,7 +284,7 @@ describe("provider update service", () => {
     });
   });
 
-  it("checks both providers independently when one fails", async () => {
+  it("checks every provider independently when one fails", async () => {
     const deps = makeDeps({
       "claude --version": new Error("Claude probe failed"),
       "codex --version": result("codex-cli 0.145.0"),
@@ -292,7 +293,7 @@ describe("provider update service", () => {
 
     const statuses = await createProviderUpdateService({}, deps).checkAll();
 
-    expect(statuses).toHaveLength(2);
+    expect(statuses).toHaveLength(3);
     expect(statuses[0]).toMatchObject({
       provider: "claude",
       state: "unknown",
@@ -302,6 +303,7 @@ describe("provider update service", () => {
       provider: "codex",
       state: "current",
     });
+    expect(statuses[2]).toMatchObject({ provider: "agy", state: "unknown", reason: "check_failed" });
   });
 
   it("applies a Codex update with the long installer timeout", async () => {
@@ -643,5 +645,83 @@ describe("provider update service regressions", () => {
       reason: "unsupported_installation",
       output: expect.stringContaining("Config install method: brew"),
     });
+  });
+});
+
+describe("agy updates", () => {
+  const manifest = (version: string, overrides: Record<string, unknown> = {}) => JSON.stringify({
+    version,
+    url: `https://storage.googleapis.com/antigravity-public/antigravity-cli/${version}-5999302598852608/darwin-arm/cli_mac_arm64.tar.gz`,
+    sha512: "a".repeat(128),
+    ...overrides,
+  });
+  const manifestUrl = agyManifestUrl()!;
+  const install = (method: "native" | "homebrew" | "unknown") => vi.fn(async () => method);
+
+  it("reports an update from the auto-updater manifest on an official install", async () => {
+    const deps = { ...makeDeps({ "agy --version": result("1.5.13") }, { [manifestUrl]: manifest("1.5.14") }), resolveAgyInstall: install("native") };
+    await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toEqual({
+      provider: "agy",
+      state: "update_available",
+      installedVersion: "1.5.13",
+      latestVersion: "1.5.14",
+      channel: null,
+      checkedAt: NOW.toISOString(),
+      reason: null,
+    });
+    expect(deps.fetchText).toHaveBeenCalledWith(manifestUrl, { timeoutMs: 10_000 });
+  });
+
+  it("answers unsupported_installation for Homebrew without fetching", async () => {
+    const deps = { ...makeDeps({ "agy --version": result("1.5.13") }), resolveAgyInstall: install("homebrew") };
+    await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({
+      state: "unknown", reason: "unsupported_installation", installedVersion: "1.5.13",
+    });
+    expect(deps.fetchText).not.toHaveBeenCalled();
+  });
+
+  it("answers version_unavailable for a bad manifest or a failed fetch", async () => {
+    for (const latest of [
+      manifest("1.5.14", { url: "https://evil.example/agy.tar.gz" }),
+      manifest("1.5.14", { sha512: "nope" }),
+      new Error("offline"),
+    ]) {
+      const deps = { ...makeDeps({ "agy --version": result("1.5.13") }, { [manifestUrl]: latest }), resolveAgyInstall: install("native") };
+      await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({
+        state: "unknown", reason: "version_unavailable",
+      });
+    }
+  });
+
+  it("reports a failing agy --version like the other providers", async () => {
+    const deps = { ...makeDeps({ "agy --version": new Error("boom") }), resolveAgyInstall: install("native") };
+    await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({
+      state: "unknown", reason: "check_failed",
+    });
+    const missing = Object.assign(new Error("spawn agy ENOENT"), { code: "ENOENT" });
+    const absent = { ...makeDeps({ "agy --version": missing }), resolveAgyInstall: install("native") };
+    await expect(createProviderUpdateService({}, absent).check("agy")).resolves.toMatchObject({
+      state: "not_installed", reason: "cli_not_found",
+    });
+  });
+
+  it("runs agy update only on an official install", async () => {
+    const native = { ...makeDeps({ "agy update": result("Updated to 1.5.14") }), resolveAgyInstall: install("native") };
+    await expect(createProviderUpdateService({}, native).apply("agy")).resolves.toMatchObject({
+      provider: "agy", ok: true, exitCode: 0, output: "Updated to 1.5.14",
+    });
+    expect(native.runCommand).toHaveBeenCalledWith("agy", ["update"], expect.objectContaining({ timeoutMs: 600_000 }));
+
+    const brew = { ...makeDeps({}), resolveAgyInstall: install("homebrew") };
+    const refused = await createProviderUpdateService({}, brew).apply("agy");
+    expect(refused).toMatchObject({ ok: false, exitCode: null, reason: "unsupported_installation" });
+    expect(refused.error).toContain("brew upgrade --cask antigravity-cli");
+    expect(brew.runCommand).not.toHaveBeenCalled();
+
+    const unknown = { ...makeDeps({}), resolveAgyInstall: install("unknown") };
+    await expect(createProviderUpdateService({}, unknown).apply("agy")).resolves.toMatchObject({
+      ok: false, reason: "install_method_unknown",
+    });
+    expect(unknown.runCommand).not.toHaveBeenCalled();
   });
 });

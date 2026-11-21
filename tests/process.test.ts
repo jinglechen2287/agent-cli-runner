@@ -370,3 +370,13 @@ describe("execCli", () => {
     )).rejects.toMatchObject({ killed: true });
   });
 });
+
+describe("childEnv for agy", () => {
+  it("strips agy's conversation variable and keeps the rest", async () => {
+    const { childEnv } = await import("../src/process.js");
+    expect(childEnv("agy", { PATH: "/usr/bin", ANTIGRAVITY_CONVERSATION_ID: "parent", CODEX_THREAD_ID: "t" })).toEqual({
+      PATH: "/usr/bin",
+      CODEX_THREAD_ID: "t",
+    });
+  });
+});

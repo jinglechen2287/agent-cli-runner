@@ -1,7 +1,7 @@
 {
   "name": "agent-cli-runner",
-  "version": "0.7.0",
-  "description": "Stream Claude Code and Codex app-server from Node or Bun: session resume, tools, usage, and abort/timeout handling.",
+  "version": "0.8.0",
+  "description": "Stream Claude Code, Codex app-server and the Antigravity CLI (agy) from Node or Bun: session resume, tools, usage, and abort/timeout handling.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -16,7 +16,7 @@
     "src"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/check-dist.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
@@ -33,7 +33,9 @@
     "claude-code",
     "codex",
     "cli",
-    "agent"
+    "agent",
+    "agy",
+    "antigravity"
   ],
   "license": "MIT",
   "devDependencies": {

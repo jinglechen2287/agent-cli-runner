@@ -3,6 +3,45 @@ export { HookCallback as ClaudeHookCallback, HookCallbackMatcher as ClaudeHookCa
 import { SpawnOptions, ChildProcess } from 'node:child_process';
 
 /**
+ * The providers this library runs, and what it can do with each of them.
+ * The capabilities are facts about the CLIs as this library drives them;
+ * host policy (which turns a product allows, say) stays with the host.
+ */
+type AgentProvider = "claude" | "codex" | "agy";
+/** What this library can do with one CLI. */
+interface ProviderCapabilities {
+    /** A turn can run on a chosen service tier (`serviceTier`). */
+    serviceTiers: boolean;
+    /** `compact()` takes focus instructions for the summary. */
+    compactionFocus: boolean;
+    /** A run can be a throwaway fork of a session (`forkSessionId`). */
+    sideFork: boolean;
+    /** A session can be copied into a new one that carries on
+     * (`forkClaudeSession` / `forkCodexThread`). */
+    lastingFork: boolean;
+    /** A saved session can be deleted (`deleteClaudeSession`). */
+    deleteSession: boolean;
+    /** `onMcpStatus` fires (on long-lived sessions). */
+    mcpStatus: boolean;
+    /** `onMcpElicitation` can be asked. */
+    mcpElicitation: boolean;
+    /** In-process hooks can guard every tool call before it runs. */
+    toolHooks: boolean;
+    /** The host answers the CLI's own permission requests per call
+     * (`onPermissionRequest`). */
+    permissionCallback: boolean;
+    /** A turn can be held read-only by the CLI (Codex's read-only sandbox,
+     * Claude's plan permission mode). */
+    readOnlyTurns: boolean;
+    /** Prompts can carry local images (`imagePaths`). */
+    images: boolean;
+    /** A failed turn rejects with a ProviderTurnError ("rejects") or resolves
+     * with exitCode 1 ("resolves"). */
+    failedTurn: "rejects" | "resolves";
+}
+declare const PROVIDER_CAPABILITIES: Readonly<Record<AgentProvider, Readonly<ProviderCapabilities>>>;
+
+/**
  * Provider-normalized token accounting, so a host can render one context-usage
  * meter for both Claude and Codex without knowing either CLI's raw shape.
  */
@@ -116,9 +155,10 @@ interface BackgroundAgentProgress {
     lastToolName?: string;
 }
 interface BackgroundAgentInfo {
-    /** Claude task id or Codex child thread id. Stable within the parent turn. */
+    /** Claude task id, Codex child thread id, or the agy tool call that
+     * started the subagent. Stable within the parent turn. */
     id: string;
-    provider: "claude" | "codex";
+    provider: AgentProvider;
     /** Tool invocation that originally spawned the agent, when reported. */
     parentToolCallId?: string;
     description?: string;
@@ -261,7 +301,8 @@ interface RunResult {
     /** Final assistant text of the turn ("" when the CLI produced none). */
     text: string;
     exitCode: number;
-    /** Claude session id / Codex thread id, when the CLI reported one. */
+    /** Claude session id / Codex thread id / agy session id, when the CLI
+     * reported one. */
     sessionId?: string;
     /** The latest context-usage snapshot of the turn, when the CLI reported any
      * token counts. Matches the final {@link AgentCallbacks.onUsage} value. */
@@ -561,25 +602,33 @@ declare function createClaudeSessionState(): ClaudeSessionState;
  * tracking are all scoped to it. */
 declare function createClaudeTurnTranslator(callbacks: AgentCallbacks, options?: ClaudeTurnTranslatorOptions): ClaudeTurnTranslator;
 
-interface CodexServerRequest {
+interface JsonRpcServerRequest {
     id: number | string;
     method: string;
     params: unknown;
 }
-type CodexServerRequestHandler = (request: CodexServerRequest) => Promise<unknown> | unknown;
-interface CodexAppServerClient {
-    request(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+type JsonRpcServerRequestHandler = (request: JsonRpcServerRequest) => Promise<unknown> | unknown;
+interface JsonRpcClient {
+    /** `timeoutMs` null sends the request with no timer at all (a request that
+     * stays open for a whole turn); undefined uses the client's default. */
+    request(method: string, params?: Record<string, unknown>, timeoutMs?: number | null): Promise<unknown>;
     notify(method: string, params?: unknown): void;
     onNotification(handler: (method: string, params: unknown) => void): () => void;
     /** Register the single handler that answers server-initiated requests.
      * Only one registration may be active at a time: a second call throws
      * while the first is live, and the slot reopens once the returned
      * disposer runs. */
-    onServerRequest(handler: CodexServerRequestHandler): () => void;
+    onServerRequest(handler: JsonRpcServerRequestHandler): () => void;
     onStderr(handler: (chunk: string) => void): () => void;
+    /** A stdout line that is not JSON, e.g. a sign-in link a CLI prints. */
+    onStdoutNonJson(handler: (line: string) => void): () => void;
     onClose(handler: (error: Error) => void): () => void;
     close(): void;
 }
+
+type CodexServerRequest = JsonRpcServerRequest;
+type CodexServerRequestHandler = JsonRpcServerRequestHandler;
+type CodexAppServerClient = JsonRpcClient;
 interface CreateCodexAppServerClientOptions {
     executablePath?: string;
     cwd: string;
@@ -752,6 +801,236 @@ interface ForkCodexThreadOptions {
  * ends. Answers the new thread's id. */
 declare function forkCodexThread(options: ForkCodexThreadOptions): Promise<string>;
 
+declare class AbortError extends Error {
+    readonly name = "AbortError";
+    constructor(message?: string);
+}
+declare class TimeoutError extends Error {
+    readonly name = "TimeoutError";
+    constructor(message?: string);
+}
+declare class MissingCliError extends Error {
+    readonly name = "MissingCliError";
+    readonly cli: string;
+    constructor(cli: string);
+}
+type ProviderTurnErrorKind = "usage_limit" | "provider_error" | "auth_required" | "unsupported" | "invalid_request";
+interface ProviderTurnErrorOptions {
+    /** Defaults to "provider_error". */
+    kind?: ProviderTurnErrorKind;
+    /** The provider's own code, e.g. "RESOURCE_EXHAUSTED" or -32000. */
+    code?: string | number;
+    /** Whether sending the same turn again may succeed. Defaults to false. */
+    retryable?: boolean;
+    /** ISO time when a usage limit resets, when the provider says. */
+    resetAt?: string;
+    exitCode?: number;
+    cause?: unknown;
+}
+/** A turn a provider failed, in one shape for every provider, so a host can
+ * handle every failure in one place. Claude's failed results resolve with
+ * exitCode 1 instead (see PROVIDER_CAPABILITIES' `failedTurn`). */
+declare class ProviderTurnError extends Error {
+    name: string;
+    readonly provider: AgentProvider;
+    readonly kind: ProviderTurnErrorKind;
+    readonly code?: string | number;
+    readonly retryable: boolean;
+    readonly resetAt?: string;
+    /** Exit code of the provider's process, once known. */
+    exitCode?: number;
+    constructor(provider: AgentProvider, message: string, options?: ProviderTurnErrorOptions);
+}
+/** A fatal `error` / `turn.failed` event in the Codex JSONL stream. */
+declare class CodexTurnError extends ProviderTurnError {
+    name: string;
+    constructor(message: string, options?: ProviderTurnErrorOptions);
+}
+interface AgyTurnErrorOptions extends ProviderTurnErrorOptions {
+    /** The ACP stop reason the prompt ended with, when it ended with one. */
+    stopReason?: string;
+    /** agy's saved conversation can no longer be sent to the model: start a
+     * fresh session. */
+    broken?: boolean;
+    /** The turn's last assistant prose. */
+    text?: string;
+}
+/** A failed agy turn: an error agy logged, a stop reason other than
+ * `end_turn`, or a request the session refused. */
+declare class AgyTurnError extends ProviderTurnError {
+    name: string;
+    readonly stopReason?: string;
+    readonly broken: boolean;
+    readonly text?: string;
+    constructor(message: string, options?: AgyTurnErrorOptions);
+}
+/** agy needs the user to sign in (`agy`, or `agy acp --login`). */
+declare class AgyAuthError extends ProviderTurnError {
+    name: string;
+    /** The sign-in link agy printed, when it printed one. */
+    readonly url?: string;
+    readonly data?: unknown;
+    constructor(message: string, options?: {
+        code?: number;
+        url?: string;
+        data?: unknown;
+    });
+}
+/** Thrown by a {@link CodexServerRequestHandler} for a method it does not
+ * take: the server gets "method not found", as if nothing were registered. */
+declare class UnsupportedServerRequestError extends Error {
+    constructor(method: string);
+}
+/** A steer the session could not hand to the running turn: none is running,
+ * or the turn is past the point of taking more input. The host can send the
+ * same words as the next turn instead. */
+declare class SteerRejectedError extends Error {
+    readonly name = "SteerRejectedError";
+}
+
+/**
+ * agy reports an upstream API failure (a quota, a rate limit, a broken
+ * conversation) as a chat message and a plain `end_turn`. Its session log
+ * ends that turn with an error step, so after each prompt the session reads
+ * the steps the prompt added and classifies the last one. Ported from T3
+ * Code's AntigravityTurnOutcome: the step types and the regexes are T3's.
+ */
+
+/** The newest step a prompt added. */
+interface AgyLastStep {
+    type: number;
+    payload: Uint8Array | null;
+    /** The model answered (a planner-response step) within the prompt. */
+    reachedModel: boolean;
+}
+/** Reads agy's per-session step log, `conversations/<sid>.db`. */
+interface AgyStepReader {
+    /** The newest step index, or undefined when the log can't be read. */
+    lastIndex(dbPath: string): number | undefined;
+    /** The newest step after `index`, or undefined when there is none. */
+    lastStepAfter(dbPath: string, index: number): AgyLastStep | undefined;
+}
+
+/** How long a cancelled prompt may take to answer before the process is
+ * stopped (T3 Code's wait). */
+declare const AGY_INTERRUPT_GRACE_MS = 15000;
+/** An agy execution mode, checked against the modes the session advertises
+ * (agy 1.5.13: default, accept-edits, auto, plan). */
+type AgyMode = string;
+/** An MCP server for the session, in this library's shape. */
+type AgyMcpServer = {
+    type?: "stdio";
+    name: string;
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+} | {
+    type: "http" | "sse";
+    name: string;
+    url: string;
+    headers?: Record<string, string>;
+};
+interface AgyPermissionRequest {
+    /** `question`: agy's own question to the user (an `interaction_` call). */
+    kind: "approval" | "question";
+    toolCall: ToolUseInfo;
+    options: Array<{
+        id: string;
+        name: string;
+        kind: string;
+    }>;
+}
+/** An option id from the request, or "cancel". */
+type AgyPermissionAnswer = string;
+type AgyPermissionCallback = (request: AgyPermissionRequest, context: {
+    signal: AbortSignal;
+}) => Promise<AgyPermissionAnswer>;
+/** Callbacks for output agy produces while no turn is open. */
+interface AgyContinuationHandlers extends AgentCallbacks {
+    onPermissionRequest?: AgyPermissionCallback;
+    /** The continuation ended: its reply finished, or a new turn took over. */
+    onEnd?: (outcome: {
+        result?: RunResult;
+        error?: Error;
+    }) => void;
+}
+interface CreateAgySessionOptions {
+    cwd: string;
+    executablePath?: string;
+    env?: NodeJS.ProcessEnv;
+    spawnFn?: SpawnFn;
+    /** Gives up on opening the session. */
+    signal?: AbortSignal;
+    geminiDir?: string;
+    appDataDir?: string;
+    authMethod?: string;
+    resumeSessionId?: string;
+    /** The model for every turn that doesn't name its own; "default" keeps
+     * agy's current one. */
+    model?: string;
+    effort?: string;
+    mode?: AgyMode;
+    appendSystemPrompt?: string;
+    mcpServers?: AgyMcpServer[];
+    /** Answer every approval agy asks for with "allow once". */
+    dangerouslySkipPermissions?: boolean;
+    /** A one-off metadata run: a fresh temp cwd, no tools, nothing left behind. */
+    isolated?: boolean;
+    /** Output agy produces while no turn is open (a finished daemon, a late
+     * wake). Without it that output is dropped. */
+    onContinuation?: (start: {
+        reason: "output" | "permission";
+    }) => AgyContinuationHandlers | undefined;
+    interruptGraceMs?: number;
+    /** How long a turn held for background work waits after agy's reply
+     * closes before ending. Default 3 s. */
+    replyQuietMs?: number;
+    /** Fail a turn that sees no update for this long while nothing it waits on
+     * is open. Off unless given. */
+    inactivityTimeoutMs?: number;
+    /** Test seam: replaces the node:sqlite step reader; null reads no step
+     * log, as on a runtime without node:sqlite. */
+    stepReader?: AgyStepReader | null;
+}
+type AgyTurnOptions = AgentCallbacks & {
+    prompt: string;
+    imagePaths?: string[];
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    model?: string;
+    effort?: string;
+    mode?: AgyMode;
+    onPermissionRequest?: AgyPermissionCallback;
+};
+type AgyCompactOptions = AgentCallbacks & {
+    instructions?: string;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+};
+interface AgySession {
+    readonly sessionId: string;
+    readonly cwd: string;
+    readonly closed: boolean;
+    /** Where turn errors come from: agy's step log, or the stop reason alone
+     * on a runtime without node:sqlite. */
+    readonly outcomeSource: "steps-db" | "stop-reason";
+    runTurn(options: AgyTurnOptions): Promise<RunResult>;
+    /** Hand more input to the running turn. Rejects with SteerRejectedError
+     * when no prompt of a turn is outstanding. */
+    steer(options: {
+        prompt: string;
+    }): Promise<void>;
+    /** Compact the conversation with agy's `/compact`, as a turn of its own. */
+    compact(options: AgyCompactOptions): Promise<RunResult>;
+    onClose(handler: (error: Error) => void): () => void;
+    close(): Promise<void>;
+}
+declare function createAgySession(options: CreateAgySessionOptions): Promise<AgySession>;
+
+type RunAgyOptions = CommonRunOptions & Omit<CreateAgySessionOptions, "cwd" | "executablePath" | "env" | "spawnFn" | "signal" | "onContinuation"> & Pick<AgyTurnOptions, "imagePaths" | "onPermissionRequest">;
+/** One agy turn: open a session (or resume one), run the prompt, close it. */
+declare function runAgy(opts: RunAgyOptions): Promise<RunResult>;
+
 /**
  * Child-process plumbing shared by every runner: finding a CLI, launching it
  * (through cmd.exe for a Windows batch shim), reading its output, and
@@ -765,6 +1044,9 @@ declare const CLAUDE_STRIPPED_ENV_VARS: readonly ["CLAUDECODE", "CLAUDE_CODE_ENT
 /** Stripped so a Codex turn spawned from within another Codex session does
  * not inherit the parent's thread. */
 declare const CODEX_STRIPPED_ENV_VARS: readonly ["CODEX_THREAD_ID"];
+/** agy sets this inside its own tool shells; stripped so an agy session
+ * started from within another agy session does not inherit its conversation. */
+declare const AGY_STRIPPED_ENV_VARS: readonly ["ANTIGRAVITY_CONVERSATION_ID"];
 
 /** Thread config for a forked side run: no web search, and every tool
  * feature off, so the copy can only answer from its history. The run adds
@@ -787,43 +1069,25 @@ declare const CODEX_FORK_CONFIG: {
     };
 };
 
-declare class AbortError extends Error {
-    readonly name = "AbortError";
-    constructor(message?: string);
-}
-declare class TimeoutError extends Error {
-    readonly name = "TimeoutError";
-    constructor(message?: string);
-}
-declare class MissingCliError extends Error {
-    readonly name = "MissingCliError";
-    readonly cli: string;
-    constructor(cli: string);
-}
-/** A fatal `error` / `turn.failed` event in the Codex JSONL stream. */
-declare class CodexTurnError extends Error {
-    readonly name = "CodexTurnError";
-    /** Exit code of the Codex process, once known. */
-    exitCode?: number;
-}
-/** Thrown by a {@link CodexServerRequestHandler} for a method it does not
- * take: the server gets "method not found", as if nothing were registered. */
-declare class UnsupportedServerRequestError extends Error {
-    constructor(method: string);
-}
-/** A steer the session could not hand to the running turn: none is running,
- * or the turn is past the point of taking more input. The host can send the
- * same words as the next turn instead. */
-declare class SteerRejectedError extends Error {
-    readonly name = "SteerRejectedError";
+interface AgyModelDescriptor {
+    /** The model option value agy takes in `session/set_config_option`. */
+    id: string;
+    label: string;
+    /** The model's thinking levels, empty when it has none. */
+    efforts: string[];
+    /** The thinking level agy selects for it. */
+    defaultEffort?: string;
+    /** agy's current model for a new session. */
+    isCurrent: boolean;
 }
 
 /**
- * Live model discovery for both providers, shared by hosts that let users
+ * Live model discovery for every provider, shared by hosts that let users
  * pick a model/effort: Codex models come from the app-server's `model/list`
  * API (with per-model reasoning efforts and service tiers); Claude aliases
  * and effort levels are parsed from the installed CLI's `--help`, with
- * static fallbacks when discovery is unavailable.
+ * static fallbacks when discovery is unavailable; agy models and their
+ * thinking levels come from a throwaway ACP session.
  *
  * Policy stays with the host: `config.defaultEffort` names the effort a host
  * sends when a thread has none saved (advertised as each model's
@@ -831,7 +1095,9 @@ declare class SteerRejectedError extends Error {
  * provider-reported default, or null — meaning "omit the option and let the
  * CLI/config decide".
  */
-type ModelCatalogProvider = "claude" | "codex";
+
+type ModelCatalogProvider = AgentProvider;
+
 interface ModelEffortOption {
     id: string;
     label: string;
@@ -852,7 +1118,7 @@ interface ModelOption {
 }
 interface ModelCatalog {
     provider: ModelCatalogProvider;
-    source: "codex-app-server" | "codex-config" | "claude-cli" | "claude-fallback";
+    source: "codex-app-server" | "codex-config" | "claude-cli" | "claude-fallback" | "agy-acp" | "agy-config";
     fetchedAt: string;
     supportsCustomModel: boolean;
     models: ModelOption[];
@@ -902,10 +1168,16 @@ interface ModelCatalogConfig {
     defaultEffort?: string;
     /** Description shown on the synthetic configured-model entry. */
     configuredModelDescription?: string;
+    /** agy binary for ACP discovery. Defaults to "agy" on PATH. */
+    agyPath?: string;
+    /** The catalog's only entry when agy discovery fails. Without it the
+     * discovery error is thrown. */
+    agyModel?: string;
 }
 interface ModelCatalogDeps {
     listCodexModels?: (executablePath: string, cwd: string) => Promise<CodexModelDescriptor[]>;
     getClaudeCapabilities?: (executablePath: string, cwd: string) => Promise<ClaudeCliCapabilities>;
+    listAgyModels?: (executablePath: string, cwd: string) => Promise<AgyModelDescriptor[]>;
     now?: () => Date;
 }
 interface ClaudeCliCapabilities {
@@ -915,7 +1187,9 @@ interface ClaudeCliCapabilities {
 declare function parseClaudeCliHelp(help: string): ClaudeCliCapabilities;
 declare function createModelCatalogService(config?: ModelCatalogConfig, deps?: ModelCatalogDeps): ModelCatalogService;
 
-type ProviderUpdateProvider = "claude" | "codex";
+type AgyInstallMethod = "native" | "homebrew" | "unknown";
+
+type ProviderUpdateProvider = AgentProvider;
 type ProviderUpdateState = "current" | "update_available" | "not_installed" | "unknown";
 type ProviderUpdateReason = "cli_not_found" | "unsupported_installation" | "version_unavailable" | "check_failed" | null;
 interface ProviderUpdateStatus {
@@ -957,6 +1231,7 @@ interface ProviderUpdateService {
 interface ProviderUpdateServiceConfig {
     claudePath?: string;
     codexPath?: string;
+    agyPath?: string;
     env?: NodeJS.ProcessEnv;
 }
 interface ProviderUpdateCommandOptions {
@@ -975,7 +1250,9 @@ interface ProviderUpdateServiceDeps {
     runCommand?: (executable: string, args: readonly string[], options: ProviderUpdateCommandOptions) => Promise<ProviderUpdateCommandResult>;
     fetchText?: (url: string, options: ProviderUpdateFetchOptions) => Promise<string>;
     now?: () => Date;
+    /** How the agy at this path was installed. */
+    resolveAgyInstall?: (executable: string, env: NodeJS.ProcessEnv) => Promise<AgyInstallMethod>;
 }
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AbortError, type AgentCallbacks, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeContextUsage, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionCompactOptions, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerCompactOptions, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CompactionFailureInfo, type CompactionInfo, type CompactionStartInfo, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, type ForkCodexThreadOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, deleteClaudeSession, forkClaudeSession, forkCodexThread, parseClaudeCliHelp, runClaude, runCodex };
+export { AGY_INTERRUPT_GRACE_MS, AGY_STRIPPED_ENV_VARS, AbortError, type AgentCallbacks, type AgentProvider, AgyAuthError, type AgyCompactOptions, type AgyContinuationHandlers, type AgyLastStep, type AgyMcpServer, type AgyMode, type AgyPermissionAnswer, type AgyPermissionCallback, type AgyPermissionRequest, type AgySession, type AgyStepReader, AgyTurnError, type AgyTurnErrorOptions, type AgyTurnOptions, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeContextUsage, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionCompactOptions, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerCompactOptions, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CompactionFailureInfo, type CompactionInfo, type CompactionStartInfo, type CreateAgySessionOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, type ForkCodexThreadOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, PROVIDER_CAPABILITIES, type ProviderCapabilities, ProviderTurnError, type ProviderTurnErrorKind, type ProviderTurnErrorOptions, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunAgyOptions, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createAgySession, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, deleteClaudeSession, forkClaudeSession, forkCodexThread, parseClaudeCliHelp, runAgy, runClaude, runCodex };

@@ -9,6 +9,7 @@ import { delimiter, extname, resolve as resolvePath, win32 } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { MissingCliError, runAborted, runTimedOut } from "./errors.js";
 import { createDeferred, type Deferred } from "./internal.js";
+import type { AgentProvider } from "./providers.js";
 import type { SpawnFn } from "./types.js";
 
 export const SIGTERM_GRACE_MS = 2000;
@@ -25,6 +26,21 @@ export const CLAUDE_STRIPPED_ENV_VARS = [
 /** Stripped so a Codex turn spawned from within another Codex session does
  * not inherit the parent's thread. */
 export const CODEX_STRIPPED_ENV_VARS = ["CODEX_THREAD_ID"] as const;
+
+/** agy sets this inside its own tool shells; stripped so an agy session
+ * started from within another agy session does not inherit its conversation. */
+export const AGY_STRIPPED_ENV_VARS = ["ANTIGRAVITY_CONVERSATION_ID"] as const;
+
+function strippedEnvVars(cli: AgentProvider): readonly string[] {
+  switch (cli) {
+    case "claude":
+      return CLAUDE_STRIPPED_ENV_VARS;
+    case "codex":
+      return CODEX_STRIPPED_ENV_VARS;
+    case "agy":
+      return AGY_STRIPPED_ENV_VARS;
+  }
+}
 
 function filterEnv(
   base: NodeJS.ProcessEnv,
@@ -43,10 +59,10 @@ function filterEnv(
 
 /** The environment for a CLI child: `base` without that CLI's nesting guards. */
 export function childEnv(
-  cli: "claude" | "codex",
+  cli: AgentProvider,
   base: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
-  return filterEnv(base, cli === "claude" ? CLAUDE_STRIPPED_ENV_VARS : CODEX_STRIPPED_ENV_VARS);
+  return filterEnv(base, strippedEnvVars(cli));
 }
 
 export function isMissingExecutable(error: unknown): boolean {
@@ -57,7 +73,7 @@ export function isMissingExecutable(error: unknown): boolean {
 
 export interface SpawnCliOptions {
   /** Names the CLI in a MissingCliError. */
-  cli: "claude" | "codex";
+  cli: AgentProvider;
   spawnFn: SpawnFn;
   command: string;
   args: readonly string[];

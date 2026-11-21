@@ -34,7 +34,8 @@ export function makeFakeChild({ exitOnKill = false }: { exitOnKill?: boolean } =
 
 /** One JSON-RPC message, as either side writes it. */
 export interface RpcMessage {
-  id?: number | undefined;
+  jsonrpc?: string;
+  id?: number | string | undefined;
   method?: string;
   params?: Record<string, unknown>;
   result?: unknown;

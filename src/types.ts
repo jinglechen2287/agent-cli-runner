@@ -1,4 +1,5 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import type { AgentProvider } from "./providers.js";
 import type { TokenUsage } from "./usage.js";
 
 /** Injectable spawn primitive so hosts and tests can substitute their own. */
@@ -68,9 +69,10 @@ export interface BackgroundAgentProgress {
 }
 
 export interface BackgroundAgentInfo {
-  /** Claude task id or Codex child thread id. Stable within the parent turn. */
+  /** Claude task id, Codex child thread id, or the agy tool call that
+   * started the subagent. Stable within the parent turn. */
   id: string;
-  provider: "claude" | "codex";
+  provider: AgentProvider;
   /** Tool invocation that originally spawned the agent, when reported. */
   parentToolCallId?: string;
   description?: string;
@@ -217,7 +219,8 @@ export interface RunResult {
   /** Final assistant text of the turn ("" when the CLI produced none). */
   text: string;
   exitCode: number;
-  /** Claude session id / Codex thread id, when the CLI reported one. */
+  /** Claude session id / Codex thread id / agy session id, when the CLI
+   * reported one. */
   sessionId?: string;
   /** The latest context-usage snapshot of the turn, when the CLI reported any
    * token counts. Matches the final {@link AgentCallbacks.onUsage} value. */

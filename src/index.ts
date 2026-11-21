@@ -35,8 +35,24 @@ export type {
 } from "@anthropic-ai/claude-agent-sdk";
 export { deleteClaudeSession, forkClaudeSession, forkCodexThread } from "./fork.js";
 export type { ForkCodexThreadOptions } from "./fork.js";
+export { runAgy } from "./run-agy.js";
+export type { RunAgyOptions } from "./run-agy.js";
+export { AGY_INTERRUPT_GRACE_MS, createAgySession } from "./agy-session.js";
+export type {
+  AgyCompactOptions,
+  AgyContinuationHandlers,
+  AgyMcpServer,
+  AgyMode,
+  AgyPermissionAnswer,
+  AgyPermissionCallback,
+  AgyPermissionRequest,
+  AgySession,
+  AgyTurnOptions,
+  CreateAgySessionOptions,
+} from "./agy-session.js";
+export type { AgyStepReader, AgyLastStep } from "./agy-outcome.js";
 export { runCodex } from "./run-codex.js";
-export { CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS } from "./process.js";
+export { AGY_STRIPPED_ENV_VARS, CLAUDE_STRIPPED_ENV_VARS, CODEX_STRIPPED_ENV_VARS } from "./process.js";
 export type { CodexSandboxPolicy, RunCodexOptions } from "./run-codex.js";
 export { createCodexAppServerClient } from "./codex-client.js";
 export type {
@@ -58,12 +74,22 @@ export type {
 } from "./codex-app-server.js";
 export {
   AbortError,
+  AgyAuthError,
+  AgyTurnError,
   CodexTurnError,
   MissingCliError,
+  ProviderTurnError,
   SteerRejectedError,
   TimeoutError,
   UnsupportedServerRequestError,
 } from "./errors.js";
+export type {
+  AgyTurnErrorOptions,
+  ProviderTurnErrorKind,
+  ProviderTurnErrorOptions,
+} from "./errors.js";
+export { PROVIDER_CAPABILITIES } from "./providers.js";
+export type { AgentProvider, ProviderCapabilities } from "./providers.js";
 export type {
   AgentCallbacks,
   McpElicitationRequest,

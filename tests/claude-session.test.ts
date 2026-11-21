@@ -6,6 +6,7 @@ import {
   AbortError,
   createClaudeSession,
   MissingCliError,
+  PROVIDER_CAPABILITIES,
   runClaude,
   SteerRejectedError,
   TimeoutError,
@@ -228,6 +229,7 @@ describe("createClaudeSession", () => {
       session_id: "11111111-1111-4111-8111-111111111111",
     });
     await expect(turn).resolves.toMatchObject({ text: "boom", exitCode: 1 });
+    expect(PROVIDER_CAPABILITIES.claude.failedTurn).toBe("resolves");
     expect(session.closed).toBe(false);
   });
 

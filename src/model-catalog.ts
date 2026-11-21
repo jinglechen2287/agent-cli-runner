@@ -1,9 +1,10 @@
 /**
- * Live model discovery for both providers, shared by hosts that let users
+ * Live model discovery for every provider, shared by hosts that let users
  * pick a model/effort: Codex models come from the app-server's `model/list`
  * API (with per-model reasoning efforts and service tiers); Claude aliases
  * and effort levels are parsed from the installed CLI's `--help`, with
- * static fallbacks when discovery is unavailable.
+ * static fallbacks when discovery is unavailable; agy models and their
+ * thinking levels come from a throwaway ACP session.
  *
  * Policy stays with the host: `config.defaultEffort` names the effort a host
  * sends when a thread has none saved (advertised as each model's
@@ -12,10 +13,13 @@
  * CLI/config decide".
  */
 
+import { listAgyModels, type AgyModelDescriptor } from "./agy-models.js";
 import { createCodexAppServerClient } from "./codex-client.js";
 import { childEnv, execCli } from "./process.js";
+import type { AgentProvider } from "./providers.js";
 
-export type ModelCatalogProvider = "claude" | "codex";
+export type ModelCatalogProvider = AgentProvider;
+export type { AgyModelDescriptor } from "./agy-models.js";
 
 export interface ModelEffortOption {
   id: string;
@@ -40,7 +44,7 @@ export interface ModelOption {
 
 export interface ModelCatalog {
   provider: ModelCatalogProvider;
-  source: "codex-app-server" | "codex-config" | "claude-cli" | "claude-fallback";
+  source: "codex-app-server" | "codex-config" | "claude-cli" | "claude-fallback" | "agy-acp" | "agy-config";
   fetchedAt: string;
   supportsCustomModel: boolean;
   models: ModelOption[];
@@ -109,11 +113,17 @@ export interface ModelCatalogConfig {
   defaultEffort?: string;
   /** Description shown on the synthetic configured-model entry. */
   configuredModelDescription?: string;
+  /** agy binary for ACP discovery. Defaults to "agy" on PATH. */
+  agyPath?: string;
+  /** The catalog's only entry when agy discovery fails. Without it the
+   * discovery error is thrown. */
+  agyModel?: string;
 }
 
 export interface ModelCatalogDeps {
   listCodexModels?: (executablePath: string, cwd: string) => Promise<CodexModelDescriptor[]>;
   getClaudeCapabilities?: (executablePath: string, cwd: string) => Promise<ClaudeCliCapabilities>;
+  listAgyModels?: (executablePath: string, cwd: string) => Promise<AgyModelDescriptor[]>;
   now?: () => Date;
 }
 
@@ -224,12 +234,20 @@ async function listCodexModels(
   }
 }
 
+/** The listed model a legacy agy id such as `gemini-3.8-flash-high` belongs
+ * to: agy sessions accept those ids, so the catalog does too. */
+function legacyAgyFamily(catalog: ModelCatalog, model: string): ModelOption | undefined {
+  if (catalog.provider !== "agy") return undefined;
+  return catalog.models.find((candidate) => candidate.id !== "default" && model.startsWith(`${candidate.id}-`));
+}
+
 export function createModelCatalogService(
   config: ModelCatalogConfig = {},
   deps: ModelCatalogDeps = {},
 ): ModelCatalogService {
   const discoverCodex = deps.listCodexModels ?? listCodexModels;
   const discoverClaude = deps.getClaudeCapabilities ?? readClaudeCliCapabilities;
+  const discoverAgy = deps.listAgyModels ?? listAgyModels;
   const now = deps.now ?? (() => new Date());
   const hostDefaultEffort = config.defaultEffort?.trim() || undefined;
 
@@ -317,9 +335,77 @@ export function createModelCatalogService(
     };
   };
 
+  const agyCatalog = async (cwd: string): Promise<ModelCatalog> => {
+    const configuredModel = config.agyModel?.trim() || undefined;
+    const efforts = (ids: readonly string[]): ModelEffortOption[] =>
+      ids.map((effort) => ({ id: effort, label: optionLabel(effort) }));
+    // The host's default wins where the model offers it, so the UI matches
+    // what a run without a saved effort sends; agy's own default otherwise.
+    const defaultEffortFor = (model: AgyModelDescriptor): string | null =>
+      hostDefaultEffort && model.efforts.includes(hostDefaultEffort)
+        ? hostDefaultEffort
+        : model.defaultEffort && model.efforts.includes(model.defaultEffort) ? model.defaultEffort : null;
+    let discovered: AgyModelDescriptor[];
+    try {
+      discovered = await discoverAgy(config.agyPath ?? "agy", cwd);
+    } catch (error) {
+      if (!configuredModel) throw error;
+      return {
+        provider: "agy",
+        source: "agy-config",
+        fetchedAt: now().toISOString(),
+        supportsCustomModel: false,
+        models: [{
+          id: configuredModel,
+          label: configuredModel,
+          description: config.configuredModelDescription ?? "Configured model",
+          efforts: efforts(hostDefaultEffort ? [hostDefaultEffort] : []),
+          serviceTiers: [],
+          defaultEffort: hostDefaultEffort ?? null,
+          isDefault: true,
+        }],
+      };
+    }
+    // Only the model agy reports as current speaks for "default".
+    const current = discovered.find((model) => model.isCurrent);
+    const models: ModelOption[] = discovered.map((model) => ({
+      id: model.id,
+      label: model.label,
+      efforts: efforts(model.efforts),
+      serviceTiers: [],
+      defaultEffort: defaultEffortFor(model),
+      isDefault: false,
+    }));
+    return {
+      provider: "agy",
+      source: "agy-acp",
+      fetchedAt: now().toISOString(),
+      supportsCustomModel: false,
+      models: [
+        {
+          id: "default",
+          label: current ? `Default (${current.label})` : "Default",
+          description: "Keep the model agy selects for this account",
+          efforts: efforts(current?.efforts ?? []),
+          serviceTiers: [],
+          defaultEffort: current ? defaultEffortFor(current) : null,
+          isDefault: true,
+        },
+        ...models,
+      ],
+    };
+  };
+
   return {
     getCatalog(provider, cwd) {
-      return provider === "claude" ? claudeCatalog(cwd) : codexCatalog(cwd);
+      switch (provider) {
+        case "claude":
+          return claudeCatalog(cwd);
+        case "codex":
+          return codexCatalog(cwd);
+        case "agy":
+          return agyCatalog(cwd);
+      }
     },
 
     validateSelection(catalog, input) {
@@ -327,7 +413,7 @@ export function createModelCatalogService(
       const markedDefault = catalog.models.find((candidate) => candidate.isDefault);
       const defaultOption = markedDefault ?? catalog.models[0];
       const option = model
-        ? catalog.models.find((candidate) => candidate.id === model)
+        ? catalog.models.find((candidate) => candidate.id === model) ?? legacyAgyFamily(catalog, model)
         : defaultOption;
       if (model && !option && !catalog.supportsCustomModel) {
         throw new Error(`Model is not available: ${model}`);

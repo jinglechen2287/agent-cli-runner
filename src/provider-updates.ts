@@ -1,5 +1,7 @@
+import { agyManifestUrl, parseAgyManifest, resolveAgyInstall, type AgyInstallMethod } from "./agy-release.js";
 import { errorMessage, isRecord } from "./internal.js";
 import { childEnv, execCli, isMissingExecutable } from "./process.js";
+import type { AgentProvider } from "./providers.js";
 
 const CHECK_TIMEOUT_MS = 5_000;
 // Doctor checks the whole installation, including network and database health.
@@ -9,8 +11,9 @@ const CODEX_DOCTOR_TIMEOUT_MS = 30_000;
  * a host's update state to "running" forever. */
 const APPLY_TIMEOUT_MS = 10 * 60 * 1_000;
 const CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases";
+const AGY_MANIFEST_TIMEOUT_MS = 10_000;
 
-export type ProviderUpdateProvider = "claude" | "codex";
+export type ProviderUpdateProvider = AgentProvider;
 
 export type ProviderUpdateState =
   | "current"
@@ -72,6 +75,7 @@ export interface ProviderUpdateService {
 export interface ProviderUpdateServiceConfig {
   claudePath?: string;
   codexPath?: string;
+  agyPath?: string;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -98,6 +102,8 @@ export interface ProviderUpdateServiceDeps {
   ) => Promise<ProviderUpdateCommandResult>;
   fetchText?: (url: string, options: ProviderUpdateFetchOptions) => Promise<string>;
   now?: () => Date;
+  /** How the agy at this path was installed. */
+  resolveAgyInstall?: (executable: string, env: NodeJS.ProcessEnv) => Promise<AgyInstallMethod>;
 }
 
 interface ParsedSemver {
@@ -309,6 +315,7 @@ export function createProviderUpdateService(
   const fetchText = deps.fetchText ?? defaultFetchText;
   const now = deps.now ?? (() => new Date());
   const baseEnv = config.env ?? process.env;
+  const agyInstall = deps.resolveAgyInstall ?? resolveAgyInstall;
 
   async function installedVersion(
     provider: ProviderUpdateProvider,
@@ -413,15 +420,53 @@ export function createProviderUpdateService(
     });
   }
 
+  /** agy publishes one release line through its auto-updater manifest. A
+   * Homebrew cask can lag that manifest, so a Homebrew install reports
+   * unsupported_installation instead of an update brew can't yet install. */
+  async function checkAgy(checkedAt: string): Promise<ProviderUpdateStatus> {
+    const executable = executableFor("agy");
+    const env = childEnv("agy", baseEnv);
+    const installed = await installedVersion("agy", executable, env, checkedAt);
+    if ("state" in installed) return installed;
+    const method = await agyInstall(executable, env).catch((): AgyInstallMethod => "unknown");
+    if (method === "homebrew") {
+      return unknownStatus("agy", checkedAt, "unsupported_installation", installed.version);
+    }
+    const url = agyManifestUrl();
+    let latest: ParsedSemver | null = null;
+    if (url) {
+      try {
+        const version = parseAgyManifest(await fetchText(url, { timeoutMs: AGY_MANIFEST_TIMEOUT_MS }));
+        latest = version ? parseVersion(version) : null;
+      } catch {
+        latest = null;
+      }
+    }
+    if (!latest) return unknownStatus("agy", checkedAt, "version_unavailable", installed.version);
+    return statusFromVersions({ provider: "agy", installed, latest, channel: null, checkedAt });
+  }
+
   const check = async (provider: ProviderUpdateProvider): Promise<ProviderUpdateStatus> => {
     const checkedAt = now().toISOString();
-    return provider === "claude" ? checkClaude(checkedAt) : checkCodex(checkedAt);
+    switch (provider) {
+      case "claude":
+        return checkClaude(checkedAt);
+      case "codex":
+        return checkCodex(checkedAt);
+      case "agy":
+        return checkAgy(checkedAt);
+    }
   };
 
   function executableFor(provider: ProviderUpdateProvider): string {
-    return provider === "claude"
-      ? config.claudePath ?? "claude"
-      : config.codexPath ?? "codex";
+    switch (provider) {
+      case "claude":
+        return config.claudePath ?? "claude";
+      case "codex":
+        return config.codexPath ?? "codex";
+      case "agy":
+        return config.agyPath ?? "agy";
+    }
   }
 
   function refusal(
@@ -527,6 +572,24 @@ export function createProviderUpdateService(
       }
     }
 
+    if (provider === "agy") {
+      const method = await agyInstall(executable, env).catch((): AgyInstallMethod => "unknown");
+      if (method === "homebrew") {
+        return refusal(
+          provider,
+          "unsupported_installation",
+          "agy was installed with Homebrew; update it with `brew upgrade --cask antigravity-cli`.",
+        );
+      }
+      if (method === "unknown") {
+        return refusal(
+          provider,
+          "install_method_unknown",
+          "Could not tell how agy was installed, so its updater was not run.",
+        );
+      }
+    }
+
     let command: ProviderUpdateCommandResult;
     try {
       command = await runCommand(executable, ["update"], {
@@ -556,6 +619,7 @@ export function createProviderUpdateService(
     checkAll: () => Promise.all([
       check("claude"),
       check("codex"),
+      check("agy"),
     ]),
     apply,
   };

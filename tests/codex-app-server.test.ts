@@ -25,7 +25,7 @@ function completedTurn(id: string, status = "completed") {
 }
 
 describe("forked Codex side runs", () => {
-  function forkServer(child: FakeChild, onTurnStart: (id: number | undefined) => void) {
+  function forkServer(child: FakeChild, onTurnStart: (id: number | string | undefined) => void) {
     return captureRequests(child, (message) => {
       if (message.method === "initialize") {
         send(child, { id: message.id, result: {} });
@@ -2940,7 +2940,7 @@ describe("CodexAppServerSession.compact", () => {
   const THREAD = "thread-compact";
   /** A session whose `thread/compact/start` the test answers; `onCompact`
    * decides what the app-server does after it. */
-  async function compactSession(onCompact: (child: FakeChild, id: number | undefined) => void) {
+  async function compactSession(onCompact: (child: FakeChild, id: number | string | undefined) => void) {
     const child = makeFakeChild();
     const requests = captureRequests(child, (message) => {
       if (message.method === "initialize") {
@@ -3193,7 +3193,7 @@ describe("CodexAppServerSession.compact", () => {
 
 describe("CodexAppServerSession archive", () => {
   /** An app-server that answers one turn on thread-arch, and archive as `archive` says. */
-  function archiveServer(child: FakeChild, archive: (id: number | undefined) => void = (id) => send(child, { id, result: {} })) {
+  function archiveServer(child: FakeChild, archive: (id: number | string | undefined) => void = (id) => send(child, { id, result: {} })) {
     child.kill = vi.fn(() => {
       child.emit("close", 0);
       return true;

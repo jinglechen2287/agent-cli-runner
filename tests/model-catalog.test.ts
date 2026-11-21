@@ -290,3 +290,68 @@ describe("model catalog custom-model selection", () => {
       .toEqual({ model: "claude-opus-4-5", effort: "high", serviceTier: null });
   });
 });
+
+describe("agy model catalog", () => {
+  const discovered = [
+    { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", efforts: ["low", "medium", "high"], defaultEffort: "high", isCurrent: true },
+    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Thinking)", efforts: [], isCurrent: false },
+  ];
+
+  it("lists a default entry first, then every model with its thinking levels", async () => {
+    const service = createModelCatalogService({ agyPath: "/bin/agy" }, {
+      listAgyModels: async (path, cwd) => {
+        expect([path, cwd]).toEqual(["/bin/agy", "/tmp"]);
+        return discovered;
+      },
+    });
+    const catalog = await service.getCatalog("agy", "/tmp");
+    expect(catalog).toMatchObject({ provider: "agy", source: "agy-acp", supportsCustomModel: false });
+    expect(catalog.models.map((model) => [model.id, model.isDefault, model.efforts.map((effort) => effort.id), model.defaultEffort]))
+      .toEqual([
+        ["default", true, ["low", "medium", "high"], "high"],
+        ["gemini-3.8-flash", false, ["low", "medium", "high"], "high"],
+        ["claude-sonnet-4-6", false, [], null],
+      ]);
+    expect(catalog.models[0]?.label).toContain("Gemini 3.8 Flash");
+    expect(service.validateSelection(catalog, { model: "default" })).toEqual({ model: "default", effort: "high", serviceTier: null });
+    expect(() => service.validateSelection(catalog, { model: "nope" })).toThrow();
+  });
+
+  it("advertises the host's default effort when the model offers it", async () => {
+    const service = createModelCatalogService({ defaultEffort: "low" }, { listAgyModels: async () => discovered });
+    const catalog = await service.getCatalog("agy", "/tmp");
+    expect(catalog.models.find((model) => model.id === "gemini-3.8-flash")?.defaultEffort).toBe("low");
+    expect(catalog.models.find((model) => model.id === "claude-sonnet-4-6")?.defaultEffort).toBeNull();
+  });
+
+  it("labels the default entry plainly when agy names no current model, and drops an unlisted default effort", async () => {
+    const service = createModelCatalogService({ defaultEffort: "max" }, {
+      listAgyModels: async () => [
+        { ...discovered[0]!, isCurrent: false, defaultEffort: "max" },
+        discovered[1]!,
+      ],
+    });
+    const catalog = await service.getCatalog("agy", "/tmp");
+    expect(catalog.models[0]).toMatchObject({ id: "default", label: "Default", efforts: [], defaultEffort: null });
+    expect(catalog.models.find((model) => model.id === "gemini-3.8-flash")?.defaultEffort).toBeNull();
+  });
+
+  it("accepts a legacy id whose family is listed, as the session does", async () => {
+    const service = createModelCatalogService({}, { listAgyModels: async () => discovered });
+    const catalog = await service.getCatalog("agy", "/tmp");
+    expect(service.validateSelection(catalog, { model: "gemini-3.8-flash-high" }))
+      .toEqual({ model: "gemini-3.8-flash-high", effort: "high", serviceTier: null });
+    expect(() => service.validateSelection(catalog, { model: "gemini-3.8" })).toThrow();
+    expect(() => service.validateSelection(catalog, { model: "default-x" })).toThrow();
+  });
+
+  it("falls back to the configured model, or rethrows without one", async () => {
+    const failing = async () => { throw new Error("agy needs you to sign in"); };
+    const configured = createModelCatalogService({ agyModel: "gemini-3.8-flash" }, { listAgyModels: failing });
+    const catalog = await configured.getCatalog("agy", "/tmp");
+    expect(catalog.source).toBe("agy-config");
+    expect(catalog.models.map((model) => [model.id, model.isDefault])).toEqual([["gemini-3.8-flash", true]]);
+    const bare = createModelCatalogService({}, { listAgyModels: failing });
+    await expect(bare.getCatalog("agy", "/tmp")).rejects.toThrow("sign in");
+  });
+});
