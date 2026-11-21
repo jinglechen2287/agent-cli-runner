@@ -709,7 +709,8 @@ async function openSession(context: OpenContext): Promise<AgySession> {
     commandHoldTimer = setTimeout(() => {
       commandHoldTimer = undefined;
       if (run !== target || target.done.settled || !target.holding) return;
-      const replying = target.repliedSinceAnswer && (target.replyOpen || replyTimer !== undefined);
+      // A reply holds the turn while its quiet timer runs; once that has run out, a reply agy never closed holds it no longer.
+      const replying = target.repliedSinceAnswer && replyTimer !== undefined;
       // Something else holds the turn, or nothing does yet: wait again, since a reply to a subagent can still leave a command running after it.
       if (!heldTools(target) || runningAgents(target).length > 0 || replying || pendingPermissions > 0) {
         armCommandHold(target);

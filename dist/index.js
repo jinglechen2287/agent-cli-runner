@@ -3405,7 +3405,7 @@ async function openSession(context) {
     commandHoldTimer = setTimeout(() => {
       commandHoldTimer = void 0;
       if (run !== target || target.done.settled || !target.holding) return;
-      const replying = target.repliedSinceAnswer && (target.replyOpen || replyTimer !== void 0);
+      const replying = target.repliedSinceAnswer && replyTimer !== void 0;
       if (!heldTools(target) || runningAgents(target).length > 0 || replying || pendingPermissions > 0) {
         armCommandHold(target);
         return;

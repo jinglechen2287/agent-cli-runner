@@ -676,6 +676,39 @@ describe("background work", () => {
     await session.close();
   });
 
+  it("stops waiting for a held command whose output went quiet without a usage update", async () => {
+    const command = { toolCallId: "call_c", name: "run_command", kind: "execute", title: "npm run watch", rawInput: { CommandLine: "npm run watch" } };
+    const agy = setup({
+      onPrompt(message, fake) {
+        fake.update({ sessionUpdate: "tool_call", ...command, status: "in_progress" });
+        fake.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Watching." } });
+        fake.respond(message.id, { stopReason: "end_turn" });
+      },
+    });
+    const session = await open(agy, { commandHoldMs: 50 });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let ended = false;
+      const turn = session.runTurn({ prompt: "go" });
+      void turn.then(() => { ended = true; }, () => {});
+      // agy has answered and the turn holds for the command, which takes real time to read.
+      const settleBy = Date.now() + 200;
+      while (Date.now() < settleBy) await new Promise((resolve) => setImmediate(resolve));
+      // The command prints, and then nothing more comes: no usage update closes that reply.
+      agy.update({ sessionUpdate: "tool_call_update", ...command, status: "in_progress", rawOutput: { output: "compiled" } });
+      await vi.advanceTimersByTimeAsync(120_000);
+      for (let step = 0; step < 100 && !ended; step++) {
+        await vi.advanceTimersByTimeAsync(50);
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(ended).toBe(true);
+      expect((await turn).text).toBe("Watching.");
+    } finally {
+      vi.useRealTimers();
+    }
+    await session.close();
+  });
+
   it("refuses a commandHoldMs that isn't a positive number", async () => {
     const agy = setup();
     await expect(open(agy, { commandHoldMs: 0 })).rejects.toThrow(/commandHoldMs/);
