@@ -2,7 +2,8 @@
  * agy reports a subagent launch as an ordinary tool call and never says when
  * the subagent finishes. It does record both on disk, under its brain/ tree:
  * the subagent's record, the launch message in the subagent's inbox, and the
- * subagent's reports in the parent's inbox. Ported from T3 Code's
+ * subagent's reports in the parent's inbox, or agy's notice there that the
+ * subagent went idle. Ported from T3 Code's
  * AntigravityChildWork (agy 1.5 layout).
  */
 import { readdir, readFile, stat } from "node:fs/promises";
@@ -66,6 +67,19 @@ function timeOf(message: Record<string, unknown>): number {
   return typeof message.timestamp === "string" ? Date.parse(message.timestamp) : Number.NaN;
 }
 
+/** What `childId` reported in a parent-inbox message, if it is a report:
+ * the child's own message, or agy's notice that the child went idle, which
+ * quotes the child's last response. agy 1.5.13 sends either. */
+function reportFrom(message: Record<string, unknown>, childId: string): { content: string; notice: boolean } | undefined {
+  if (typeof message.content !== "string") return undefined;
+  if (message.sender === childId) return { content: message.content, notice: false };
+  if (message.sender !== "system") return undefined;
+  const idle = `Subagent ${childId} has gone idle.`;
+  if (!message.content.startsWith(idle)) return undefined;
+  const quoted = message.content.slice(idle.length).replace(/^\s*This was the subagent's most recent response:\s*/, "");
+  return { content: quoted.trim(), notice: true };
+}
+
 function launchToolCallId(message: Record<string, unknown>): string | undefined {
   const tool = isRecord(message.sourceMetadata) ? message.sourceMetadata.tool : undefined;
   const toolCall = isRecord(tool) ? tool.toolCall : undefined;
@@ -104,8 +118,10 @@ export async function readAgyChildren(
 
     const descriptor = isRecord(record.subagentDescriptor) ? record.subagentDescriptor : {};
     const reports = parentInbox
-      .filter((message) => message.sender === childId && typeof message.content === "string")
-      .map((message) => ({ content: message.content as string, at: timeOf(message) }))
+      .flatMap((message) => {
+        const report = reportFrom(message, childId);
+        return report ? [{ ...report, at: timeOf(message) }] : [];
+      })
       .sort((a, b) => (Number.isNaN(a.at) ? 0 : a.at) - (Number.isNaN(b.at) ? 0 : b.at));
     const killed = record.state === "SUBAGENT_STATE_KILLED";
     launchesOfChild.forEach((launch, index) => {
@@ -114,7 +130,8 @@ export async function readAgyChildren(
       const own = reports.filter((report) =>
         (Number.isNaN(launch.at) || Number.isNaN(report.at) || report.at >= launch.at)
         && (next === undefined || Number.isNaN(next) || Number.isNaN(report.at) || report.at < next));
-      const newest = own.at(-1);
+      // The child's own words win; agy's idle notice stands in without them.
+      const newest = own.filter((report) => !report.notice).at(-1) ?? own.at(-1);
       // A kill applies to the child's newest launch.
       const state: AgyChildState["state"] = killed && next === undefined
         ? "killed"

@@ -294,6 +294,12 @@ interface Run {
   /** Subagents this run started. */
   agents: Set<string>;
   holding: boolean;
+  /** Every prompt has answered: what agy sends now are replies of its own. */
+  answered: boolean;
+  /** agy has sent output since its last usage update. */
+  replyOpen: boolean;
+  /** agy has sent output of its own since every prompt answered. */
+  repliedSinceAnswer: boolean;
   cancelRequested: boolean;
   interruption?: Error;
   usage?: TokenUsage;
@@ -737,6 +743,9 @@ async function openSession(context: OpenContext): Promise<AgySession> {
         target.holding = true;
         armInactivity();
         armHoldCheck(target);
+        // A reply agy sent while this read its files has no check left to
+        // end the hold once its quiet time ran out: start one.
+        if (target.repliedSinceAnswer && !replyTimer) armReplyEnd(target, target.replyOpen);
         return;
       }
       await settleSuccess(target);
@@ -761,7 +770,10 @@ async function openSession(context: OpenContext): Promise<AgySession> {
         if (steer && !steer.settled) steer.resolve();
         // The earlier prompt answering means agy took the steer.
         if (!steer) for (const pending of target.steers.splice(0)) pending.resolve();
-        if (target.outstanding === 0) void promptsAnswered(target);
+        if (target.outstanding === 0) {
+          target.answered = true;
+          void promptsAnswered(target);
+        }
       },
       (error: unknown) => {
         target.outstanding -= 1;
@@ -771,7 +783,10 @@ async function openSession(context: OpenContext): Promise<AgySession> {
         } else {
           target.promptError = failure;
         }
-        if (target.outstanding === 0) void promptsAnswered(target);
+        if (target.outstanding === 0) {
+          target.answered = true;
+          void promptsAnswered(target);
+        }
       },
     );
     if (steer && previous) target.steers.push(steer);
@@ -895,7 +910,12 @@ async function openSession(context: OpenContext): Promise<AgySession> {
     let target = run;
     if (!target && isOutput(kind)) target = startContinuation("output");
     if (target) armInactivity();
-    if (target && (target.holding || target.kind === "continuation") && (isOutput(kind) || kind === "usage_update")) {
+    if (target && isOutput(kind)) {
+      target.replyOpen = true;
+      if (target.answered) target.repliedSinceAnswer = true;
+    }
+    if (target && kind === "usage_update") target.replyOpen = false;
+    if (target && (target.answered || target.kind === "continuation") && (isOutput(kind) || kind === "usage_update")) {
       // A usage update closes the reply unless a tool is still running.
       armReplyEnd(target, kind !== "usage_update" || waitedTools(target) > 0);
     }
@@ -935,6 +955,9 @@ async function openSession(context: OpenContext): Promise<AgySession> {
         if (!target) return;
         target.usage = lastUsage;
         const usage = lastUsage;
+        // A reply agy sends by itself ends at its usage update: its text is
+        // one message, whatever the quiet time then decides about the run.
+        if (target.answered || target.kind === "continuation") flush(target);
         safeCallback(() => target.callbacks.onUsage?.(usage));
         return;
       }
@@ -1154,6 +1177,9 @@ async function openSession(context: OpenContext): Promise<AgySession> {
       openTools: new Set(),
       agents: new Set(),
       holding: false,
+      answered: false,
+      replyOpen: false,
+      repliedSinceAnswer: false,
       cancelRequested: false,
       compactionReported: false,
       ended: new AbortController(),
@@ -1245,7 +1271,12 @@ async function openSession(context: OpenContext): Promise<AgySession> {
       }
       if (kind === "compact" && lastUsage) target.usedBefore = lastUsage.contextTokens;
       await recordStepIndex(target);
-      if (target.done.settled) return;
+      // agy sends no compaction event: the attempt starts with the /compact
+      // prompt. Fired before the last check, so an abort from it sends nothing.
+      if (kind === "compact" && !target.done.settled) {
+        safeCallback(() => target.callbacks.onCompactionStart?.({ trigger: "manual" }));
+      }
+      if (target.done.settled || target.interruption) return;
       sendPrompt(target, blocks);
       armInactivity();
     };

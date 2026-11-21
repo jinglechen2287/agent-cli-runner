@@ -170,9 +170,15 @@ await step("S26", async () => {
   try {
     await session.runTurn({ prompt: "Write four sentences about rivers." });
     const compactions = [];
-    const result = await session.compact({ instructions: "keep only the topic", onCompaction: (info) => compactions.push(info) });
+    const starts = [];
+    const result = await session.compact({
+      instructions: "keep only the topic",
+      onCompactionStart: (info) => starts.push(info),
+      onCompaction: (info) => compactions.push(info),
+    });
     assert(result.text === "", `compact text ${JSON.stringify(result.text)}`);
-    return { compactions, usage: result.usage };
+    assert(starts.length === 1 && starts[0].trigger === "manual", `starts were ${JSON.stringify(starts)}`);
+    return { starts, compactions, usage: result.usage };
   } finally {
     await session.close();
   }

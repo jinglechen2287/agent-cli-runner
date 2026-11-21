@@ -244,7 +244,6 @@ describe("model, effort and mode", () => {
     await expect(first).rejects.toBeInstanceOf(AbortError);
     const second = session.runTurn({ prompt: "y" });
     await tick();
-    expect(agy.prompts()).toHaveLength(0);
     agy.respond(held[0]!.id, { configOptions: configOptions({ model: "claude-sonnet-4-6" }) });
     expect((await second).text).toBe("ok");
     expect(agy.prompts()).toHaveLength(1);
@@ -543,6 +542,39 @@ describe("background work", () => {
     await session.close();
   });
 
+  it("keeps two replies apart when the second starts before the first's quiet time is over", async () => {
+    const dir = home();
+    const root = join(dir, ".gemini", "antigravity-cli");
+    const agy = setup({
+      onPrompt(message, fake) {
+        for (const [id, role] of [["call_a", "A"], ["call_b", "B"]] as const) {
+          fake.update({ sessionUpdate: "tool_call", ...subagentCall(id, role), status: "in_progress" });
+          fake.update({ sessionUpdate: "tool_call_update", ...subagentCall(id, role), status: "completed" });
+        }
+        for (const [child, call] of [["a-1", "call_a"], ["b-1", "call_b"]] as const) {
+          writeSubagent(root, SESSION, child);
+          writeLaunchMessage(root, SESSION, child, call);
+        }
+        fake.respond(message.id, { stopReason: "end_turn" });
+      },
+    });
+    const session = await open(agy, { env: { HOME: dir }, replyQuietMs: 200 });
+    const texts: string[] = [];
+    const updates: BackgroundAgentInfo[] = [];
+    const turn = session.runTurn({ prompt: "go", onAssistantText: (text) => texts.push(text), onBackgroundAgentUpdate: (info) => updates.push(info) });
+    await vi.waitFor(() => expect(updates.filter((info) => info.status === "running")).toHaveLength(2));
+    await tick();
+    writeReport(root, SESSION, "a-1", "m1", "a-done", "2026-11-20T22:04:22.957Z");
+    writeReport(root, SESSION, "b-1", "m2", "b-done", "2026-11-20T22:04:23.957Z");
+    agy.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "A reported." } });
+    agy.update({ sessionUpdate: "usage_update", used: 100, size: 1_048_576 });
+    agy.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "B reported." } });
+    agy.update({ sessionUpdate: "usage_update", used: 120, size: 1_048_576 });
+    expect((await turn).text).toBe("B reported.");
+    expect(texts).toEqual(["A reported.", "B reported."]);
+    await session.close();
+  });
+
   it("resolves at once when the subagent had already reported", async () => {
     const dir = home();
     const root = join(dir, ".gemini", "antigravity-cli");
@@ -788,7 +820,8 @@ describe("abort and timeout", () => {
     const controller = new AbortController();
     await expect(session.runTurn({ prompt: "x", signal: controller.signal, onSessionId: () => controller.abort() }))
       .rejects.toBeInstanceOf(AbortError);
-    expect(agy.prompts()).toHaveLength(0);
+    await session.runTurn({ prompt: "next" });
+    expect(agy.prompts().map((message) => (message.params?.prompt as Array<{ text: string }>)[0]!.text)).toEqual(["next"]);
     await session.close();
   });
 
@@ -899,10 +932,29 @@ describe("compaction", () => {
     const session = await open(agy);
     await session.runTurn({ prompt: "warm up" });
     const compactions: unknown[] = [];
-    const result = await session.compact({ instructions: "keep API notes", onCompaction: (info) => compactions.push(info) });
+    const events: string[] = [];
+    const result = await session.compact({
+      instructions: "keep API notes",
+      onCompactionStart: (info) => events.push(`start:${info.trigger}:${agy.prompts().length}`),
+      onCompaction: (info) => { compactions.push(info); events.push("done"); },
+    });
     expect(agy.prompts().at(-1)?.params?.prompt).toEqual([{ type: "text", text: "/compact keep API notes" }]);
     expect(result.text).toBe("");
     expect(compactions).toEqual([{ trigger: "manual", preTokens: 15997, postTokens: 10213 }]);
+    // Started as /compact went out, after the warm-up prompt.
+    expect(events).toEqual(["start:manual:1", "done"]);
+    await session.close();
+  });
+
+  it("goes straight to the next turn when onCompactionStart aborts", async () => {
+    const agy = setup({ onPrompt: answer("ok") });
+    const session = await open(agy);
+    await session.runTurn({ prompt: "warm up" });
+    const controller = new AbortController();
+    await expect(session.compact({ signal: controller.signal, onCompactionStart: () => controller.abort() }))
+      .rejects.toBeInstanceOf(AbortError);
+    await session.runTurn({ prompt: "next" });
+    expect(agy.prompts().map((message) => (message.params?.prompt as Array<{ text: string }>)[0]!.text)).toEqual(["warm up", "next"]);
     await session.close();
   });
 

@@ -33,3 +33,18 @@ export function writeReport(root: string, parent: string, child: string, id: str
   writeFileSync(join(dir, `${id}.json`), JSON.stringify({ id, recipient: parent, sender: child, timestamp, content }));
   writeFileSync(join(dir, "read.json"), JSON.stringify({ [id]: true }));
 }
+
+/** agy's notice, from "system", that a child stopped without a report of its own. */
+export function writeIdleNotice(root: string, parent: string, child: string, id: string, response: string, timestamp: string): void {
+  const dir = join(root, "brain", parent, ".system_generated", "messages");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${id}.json`), JSON.stringify({
+    id,
+    recipient: parent,
+    sender: "system",
+    priority: "MESSAGE_PRIORITY_LOW",
+    timestamp,
+    hideFromUser: true,
+    content: `Subagent ${child} has gone idle. This was the subagent's most recent response: ${response}`,
+  }));
+}

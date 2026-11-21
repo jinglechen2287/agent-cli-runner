@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { readAgyChildren } from "../src/agy-children.js";
-import { writeLaunchMessage, writeReport, writeSubagent } from "./helpers/agy-brain.js";
+import { writeIdleNotice, writeLaunchMessage, writeReport, writeSubagent } from "./helpers/agy-brain.js";
 
 const roots: string[] = [];
 function makeRoot(): string {
@@ -86,6 +86,25 @@ describe("readAgyChildren", () => {
     writeReport(root, "parent-1", "c1", "m2", "second", "2026-11-20T22:03:00.000Z");
     children = await readAgyChildren(root, "parent-1", ["call_1", "call_2"]);
     expect(children.get("call_2")).toMatchObject({ state: "reported", summary: "second" });
+  });
+
+  it("counts agy's notice that a child went idle as its report", async () => {
+    const root = makeRoot();
+    writeSubagent(root, "parent-1", "c1");
+    writeLaunchMessage(root, "parent-1", "c1", "call_1", "2026-11-20T22:00:00.000Z");
+    writeSubagent(root, "parent-1", "c2");
+    writeLaunchMessage(root, "parent-1", "c2", "call_2", "2026-11-20T22:00:00.000Z");
+    writeIdleNotice(root, "parent-1", "c1", "n1", "Ancient giants stand,\nCrowned in snow.", "2026-11-20T22:01:00.000Z");
+    const children = await readAgyChildren(root, "parent-1", ["call_1", "call_2"]);
+    expect(children.get("call_1")).toMatchObject({ state: "reported", summary: "Ancient giants stand,\nCrowned in snow." });
+    expect(children.get("call_2")).toMatchObject({ state: "running" });
+
+    // The child's own report wins over a later notice.
+    writeReport(root, "parent-1", "c2", "m2", "the real report", "2026-11-20T22:02:00.000Z");
+    writeIdleNotice(root, "parent-1", "c2", "n2", "Bye.", "2026-11-20T22:03:00.000Z");
+    expect((await readAgyChildren(root, "parent-1", ["call_2"])).get("call_2")).toMatchObject({
+      state: "reported", summary: "the real report",
+    });
   });
 
   it("skips malformed and oversized records", async () => {

@@ -2628,6 +2628,15 @@ function generatedDir(root, conversationId, leaf) {
 function timeOf(message) {
   return typeof message.timestamp === "string" ? Date.parse(message.timestamp) : Number.NaN;
 }
+function reportFrom(message, childId) {
+  if (typeof message.content !== "string") return void 0;
+  if (message.sender === childId) return { content: message.content, notice: false };
+  if (message.sender !== "system") return void 0;
+  const idle = `Subagent ${childId} has gone idle.`;
+  if (!message.content.startsWith(idle)) return void 0;
+  const quoted = message.content.slice(idle.length).replace(/^\s*This was the subagent's most recent response:\s*/, "");
+  return { content: quoted.trim(), notice: true };
+}
 function launchToolCallId(message) {
   const tool = isRecord(message.sourceMetadata) ? message.sourceMetadata.tool : void 0;
   const toolCall = isRecord(tool) ? tool.toolCall : void 0;
@@ -2650,13 +2659,16 @@ async function readAgyChildren(root, rootSessionId, launches) {
     }).sort((a, b) => (Number.isNaN(a.at) ? 0 : a.at) - (Number.isNaN(b.at) ? 0 : b.at));
     if (!launchesOfChild.some((launch) => wanted.has(launch.toolCallId))) continue;
     const descriptor = isRecord(record2.subagentDescriptor) ? record2.subagentDescriptor : {};
-    const reports = parentInbox.filter((message) => message.sender === childId && typeof message.content === "string").map((message) => ({ content: message.content, at: timeOf(message) })).sort((a, b) => (Number.isNaN(a.at) ? 0 : a.at) - (Number.isNaN(b.at) ? 0 : b.at));
+    const reports = parentInbox.flatMap((message) => {
+      const report = reportFrom(message, childId);
+      return report ? [{ ...report, at: timeOf(message) }] : [];
+    }).sort((a, b) => (Number.isNaN(a.at) ? 0 : a.at) - (Number.isNaN(b.at) ? 0 : b.at));
     const killed = record2.state === "SUBAGENT_STATE_KILLED";
     launchesOfChild.forEach((launch, index) => {
       if (!wanted.has(launch.toolCallId)) return;
       const next = launchesOfChild[index + 1]?.at;
       const own = reports.filter((report) => (Number.isNaN(launch.at) || Number.isNaN(report.at) || report.at >= launch.at) && (next === void 0 || Number.isNaN(next) || Number.isNaN(report.at) || report.at < next));
-      const newest = own.at(-1);
+      const newest = own.filter((report) => !report.notice).at(-1) ?? own.at(-1);
       const state = killed && next === void 0 ? "killed" : newest ? "reported" : "running";
       children.set(launch.toolCallId, {
         childId,
@@ -3433,6 +3445,7 @@ async function openSession(context) {
         target.holding = true;
         armInactivity();
         armHoldCheck(target);
+        if (target.repliedSinceAnswer && !replyTimer) armReplyEnd(target, target.replyOpen);
         return;
       }
       await settleSuccess(target);
@@ -3455,7 +3468,10 @@ async function openSession(context) {
         if (isRecord(response)) target.lastResponse = response;
         if (steer && !steer.settled) steer.resolve();
         if (!steer) for (const pending of target.steers.splice(0)) pending.resolve();
-        if (target.outstanding === 0) void promptsAnswered(target);
+        if (target.outstanding === 0) {
+          target.answered = true;
+          void promptsAnswered(target);
+        }
       },
       (error) => {
         target.outstanding -= 1;
@@ -3465,7 +3481,10 @@ async function openSession(context) {
         } else {
           target.promptError = failure;
         }
-        if (target.outstanding === 0) void promptsAnswered(target);
+        if (target.outstanding === 0) {
+          target.answered = true;
+          void promptsAnswered(target);
+        }
       }
     );
     if (steer && previous) target.steers.push(steer);
@@ -3577,7 +3596,12 @@ async function openSession(context) {
     let target = run;
     if (!target && isOutput(kind)) target = startContinuation("output");
     if (target) armInactivity();
-    if (target && (target.holding || target.kind === "continuation") && (isOutput(kind) || kind === "usage_update")) {
+    if (target && isOutput(kind)) {
+      target.replyOpen = true;
+      if (target.answered) target.repliedSinceAnswer = true;
+    }
+    if (target && kind === "usage_update") target.replyOpen = false;
+    if (target && (target.answered || target.kind === "continuation") && (isOutput(kind) || kind === "usage_update")) {
       armReplyEnd(target, kind !== "usage_update" || waitedTools(target) > 0);
     }
     switch (kind) {
@@ -3615,6 +3639,7 @@ async function openSession(context) {
         if (!target) return;
         target.usage = lastUsage;
         const usage = lastUsage;
+        if (target.answered || target.kind === "continuation") flush(target);
         safeCallback(() => target.callbacks.onUsage?.(usage));
         return;
       }
@@ -3804,6 +3829,9 @@ async function openSession(context) {
       openTools: /* @__PURE__ */ new Set(),
       agents: /* @__PURE__ */ new Set(),
       holding: false,
+      answered: false,
+      replyOpen: false,
+      repliedSinceAnswer: false,
       cancelRequested: false,
       compactionReported: false,
       ended: new AbortController(),
@@ -3869,7 +3897,10 @@ ${turnOptions.prompt}` : turnOptions.prompt;
       }
       if (kind === "compact" && lastUsage) target.usedBefore = lastUsage.contextTokens;
       await recordStepIndex(target);
-      if (target.done.settled) return;
+      if (kind === "compact" && !target.done.settled) {
+        safeCallback(() => target.callbacks.onCompactionStart?.({ trigger: "manual" }));
+      }
+      if (target.done.settled || target.interruption) return;
       sendPrompt(target, blocks);
       armInactivity();
     };
