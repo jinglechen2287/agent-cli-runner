@@ -972,10 +972,16 @@ interface CreateAgySessionOptions {
     mode?: AgyMode;
     appendSystemPrompt?: string;
     mcpServers?: AgyMcpServer[];
-    /** Answer every approval agy asks for with "allow once". */
+    /** Answer every approval agy asks for with "allow once", and start agy
+     * with `--dangerously-skip-permissions`, since a subagent's approvals never
+     * reach the host and would otherwise hold its turn forever. */
     dangerouslySkipPermissions?: boolean;
     /** A one-off metadata run: a fresh temp cwd, no tools, nothing left behind. */
     isolated?: boolean;
+    /** A throwaway session in `cwd`, tools and all, whose conversation, brain
+     * and annotation files are deleted when it closes: a side run that leaves
+     * no conversation behind. It cannot resume a session. */
+    ephemeral?: boolean;
     /** Output agy produces while no turn is open (a finished daemon, a late
      * wake). Without it that output is dropped. */
     onContinuation?: (start: {
@@ -985,6 +991,11 @@ interface CreateAgySessionOptions {
     /** How long a turn held for background work waits after agy's reply
      * closes before ending. Default 3 s. */
     replyQuietMs?: number;
+    /** End a turn this long after agy answered when only commands it left
+     * running hold it, so a stray long command can't keep the turn open. What
+     * agy says once they finish goes to `onContinuation`, or is dropped.
+     * Running subagents still hold the turn. Off unless given. */
+    commandHoldMs?: number;
     /** Fail a turn that sees no update for this long while nothing it waits on
      * is open. Off unless given. */
     inactivityTimeoutMs?: number;
@@ -1080,6 +1091,13 @@ interface AgyModelDescriptor {
     /** agy's current model for a new session. */
     isCurrent: boolean;
 }
+/** Every model agy offers this account, with its thinking levels. */
+/** agy's `--app-data-dir` and `--gemini-dir`, for a host whose sessions use
+ * their own profile. */
+interface AgyDiscoveryFolders {
+    appDataDir?: string;
+    geminiDir?: string;
+}
 
 /**
  * Live model discovery for every provider, shared by hosts that let users
@@ -1170,6 +1188,10 @@ interface ModelCatalogConfig {
     configuredModelDescription?: string;
     /** agy binary for ACP discovery. Defaults to "agy" on PATH. */
     agyPath?: string;
+    /** agy's `--app-data-dir` and `--gemini-dir` for discovery, so the catalog
+     * reads the same profile the host's sessions use. */
+    agyAppDataDir?: string;
+    agyGeminiDir?: string;
     /** The catalog's only entry when agy discovery fails. Without it the
      * discovery error is thrown. */
     agyModel?: string;
@@ -1177,7 +1199,7 @@ interface ModelCatalogConfig {
 interface ModelCatalogDeps {
     listCodexModels?: (executablePath: string, cwd: string) => Promise<CodexModelDescriptor[]>;
     getClaudeCapabilities?: (executablePath: string, cwd: string) => Promise<ClaudeCliCapabilities>;
-    listAgyModels?: (executablePath: string, cwd: string) => Promise<AgyModelDescriptor[]>;
+    listAgyModels?: (executablePath: string, cwd: string, folders?: AgyDiscoveryFolders) => Promise<AgyModelDescriptor[]>;
     now?: () => Date;
 }
 interface ClaudeCliCapabilities {

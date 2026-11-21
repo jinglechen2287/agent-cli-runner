@@ -58,4 +58,20 @@ describe("runAgy", () => {
     });
     expect(String(launched?.env.BROWSER)).toContain("-e");
   });
+
+  it("asks agy itself to skip approvals, which its subagents never send over ACP", async () => {
+    const agy = fakeAgy({ onPrompt: answer("ok") });
+    let args: readonly string[] | undefined;
+    await runAgy({
+      prompt: "x",
+      cwd: "/tmp/project",
+      dangerouslySkipPermissions: true,
+      stepReader: null,
+      spawnFn: ((_command: string, launched: readonly string[]) => {
+        args = launched;
+        return agy.child as never;
+      }) as never,
+    });
+    expect(args).toEqual(["acp", "--dangerously-skip-permissions"]);
+  });
 });

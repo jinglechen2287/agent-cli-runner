@@ -24,9 +24,8 @@ export interface AgyChildState {
   reportedAt?: number;
 }
 
-/** The newest `MAX_FILES` JSON records in `dir`: a session's inbox only
- * grows, and the reports that matter are the latest ones. */
-async function readJsonFiles(dir: string | undefined): Promise<Array<Record<string, unknown>>> {
+/** The newest `limit` JSON records in `dir`, `MAX_FILES` unless given: a session's inbox only grows, and the reports that matter are the latest ones. */
+async function readJsonFiles(dir: string | undefined, limit = MAX_FILES): Promise<Array<Record<string, unknown>>> {
   if (!dir) return [];
   let names: string[];
   try {
@@ -47,7 +46,7 @@ async function readJsonFiles(dir: string | undefined): Promise<Array<Record<stri
   }
   files.sort((a, b) => b.modified - a.modified);
   const records: Array<Record<string, unknown>> = [];
-  for (const { path, size } of files.slice(0, MAX_FILES)) {
+  for (const { path, size } of files.slice(0, limit)) {
     if (size > MAX_FILE_BYTES) continue;
     try {
       const value: unknown = JSON.parse(await readFile(path, "utf8"));
@@ -84,6 +83,15 @@ function launchToolCallId(message: Record<string, unknown>): string | undefined 
   const tool = isRecord(message.sourceMetadata) ? message.sourceMetadata.tool : undefined;
   const toolCall = isRecord(tool) ? tool.toolCall : undefined;
   return isRecord(toolCall) && typeof toolCall.id === "string" ? toolCall.id : undefined;
+}
+
+/** Every conversation `sessionId` launched as a subagent, as agy's own records
+ * name them. Fails soft: anything unreadable names no child. */
+export async function listAgyChildIds(root: string, sessionId: string): Promise<string[]> {
+  if (!isAgyId(sessionId)) return [];
+  // Every one, not the newest few: a child left out would keep its files after its parent's are gone.
+  const records = await readJsonFiles(await generatedDir(root, sessionId, "subagents"), Number.POSITIVE_INFINITY);
+  return [...new Set(records.flatMap((record) => typeof record.conversationId === "string" && isAgyId(record.conversationId) ? [record.conversationId] : []))];
 }
 
 /** The subagents `rootSessionId` launched through the tool calls in

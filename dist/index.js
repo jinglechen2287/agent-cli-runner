@@ -2416,6 +2416,7 @@ function agyAcpLaunch(options) {
   const args = ["acp"];
   if (options.geminiDir) args.push("--gemini-dir", options.geminiDir);
   if (options.appDataDir) args.push("--app-data-dir", options.appDataDir);
+  if (options.skipPermissions) args.push("--dangerously-skip-permissions");
   const env = childEnv("agy", options.env ?? process.env);
   env.AGY_CLI_DISABLE_AUTO_UPDATE = "1";
   if (options.geminiDir) env.GEMINI_HOME = options.geminiDir;
@@ -2592,7 +2593,7 @@ async function literalPath(root, segments) {
 // src/agy-children.ts
 var MAX_FILES = 256;
 var MAX_FILE_BYTES = 1024 * 1024;
-async function readJsonFiles(dir) {
+async function readJsonFiles(dir, limit = MAX_FILES) {
   if (!dir) return [];
   let names;
   try {
@@ -2612,7 +2613,7 @@ async function readJsonFiles(dir) {
   }
   files.sort((a, b) => b.modified - a.modified);
   const records = [];
-  for (const { path, size } of files.slice(0, MAX_FILES)) {
+  for (const { path, size } of files.slice(0, limit)) {
     if (size > MAX_FILE_BYTES) continue;
     try {
       const value = JSON.parse(await readFile(path, "utf8"));
@@ -2641,6 +2642,11 @@ function launchToolCallId(message) {
   const tool = isRecord(message.sourceMetadata) ? message.sourceMetadata.tool : void 0;
   const toolCall = isRecord(tool) ? tool.toolCall : void 0;
   return isRecord(toolCall) && typeof toolCall.id === "string" ? toolCall.id : void 0;
+}
+async function listAgyChildIds(root, sessionId) {
+  if (!isAgyId(sessionId)) return [];
+  const records = await readJsonFiles(await generatedDir(root, sessionId, "subagents"), Number.POSITIVE_INFINITY);
+  return [...new Set(records.flatMap((record2) => typeof record2.conversationId === "string" && isAgyId(record2.conversationId) ? [record2.conversationId] : []))];
 }
 async function readAgyChildren(root, rootSessionId, launches) {
   const children = /* @__PURE__ */ new Map();
@@ -3030,8 +3036,10 @@ function acpMcpServers(servers) {
     return { name: server.name, command: server.command, args: server.args ?? [], env: pairs(server.env) };
   });
 }
-async function removeAgySessionFiles(root, sessionId) {
-  if (!isAgyId(sessionId)) return;
+async function removeAgySessionFiles(root, sessionId, removed = /* @__PURE__ */ new Set()) {
+  if (!isAgyId(sessionId) || removed.has(sessionId)) return;
+  removed.add(sessionId);
+  for (const child of await listAgyChildIds(root, sessionId)) await removeAgySessionFiles(root, child, removed);
   const remove = async (segments, recursive = false) => {
     const path = join2(root, ...segments);
     try {
@@ -3080,6 +3088,10 @@ async function imageBlock(path) {
   return { type: "image", mimeType, data: (await readFile2(path)).toString("base64") };
 }
 async function createAgySession(options) {
+  if (options.commandHoldMs !== void 0 && !(Number.isFinite(options.commandHoldMs) && options.commandHoldMs > 0)) {
+    throw new Error("commandHoldMs must be a positive number of milliseconds");
+  }
+  if (options.ephemeral && options.resumeSessionId) throw new Error("ephemeral agy sessions cannot resume a session");
   if (options.isolated) {
     if (options.resumeSessionId) throw new Error("isolated agy runs cannot resume a session");
     if (options.mcpServers?.length) throw new Error("isolated agy runs cannot take MCP servers");
@@ -3103,7 +3115,8 @@ async function createAgySession(options) {
       ...options.signal ? { signal: options.signal } : {},
       ...options.geminiDir ? { geminiDir: options.geminiDir } : {},
       ...options.appDataDir ? { appDataDir: options.appDataDir } : {},
-      ...options.authMethod ? { authMethod: options.authMethod } : {}
+      ...options.authMethod ? { authMethod: options.authMethod } : {},
+      ...options.dangerouslySkipPermissions ? { skipPermissions: true } : {}
     });
   } catch (error) {
     await removeTempCwd();
@@ -3129,7 +3142,7 @@ async function createAgySession(options) {
     });
   } catch (error) {
     client.close();
-    if (options.isolated && openedId) {
+    if ((options.isolated || options.ephemeral) && openedId) {
       await whenExited;
       await removeAgySessionFiles(root, openedId);
     }
@@ -3174,6 +3187,7 @@ async function openSession(context) {
   let inactivityTimer;
   let replyTimer;
   let holdTimer;
+  let commandHoldTimer;
   const currentModel = () => {
     const option = findOption(configOptions, "model");
     return sentValues.get(option?.id ?? "model") ?? option?.currentValue;
@@ -3275,6 +3289,8 @@ async function openSession(context) {
     }
     if (holdTimer) clearTimeout(holdTimer);
     holdTimer = void 0;
+    if (commandHoldTimer) clearTimeout(commandHoldTimer);
+    commandHoldTimer = void 0;
     for (const id of target.agents) {
       if (agents.get(id)?.info.status === "running") continue;
       agents.delete(id);
@@ -3382,6 +3398,22 @@ async function openSession(context) {
     }, HOLD_CHECK_MS);
     holdTimer.unref?.();
   };
+  const armCommandHold = (target) => {
+    const limit = options.commandHoldMs;
+    if (limit === void 0) return;
+    if (commandHoldTimer) clearTimeout(commandHoldTimer);
+    commandHoldTimer = setTimeout(() => {
+      commandHoldTimer = void 0;
+      if (run !== target || target.done.settled || !target.holding) return;
+      const replying = target.repliedSinceAnswer && (target.replyOpen || replyTimer !== void 0);
+      if (!heldTools(target) || runningAgents(target).length > 0 || replying || pendingPermissions > 0) {
+        armCommandHold(target);
+        return;
+      }
+      void settleSuccess(target);
+    }, limit);
+    commandHoldTimer.unref?.();
+  };
   const dbPath = () => isAgyId(sessionId) ? join2(root, "conversations", `${sessionId}.db`) : void 0;
   const recordStepIndex = async (target) => {
     const path = dbPath();
@@ -3445,6 +3477,7 @@ async function openSession(context) {
         target.holding = true;
         armInactivity();
         armHoldCheck(target);
+        armCommandHold(target);
         if (target.repliedSinceAnswer && !replyTimer) armReplyEnd(target, target.replyOpen);
         return;
       }
@@ -3925,7 +3958,7 @@ ${turnOptions.prompt}` : turnOptions.prompt;
       }
       client.close();
       await whenExited;
-      if (isolated) await removeAgySessionFiles(root, sessionId);
+      if (isolated || options.ephemeral) await removeAgySessionFiles(root, sessionId);
       await context.removeTempCwd();
     })();
     return closePromise;
@@ -5009,11 +5042,11 @@ function selectOption(options, category) {
     values
   };
 }
-async function listAgyModels(executablePath, _cwd) {
+async function listAgyModels(executablePath, _cwd, folders = {}) {
   const cwd = await mkdtemp2(join3(tmpdir2(), "agent-cli-runner-agy-"));
   const env = process.env;
   try {
-    const { client, whenExited } = await startAgyAcp({ executablePath, cwd, env });
+    const { client, whenExited } = await startAgyAcp({ executablePath, cwd, env, ...folders });
     let sessionId;
     const deadline = setTimeout(() => client.close(), DISCOVERY_TIMEOUT_MS);
     deadline.unref?.();
@@ -5048,7 +5081,7 @@ async function listAgyModels(executablePath, _cwd) {
       });
       client.close();
       await whenExited;
-      if (sessionId) await removeAgySessionFiles(agyDataRoot({ env }), sessionId);
+      if (sessionId) await removeAgySessionFiles(agyDataRoot({ env, ...folders }), sessionId);
     }
   } finally {
     await rm2(cwd, { recursive: true, force: true }).catch(() => {
@@ -5230,7 +5263,11 @@ function createModelCatalogService(config = {}, deps = {}) {
     const defaultEffortFor = (model) => hostDefaultEffort && model.efforts.includes(hostDefaultEffort) ? hostDefaultEffort : model.defaultEffort && model.efforts.includes(model.defaultEffort) ? model.defaultEffort : null;
     let discovered;
     try {
-      discovered = await discoverAgy(config.agyPath ?? "agy", cwd);
+      const folders = {
+        ...config.agyAppDataDir ? { appDataDir: config.agyAppDataDir } : {},
+        ...config.agyGeminiDir ? { geminiDir: config.agyGeminiDir } : {}
+      };
+      discovered = Object.keys(folders).length > 0 ? await discoverAgy(config.agyPath ?? "agy", cwd, folders) : await discoverAgy(config.agyPath ?? "agy", cwd);
     } catch (error) {
       if (!configuredModel) throw error;
       return {

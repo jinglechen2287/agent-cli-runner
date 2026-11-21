@@ -13,7 +13,7 @@
  * CLI/config decide".
  */
 
-import { listAgyModels, type AgyModelDescriptor } from "./agy-models.js";
+import { listAgyModels, type AgyDiscoveryFolders, type AgyModelDescriptor } from "./agy-models.js";
 import { createCodexAppServerClient } from "./codex-client.js";
 import { childEnv, execCli } from "./process.js";
 import type { AgentProvider } from "./providers.js";
@@ -115,6 +115,10 @@ export interface ModelCatalogConfig {
   configuredModelDescription?: string;
   /** agy binary for ACP discovery. Defaults to "agy" on PATH. */
   agyPath?: string;
+  /** agy's `--app-data-dir` and `--gemini-dir` for discovery, so the catalog
+   * reads the same profile the host's sessions use. */
+  agyAppDataDir?: string;
+  agyGeminiDir?: string;
   /** The catalog's only entry when agy discovery fails. Without it the
    * discovery error is thrown. */
   agyModel?: string;
@@ -123,7 +127,7 @@ export interface ModelCatalogConfig {
 export interface ModelCatalogDeps {
   listCodexModels?: (executablePath: string, cwd: string) => Promise<CodexModelDescriptor[]>;
   getClaudeCapabilities?: (executablePath: string, cwd: string) => Promise<ClaudeCliCapabilities>;
-  listAgyModels?: (executablePath: string, cwd: string) => Promise<AgyModelDescriptor[]>;
+  listAgyModels?: (executablePath: string, cwd: string, folders?: AgyDiscoveryFolders) => Promise<AgyModelDescriptor[]>;
   now?: () => Date;
 }
 
@@ -347,7 +351,13 @@ export function createModelCatalogService(
         : model.defaultEffort && model.efforts.includes(model.defaultEffort) ? model.defaultEffort : null;
     let discovered: AgyModelDescriptor[];
     try {
-      discovered = await discoverAgy(config.agyPath ?? "agy", cwd);
+      const folders: AgyDiscoveryFolders = {
+        ...(config.agyAppDataDir ? { appDataDir: config.agyAppDataDir } : {}),
+        ...(config.agyGeminiDir ? { geminiDir: config.agyGeminiDir } : {}),
+      };
+      discovered = Object.keys(folders).length > 0
+        ? await discoverAgy(config.agyPath ?? "agy", cwd, folders)
+        : await discoverAgy(config.agyPath ?? "agy", cwd);
     } catch (error) {
       if (!configuredModel) throw error;
       return {

@@ -317,6 +317,18 @@ describe("agy model catalog", () => {
     expect(() => service.validateSelection(catalog, { model: "nope" })).toThrow();
   });
 
+  it("discovers in the data folders it is given", async () => {
+    const seen: unknown[] = [];
+    const service = createModelCatalogService({ agyAppDataDir: "merlo", agyGeminiDir: "/g" }, {
+      listAgyModels: async (_path, _cwd, folders) => {
+        seen.push(folders);
+        return discovered;
+      },
+    });
+    await service.getCatalog("agy", "/tmp");
+    expect(seen).toEqual([{ appDataDir: "merlo", geminiDir: "/g" }]);
+  });
+
   it("advertises the host's default effort when the model offers it", async () => {
     const service = createModelCatalogService({ defaultEffort: "low" }, { listAgyModels: async () => discovered });
     const catalog = await service.getCatalog("agy", "/tmp");

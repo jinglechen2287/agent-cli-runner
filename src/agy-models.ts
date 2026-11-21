@@ -52,11 +52,22 @@ function selectOption(options: unknown, category: string): SelectOption | undefi
 }
 
 /** Every model agy offers this account, with its thinking levels. */
-export async function listAgyModels(executablePath: string, _cwd: string): Promise<AgyModelDescriptor[]> {
+/** agy's `--app-data-dir` and `--gemini-dir`, for a host whose sessions use
+ * their own profile. */
+export interface AgyDiscoveryFolders {
+  appDataDir?: string;
+  geminiDir?: string;
+}
+
+export async function listAgyModels(
+  executablePath: string,
+  _cwd: string,
+  folders: AgyDiscoveryFolders = {},
+): Promise<AgyModelDescriptor[]> {
   const cwd = await mkdtemp(join(tmpdir(), "agent-cli-runner-agy-"));
   const env = process.env;
   try {
-    const { client, whenExited } = await startAgyAcp({ executablePath, cwd, env });
+    const { client, whenExited } = await startAgyAcp({ executablePath, cwd, env, ...folders });
     let sessionId: string | undefined;
     const deadline = setTimeout(() => client.close(), DISCOVERY_TIMEOUT_MS);
     deadline.unref?.();
@@ -90,7 +101,7 @@ export async function listAgyModels(executablePath: string, _cwd: string): Promi
       if (sessionId) await client.request("session/close", { sessionId }, 2_000).catch(() => {});
       client.close();
       await whenExited;
-      if (sessionId) await removeAgySessionFiles(agyDataRoot({ env }), sessionId);
+      if (sessionId) await removeAgySessionFiles(agyDataRoot({ env, ...folders }), sessionId);
     }
   } finally {
     await rm(cwd, { recursive: true, force: true }).catch(() => {});

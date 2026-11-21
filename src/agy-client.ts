@@ -24,6 +24,9 @@ export interface StartAgyAcpOptions {
   appDataDir?: string;
   /** The ACP auth method to sign in with. Defaults to "oauth-personal". */
   authMethod?: string;
+  /** agy's `--dangerously-skip-permissions`: agy approves its own tool calls,
+   * subagents' included, which never reach the host over ACP. */
+  skipPermissions?: boolean;
 }
 
 export interface AgyAgentInfo {
@@ -70,13 +73,14 @@ export function agyBrowserCommand(execPath: string = process.execPath): string |
 }
 
 /** agy's argv and environment for one `agy acp` process. */
-export function agyAcpLaunch(options: Pick<StartAgyAcpOptions, "env" | "geminiDir" | "appDataDir">): {
+export function agyAcpLaunch(options: Pick<StartAgyAcpOptions, "env" | "geminiDir" | "appDataDir" | "skipPermissions">): {
   args: string[];
   env: Record<string, string>;
 } {
   const args = ["acp"];
   if (options.geminiDir) args.push("--gemini-dir", options.geminiDir);
   if (options.appDataDir) args.push("--app-data-dir", options.appDataDir);
+  if (options.skipPermissions) args.push("--dangerously-skip-permissions");
   const env = childEnv("agy", options.env ?? process.env);
   env.AGY_CLI_DISABLE_AUTO_UPDATE = "1";
   if (options.geminiDir) env.GEMINI_HOME = options.geminiDir;

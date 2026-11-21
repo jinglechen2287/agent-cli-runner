@@ -9,7 +9,7 @@ import { lstat, mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { agyRequestError, startAgyAcp, type AgyAgentInfo } from "./agy-client.js";
-import { readAgyChildren } from "./agy-children.js";
+import { listAgyChildIds, readAgyChildren } from "./agy-children.js";
 import {
   agyFinalUsage,
   agyPlanToolUse,
@@ -124,10 +124,16 @@ export interface CreateAgySessionOptions {
   mode?: AgyMode;
   appendSystemPrompt?: string;
   mcpServers?: AgyMcpServer[];
-  /** Answer every approval agy asks for with "allow once". */
+  /** Answer every approval agy asks for with "allow once", and start agy
+   * with `--dangerously-skip-permissions`, since a subagent's approvals never
+   * reach the host and would otherwise hold its turn forever. */
   dangerouslySkipPermissions?: boolean;
   /** A one-off metadata run: a fresh temp cwd, no tools, nothing left behind. */
   isolated?: boolean;
+  /** A throwaway session in `cwd`, tools and all, whose conversation, brain
+   * and annotation files are deleted when it closes: a side run that leaves
+   * no conversation behind. It cannot resume a session. */
+  ephemeral?: boolean;
   /** Output agy produces while no turn is open (a finished daemon, a late
    * wake). Without it that output is dropped. */
   onContinuation?: (start: { reason: "output" | "permission" }) => AgyContinuationHandlers | undefined;
@@ -135,6 +141,11 @@ export interface CreateAgySessionOptions {
   /** How long a turn held for background work waits after agy's reply
    * closes before ending. Default 3 s. */
   replyQuietMs?: number;
+  /** End a turn this long after agy answered when only commands it left
+   * running hold it, so a stray long command can't keep the turn open. What
+   * agy says once they finish goes to `onContinuation`, or is dropped.
+   * Running subagents still hold the turn. Off unless given. */
+  commandHoldMs?: number;
   /** Fail a turn that sees no update for this long while nothing it waits on
    * is open. Off unless given. */
   inactivityTimeoutMs?: number;
@@ -220,8 +231,12 @@ function acpMcpServers(servers: readonly AgyMcpServer[]): Array<Record<string, u
 
 /** Delete one agy session's own files under its data root. Only for a
  * session id this process created. */
-export async function removeAgySessionFiles(root: string, sessionId: string): Promise<void> {
-  if (!isAgyId(sessionId)) return;
+export async function removeAgySessionFiles(root: string, sessionId: string, removed = new Set<string>()): Promise<void> {
+  if (!isAgyId(sessionId) || removed.has(sessionId)) return;
+  removed.add(sessionId);
+  // A subagent is a conversation of its own: its files go too, read from the
+  // parent's records before those go with the parent's brain.
+  for (const child of await listAgyChildIds(root, sessionId)) await removeAgySessionFiles(root, child, removed);
   const remove = async (segments: string[], recursive = false) => {
     const path = join(root, ...segments);
     try {
@@ -320,6 +335,10 @@ interface AgentEntry {
 }
 
 export async function createAgySession(options: CreateAgySessionOptions): Promise<AgySession> {
+  if (options.commandHoldMs !== undefined && !(Number.isFinite(options.commandHoldMs) && options.commandHoldMs > 0)) {
+    throw new Error("commandHoldMs must be a positive number of milliseconds");
+  }
+  if (options.ephemeral && options.resumeSessionId) throw new Error("ephemeral agy sessions cannot resume a session");
   if (options.isolated) {
     if (options.resumeSessionId) throw new Error("isolated agy runs cannot resume a session");
     if (options.mcpServers?.length) throw new Error("isolated agy runs cannot take MCP servers");
@@ -344,6 +363,7 @@ export async function createAgySession(options: CreateAgySessionOptions): Promis
       ...(options.geminiDir ? { geminiDir: options.geminiDir } : {}),
       ...(options.appDataDir ? { appDataDir: options.appDataDir } : {}),
       ...(options.authMethod ? { authMethod: options.authMethod } : {}),
+      ...(options.dangerouslySkipPermissions ? { skipPermissions: true } : {}),
     });
   } catch (error) {
     await removeTempCwd();
@@ -363,7 +383,7 @@ export async function createAgySession(options: CreateAgySessionOptions): Promis
     });
   } catch (error) {
     client.close();
-    if (options.isolated && openedId) {
+    if ((options.isolated || options.ephemeral) && openedId) {
       await whenExited;
       await removeAgySessionFiles(root, openedId);
     }
@@ -429,6 +449,7 @@ async function openSession(context: OpenContext): Promise<AgySession> {
   let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
   let replyTimer: ReturnType<typeof setTimeout> | undefined;
   let holdTimer: ReturnType<typeof setTimeout> | undefined;
+  let commandHoldTimer: ReturnType<typeof setTimeout> | undefined;
 
   const currentModel = (): string | undefined => {
     const option = findOption(configOptions, "model");
@@ -553,6 +574,8 @@ async function openSession(context: OpenContext): Promise<AgySession> {
     }
     if (holdTimer) clearTimeout(holdTimer);
     holdTimer = undefined;
+    if (commandHoldTimer) clearTimeout(commandHoldTimer);
+    commandHoldTimer = undefined;
     for (const id of target.agents) {
       if (agents.get(id)?.info.status === "running") continue;
       agents.delete(id);
@@ -675,6 +698,28 @@ async function openSession(context: OpenContext): Promise<AgySession> {
     holdTimer.unref?.();
   };
 
+  /** Stop waiting on commands agy left running once `commandHoldMs` has
+   * passed. Subagents report back, and a reply agy is sending or a question
+   * it is asking is still the turn's, so while any is under way the wait
+   * starts over; once nothing but commands holds the turn, it ends. */
+  const armCommandHold = (target: Run): void => {
+    const limit = options.commandHoldMs;
+    if (limit === undefined) return;
+    if (commandHoldTimer) clearTimeout(commandHoldTimer);
+    commandHoldTimer = setTimeout(() => {
+      commandHoldTimer = undefined;
+      if (run !== target || target.done.settled || !target.holding) return;
+      const replying = target.repliedSinceAnswer && (target.replyOpen || replyTimer !== undefined);
+      // Something else holds the turn, or nothing does yet: wait again, since a reply to a subagent can still leave a command running after it.
+      if (!heldTools(target) || runningAgents(target).length > 0 || replying || pendingPermissions > 0) {
+        armCommandHold(target);
+        return;
+      }
+      void settleSuccess(target);
+    }, limit);
+    commandHoldTimer.unref?.();
+  };
+
   const dbPath = (): string | undefined =>
     isAgyId(sessionId) ? join(root, "conversations", `${sessionId}.db`) : undefined;
 
@@ -743,6 +788,7 @@ async function openSession(context: OpenContext): Promise<AgySession> {
         target.holding = true;
         armInactivity();
         armHoldCheck(target);
+        armCommandHold(target);
         // A reply agy sent while this read its files has no check left to
         // end the hold once its quiet time ran out: start one.
         if (target.repliedSinceAnswer && !replyTimer) armReplyEnd(target, target.replyOpen);
@@ -1301,7 +1347,7 @@ async function openSession(context: OpenContext): Promise<AgySession> {
       }
       client.close();
       await whenExited;
-      if (isolated) await removeAgySessionFiles(root, sessionId);
+      if (isolated || options.ephemeral) await removeAgySessionFiles(root, sessionId);
       await context.removeTempCwd();
     })();
     return closePromise;

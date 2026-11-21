@@ -629,6 +629,133 @@ describe("background work", () => {
     await second.close();
   });
 
+  it("stops waiting for a held command after commandHoldMs, ending with the reply it has", async () => {
+    const command = { toolCallId: "call_c", name: "run_command", kind: "execute", title: "find ~", rawInput: { CommandLine: "find ~ -name x" } };
+    const agy = setup({
+      onPrompt(message, fake) {
+        fake.update({ sessionUpdate: "tool_call", ...command, status: "in_progress" });
+        fake.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Here is the plan." } });
+        fake.respond(message.id, { stopReason: "end_turn" });
+      },
+    });
+    const session = await open(agy, { commandHoldMs: 100 });
+    let settled = false;
+    const turn = session.runTurn({ prompt: "go" });
+    void turn.then(() => { settled = true; }, () => { settled = true; });
+    await tick();
+    await tick();
+    expect(settled).toBe(false);
+    expect((await turn).text).toBe("Here is the plan.");
+    // The command ending later finds no turn open; the session carries on.
+    agy.update({ sessionUpdate: "tool_call_update", ...command, status: "completed", rawOutput: { output: "found", exit_code: 0 } });
+    agy.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "It found nothing." } });
+    agy.update({ sessionUpdate: "usage_update", used: 50, size: 1_048_576 });
+    await tick();
+    expect(session.closed).toBe(false);
+    await session.close();
+  });
+
+  it("lets a reply that follows a held command finish, even past commandHoldMs", async () => {
+    const command = { toolCallId: "call_c", name: "run_command", kind: "execute", title: "npm test", rawInput: { CommandLine: "npm test" } };
+    const agy = setup({
+      onPrompt(message, fake) {
+        fake.update({ sessionUpdate: "tool_call", ...command, status: "in_progress" });
+        fake.respond(message.id, { stopReason: "end_turn" });
+      },
+    });
+    const session = await open(agy, { commandHoldMs: 120, replyQuietMs: 150 });
+    const turn = session.runTurn({ prompt: "go" });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    // The command ends just before the limit, and agy starts telling what it found.
+    agy.update({ sessionUpdate: "tool_call_update", ...command, status: "completed", rawOutput: { output: "ok", exit_code: 0 } });
+    agy.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The command finished: " } });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    agy.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "all 12 tests pass." } });
+    agy.update({ sessionUpdate: "usage_update", used: 50, size: 1_048_576 });
+    expect((await turn).text).toBe("The command finished: all 12 tests pass.");
+    await session.close();
+  });
+
+  it("refuses a commandHoldMs that isn't a positive number", async () => {
+    const agy = setup();
+    await expect(open(agy, { commandHoldMs: 0 })).rejects.toThrow(/commandHoldMs/);
+  });
+
+  it("keeps holding for a running subagent past commandHoldMs", async () => {
+    const dir = home();
+    const root = join(dir, ".gemini", "antigravity-cli");
+    const agy = setup({
+      onPrompt(message, fake) {
+        fake.update({ sessionUpdate: "tool_call", ...subagentCall("call_slow", "Slow"), status: "in_progress" });
+        fake.update({ sessionUpdate: "tool_call_update", ...subagentCall("call_slow", "Slow"), status: "completed" });
+        writeSubagent(root, SESSION, "slow-1", { role: "Slow" });
+        writeLaunchMessage(root, SESSION, "slow-1", "call_slow");
+        fake.respond(message.id, { stopReason: "end_turn" });
+      },
+    });
+    const session = await open(agy, { env: { HOME: dir }, commandHoldMs: 50 });
+    let settled = false;
+    const turn = session.runTurn({ prompt: "go" });
+    void turn.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(settled).toBe(false);
+    void session.close();
+    await turn.catch(() => {});
+  });
+
+  it("still stops waiting for a command that a subagent's report leaves running, after holding for the subagent", async () => {
+    const dir = home();
+    const root = join(dir, ".gemini", "antigravity-cli");
+    const agy = setup({
+      onPrompt(message, fake) {
+        fake.update({ sessionUpdate: "tool_call", ...subagentCall("call_slow", "Slow"), status: "in_progress" });
+        fake.update({ sessionUpdate: "tool_call_update", ...subagentCall("call_slow", "Slow"), status: "completed" });
+        writeSubagent(root, SESSION, "slow-1", { role: "Slow" });
+        writeLaunchMessage(root, SESSION, "slow-1", "call_slow");
+        fake.respond(message.id, { stopReason: "end_turn" });
+      },
+    });
+    const session = await open(agy, { env: { HOME: dir }, commandHoldMs: 50, replyQuietMs: 30 });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await holdThenReport(session, agy, root);
+    } finally {
+      vi.useRealTimers();
+    }
+    await session.close();
+  });
+
+  async function holdThenReport(session: Awaited<ReturnType<typeof open>>, agy: ReturnType<typeof setup>, root: string): Promise<void> {
+    let running = false;
+    const turn = session.runTurn({ prompt: "go", onBackgroundAgentUpdate: (info) => { if (info.status === "running") running = true; } });
+    let ended = false;
+    void turn.then(() => { ended = true; }, () => {});
+    // The turn holds for the subagent once agy has answered and its files are read, which takes real time.
+    const settleBy = Date.now() + 200;
+    while (!running || Date.now() < settleBy) await new Promise((resolve) => setImmediate(resolve));
+    // Past several hold limits with only the subagent running, the file reads between them given real time.
+    for (let step = 0; step < 10; step++) {
+      await vi.advanceTimersByTimeAsync(50);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(ended).toBe(false);
+    // The subagent reports, and agy's answer to it starts a command it leaves running.
+    writeReport(root, SESSION, "slow-1", "m1", "slow-done", "2026-11-20T22:04:46.759Z");
+    const command = { toolCallId: "call_c", name: "run_command", kind: "execute", title: "npm test", rawInput: { CommandLine: "npm test" } };
+    agy.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Slow is done; running the tests." } });
+    agy.update({ sessionUpdate: "tool_call", ...command, status: "in_progress" });
+    agy.update({ sessionUpdate: "usage_update", used: 100, size: 1_048_576 });
+    // A reply that leaves a command running counts as open for two minutes; past that, only the command holds the turn.
+    await vi.advanceTimersByTimeAsync(120_000);
+    // The checks read agy's files, which takes real time: step the clock while they do.
+    for (let step = 0; step < 100 && !ended; step++) {
+      await vi.advanceTimersByTimeAsync(50);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(ended).toBe(true);
+    expect((await turn).text).toBe("Slow is done; running the tests.");
+  }
+
   it("waits out a usage update in the middle of the reply that follows a held command", async () => {
     const command = { toolCallId: "call_c", name: "run_command", kind: "execute", title: "sleep 8", rawInput: { CommandLine: "sleep 8" } };
     const read = { toolCallId: "call_r", name: "view_file", kind: "read", title: "Read out.txt", rawInput: { AbsolutePath: "/tmp/project/out.txt" } };
@@ -1029,6 +1156,78 @@ describe("isolated runs", () => {
     ]) {
       await expect(open(setup(), { isolated: true, ...extra })).rejects.toThrow();
     }
+  });
+});
+
+describe("ephemeral sessions", () => {
+  it("keep their cwd and tools, and delete the session's files on close", async () => {
+    const dir = home();
+    const root = join(dir, ".gemini", "antigravity-cli");
+    for (const sub of ["conversations", "annotations", join("brain", SESSION)]) mkdirSync(join(root, sub), { recursive: true });
+    writeFileSync(join(root, "conversations", `${SESSION}.db`), "");
+    writeFileSync(join(root, "annotations", `${SESSION}.pbtxt`), "");
+    writeFileSync(join(root, "conversations", "other.db"), "");
+    const agy = setup({
+      onPrompt(_message, fake) {
+        fake.update({ sessionUpdate: "tool_call", toolCallId: "call_1", name: "list_dir", kind: "read", status: "completed" });
+        return answer("Seen")(_message, fake);
+      },
+    });
+    const session = await open(agy, { ephemeral: true, env: { HOME: dir } });
+    expect(session.cwd).toBe("/tmp/project");
+    expect((await session.runTurn({ prompt: "Look around" })).text).toBe("Seen");
+    await session.close();
+    expect(readdirSync(join(root, "conversations"))).toEqual(["other.db"]);
+    expect(existsSync(join(root, "brain", SESSION))).toBe(false);
+    expect(existsSync(join(root, "annotations", `${SESSION}.pbtxt`))).toBe(false);
+  });
+
+  it("delete the files of the subagents the session launched, and theirs", async () => {
+    const dir = home();
+    const root = join(dir, ".gemini", "antigravity-cli");
+    mkdirSync(join(root, "conversations"), { recursive: true });
+    for (const id of [SESSION, "child-1", "grandchild-1", "other"]) {
+      mkdirSync(join(root, "brain", id), { recursive: true });
+      writeFileSync(join(root, "conversations", `${id}.db`), "");
+    }
+    writeSubagent(root, SESSION, "child-1");
+    writeSubagent(root, "child-1", "grandchild-1");
+    const session = await open(setup(), { ephemeral: true, env: { HOME: dir } });
+    await session.close();
+    expect(readdirSync(join(root, "conversations"))).toEqual(["other.db"]);
+    expect(readdirSync(join(root, "brain"))).toEqual(["other"]);
+  });
+
+  it("delete every subagent's files, however many the session launched", async () => {
+    const dir = home();
+    const root = join(dir, ".gemini", "antigravity-cli");
+    mkdirSync(join(root, "conversations"), { recursive: true });
+    const children = Array.from({ length: 300 }, (_, index) => `child-${index}`);
+    for (const id of [SESSION, ...children]) writeFileSync(join(root, "conversations", `${id}.db`), "");
+    for (const child of children) writeSubagent(root, SESSION, child);
+    const session = await open(setup(), { ephemeral: true, env: { HOME: dir } });
+    await session.close();
+    expect(readdirSync(join(root, "conversations"))).toEqual([]);
+  });
+
+  it("delete the session's files when opening fails after agy created it", async () => {
+    const dir = home();
+    const root = join(dir, ".gemini", "antigravity-cli");
+    mkdirSync(join(root, "conversations"), { recursive: true });
+    writeFileSync(join(root, "conversations", `${SESSION}.db`), "");
+    const agy = setup({
+      onRequest(message, fake) {
+        if (message.method !== "session/set_config_option") return false;
+        fake.fail(message.id, { code: -32603, message: "no" });
+        return true;
+      },
+    });
+    await expect(open(agy, { ephemeral: true, model: "claude-sonnet-4-6", env: { HOME: dir } })).rejects.toThrow();
+    expect(readdirSync(join(root, "conversations"))).toEqual([]);
+  });
+
+  it("cannot resume a session", async () => {
+    await expect(open(setup(), { ephemeral: true, resumeSessionId: "s" })).rejects.toThrow();
   });
 });
 
