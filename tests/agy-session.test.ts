@@ -41,6 +41,18 @@ function open(agy: FakeAgy, options: Partial<CreateAgySessionOptions> = {}) {
   });
 }
 
+/** Moves the faked clock on a step at a time until `done`, giving the session real time between steps for the file reads it makes to see where its subagents stand. A fixed number of steps would run out on a slow disk before the reads finish; this waits for the outcome, up to 10 s of real time. */
+async function advanceUntil(done: () => boolean): Promise<void> {
+  await vi.waitFor(async () => {
+    if (!done()) await vi.advanceTimersByTimeAsync(50);
+    expect(done()).toBe(true);
+  }, { timeout: ADVANCE_UNTIL_MS, interval: 20 });
+}
+
+const ADVANCE_UNTIL_MS = 10_000;
+/** The timeout of a test that calls `advanceUntil`: past its wait, so on a hang the helper gives up inside its own test, and doesn't run on into the next one, moving its clock. */
+const ADVANCING_TEST_MS = ADVANCE_UNTIL_MS + 10_000;
+
 function setup(options: FakeAgyOptions = {}) {
   return fakeAgy(options);
 }
@@ -697,17 +709,13 @@ describe("background work", () => {
       // The command prints, and then nothing more comes: no usage update closes that reply.
       agy.update({ sessionUpdate: "tool_call_update", ...command, status: "in_progress", rawOutput: { output: "compiled" } });
       await vi.advanceTimersByTimeAsync(120_000);
-      for (let step = 0; step < 100 && !ended; step++) {
-        await vi.advanceTimersByTimeAsync(50);
-        await new Promise((resolve) => setImmediate(resolve));
-      }
-      expect(ended).toBe(true);
+      await advanceUntil(() => ended);
       expect((await turn).text).toBe("Watching.");
     } finally {
       vi.useRealTimers();
     }
     await session.close();
-  });
+  }, ADVANCING_TEST_MS);
 
   it("refuses a commandHoldMs that isn't a positive number", async () => {
     const agy = setup();
@@ -756,7 +764,7 @@ describe("background work", () => {
       vi.useRealTimers();
     }
     await session.close();
-  });
+  }, ADVANCING_TEST_MS);
 
   async function holdThenReport(session: Awaited<ReturnType<typeof open>>, agy: ReturnType<typeof setup>, root: string): Promise<void> {
     let running = false;
@@ -780,12 +788,7 @@ describe("background work", () => {
     agy.update({ sessionUpdate: "usage_update", used: 100, size: 1_048_576 });
     // A reply that leaves a command running counts as open for two minutes; past that, only the command holds the turn.
     await vi.advanceTimersByTimeAsync(120_000);
-    // The checks read agy's files, which takes real time: step the clock while they do.
-    for (let step = 0; step < 100 && !ended; step++) {
-      await vi.advanceTimersByTimeAsync(50);
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-    expect(ended).toBe(true);
+    await advanceUntil(() => ended);
     expect((await turn).text).toBe("Slow is done; running the tests.");
   }
 
