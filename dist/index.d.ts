@@ -1209,7 +1209,42 @@ interface ClaudeCliCapabilities {
 declare function parseClaudeCliHelp(help: string): ClaudeCliCapabilities;
 declare function createModelCatalogService(config?: ModelCatalogConfig, deps?: ModelCatalogDeps): ModelCatalogService;
 
-type AgyInstallMethod = "native" | "homebrew" | "unknown";
+type AgyInstall = {
+    kind: "native";
+} | {
+    kind: "homebrew";
+    cask: string;
+    brew: string;
+} | {
+    kind: "unknown";
+};
+
+type ClaudeChannel = "stable" | "latest";
+type ClaudeInstall = 
+/** The native installer. `claude update` updates it. */
+{
+    kind: "native";
+    channel: ClaudeChannel | null;
+}
+/** A global or local npm install. `claude update` runs npm itself. */
+ | {
+    kind: "npm";
+    channel: ClaudeChannel | null;
+}
+/** A cask Claude publishes. Its channel is the cask's, not doctor's. */
+ | {
+    kind: "homebrew";
+    cask: string;
+    brew: string;
+    channel: ClaudeChannel;
+}
+/** Something only its own manager can update. */
+ | {
+    kind: "other";
+    manager: string;
+} | {
+    kind: "unknown";
+};
 
 type ProviderUpdateProvider = AgentProvider;
 type ProviderUpdateState = "current" | "update_available" | "not_installed" | "unknown";
@@ -1272,9 +1307,21 @@ interface ProviderUpdateServiceDeps {
     runCommand?: (executable: string, args: readonly string[], options: ProviderUpdateCommandOptions) => Promise<ProviderUpdateCommandResult>;
     fetchText?: (url: string, options: ProviderUpdateFetchOptions) => Promise<string>;
     now?: () => Date;
+    /** How the Claude Code at this path was installed. `doctorOutput` is null
+     * when `claude doctor` could not be run. */
+    resolveClaudeInstall?: (executable: string, env: NodeJS.ProcessEnv, doctorOutput: string | null) => Promise<ClaudeInstall>;
+    /** Whether the Codex at this path is a Homebrew cask, which brew upgrades directly. */
+    resolveCodexInstall?: (executable: string, env: NodeJS.ProcessEnv) => Promise<CodexInstall>;
     /** How the agy at this path was installed. */
-    resolveAgyInstall?: (executable: string, env: NodeJS.ProcessEnv) => Promise<AgyInstallMethod>;
+    resolveAgyInstall?: (executable: string, env: NodeJS.ProcessEnv) => Promise<AgyInstall>;
 }
+type CodexInstall = {
+    kind: "homebrew";
+    cask: string;
+    brew: string;
+} | {
+    kind: "other";
+};
 declare function createProviderUpdateService(config?: ProviderUpdateServiceConfig, deps?: ProviderUpdateServiceDeps): ProviderUpdateService;
 
-export { AGY_INTERRUPT_GRACE_MS, AGY_STRIPPED_ENV_VARS, AbortError, type AgentCallbacks, type AgentProvider, AgyAuthError, type AgyCompactOptions, type AgyContinuationHandlers, type AgyLastStep, type AgyMcpServer, type AgyMode, type AgyPermissionAnswer, type AgyPermissionCallback, type AgyPermissionRequest, type AgySession, type AgyStepReader, AgyTurnError, type AgyTurnErrorOptions, type AgyTurnOptions, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeCliCapabilities, type ClaudeContextUsage, type ClaudeHooks, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionCompactOptions, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerCompactOptions, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CompactionFailureInfo, type CompactionInfo, type CompactionStartInfo, type CreateAgySessionOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, type ForkCodexThreadOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, PROVIDER_CAPABILITIES, type ProviderCapabilities, ProviderTurnError, type ProviderTurnErrorKind, type ProviderTurnErrorOptions, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunAgyOptions, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createAgySession, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, deleteClaudeSession, forkClaudeSession, forkCodexThread, parseClaudeCliHelp, runAgy, runClaude, runCodex };
+export { AGY_INTERRUPT_GRACE_MS, AGY_STRIPPED_ENV_VARS, AbortError, type AgentCallbacks, type AgentProvider, AgyAuthError, type AgyCompactOptions, type AgyContinuationHandlers, type AgyInstall, type AgyLastStep, type AgyMcpServer, type AgyMode, type AgyPermissionAnswer, type AgyPermissionCallback, type AgyPermissionRequest, type AgySession, type AgyStepReader, AgyTurnError, type AgyTurnErrorOptions, type AgyTurnOptions, type BackgroundAgentInfo, type BackgroundAgentProgress, type BackgroundAgentStatus, CLAUDE_ABSORBED_FOLLOW_UP_GRACE_MS, CLAUDE_CONTEXT_WINDOWS, CLAUDE_FOLLOW_UP_GRACE_MS, CLAUDE_INTERRUPT_GRACE_MS, CLAUDE_STRIPPED_ENV_VARS, CODEX_FORK_CONFIG, CODEX_STRIPPED_ENV_VARS, type ClaudeChannel, type ClaudeCliCapabilities, type ClaudeContextUsage, type ClaudeHooks, type ClaudeInstall, type ClaudePermissionMode, type ClaudeQuery, type ClaudeQueryFn, type ClaudeSession, type ClaudeSessionCompactOptions, type ClaudeSessionState, type ClaudeSessionSteerOptions, type ClaudeSessionTurnOptions, type ClaudeTurnOutcome, type ClaudeTurnTranslator, type ClaudeTurnTranslatorOptions, type CodexAppServerClient, type CodexAppServerCompactOptions, type CodexAppServerSession, type CodexAppServerSteerOptions, type CodexAppServerTurnOptions, type CodexConfigOverrides, type CodexInstall, type CodexJsonValue, type CodexModelDescriptor, type CodexSandboxPolicy, type CodexServerRequest, type CodexServerRequestHandler, CodexTurnError, type CommonRunOptions, type CompactionFailureInfo, type CompactionInfo, type CompactionStartInfo, type CreateAgySessionOptions, type CreateClaudeSessionOptions, type CreateCodexAppServerClientOptions, type CreateCodexAppServerSessionOptions, type ForkCodexThreadOptions, KNOWN_CONTEXT_WINDOWS, type McpElicitationRequest, type McpElicitationResponse, type McpServerStatusInfo, MissingCliError, type ModelCatalog, type ModelCatalogConfig, type ModelCatalogDeps, type ModelCatalogProvider, type ModelCatalogService, type ModelEffortOption, type ModelOption, type ModelSelection, type ModelSelectionInput, type ModelServiceTierOption, PROVIDER_CAPABILITIES, type ProviderCapabilities, ProviderTurnError, type ProviderTurnErrorKind, type ProviderTurnErrorOptions, type ProviderUpdateApplyReason, type ProviderUpdateApplyResult, type ProviderUpdateCommandOptions, type ProviderUpdateCommandResult, type ProviderUpdateFetchOptions, type ProviderUpdateProvider, type ProviderUpdateReason, type ProviderUpdateService, type ProviderUpdateServiceConfig, type ProviderUpdateServiceDeps, type ProviderUpdateState, type ProviderUpdateStatus, type RunAgyOptions, type RunClaudeOptions, type RunCodexOptions, type RunResult, type SpawnFn, SteerRejectedError, TimeoutError, type TokenUsage, type ToolPlanItem, type ToolResultInfo, type ToolUseInfo, UnsupportedServerRequestError, collectCodexModels, contextWindowForModel, createAgySession, createClaudeSession, createClaudeSessionState, createClaudeTurnTranslator, createCodexAppServerClient, createCodexAppServerSession, createModelCatalogService, createProviderUpdateService, deleteClaudeSession, forkClaudeSession, forkCodexThread, parseClaudeCliHelp, runAgy, runClaude, runCodex };

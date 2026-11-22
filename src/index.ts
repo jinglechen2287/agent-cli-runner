@@ -147,4 +147,7 @@ export type {
   ProviderUpdateServiceDeps,
   ProviderUpdateState,
   ProviderUpdateStatus,
+  CodexInstall,
 } from "./provider-updates.js";
+export type { ClaudeChannel, ClaudeInstall } from "./claude-install.js";
+export type { AgyInstall } from "./agy-release.js";

@@ -1170,13 +1170,13 @@ function launchCommand(command, args, env, { cwd = process.cwd(), platform = pro
   if (args.some((arg) => /[\r\n]/.test(arg))) {
     throw new Error(`cmd.exe cannot pass a line break in an argument to ${resolved}`);
   }
-  const line = [
+  const line2 = [
     win32.normalize(resolved).replace(CMD_META_CHARS, "^$1"),
     ...args.map(escapeBatchArgument)
   ].join(" ");
   return {
     command: windowsEnvValue(env, "ComSpec") ?? windowsEnvValue(process.env, "ComSpec") ?? "cmd.exe",
-    args: ["/d", "/s", "/c", `"${line}"`],
+    args: ["/d", "/s", "/c", `"${line2}"`],
     options: { windowsVerbatimArguments: true }
   };
 }
@@ -1708,7 +1708,7 @@ import { deleteSession, forkSession } from "@anthropic-ai/claude-agent-sdk";
 import { spawn as nodeSpawn3 } from "node:child_process";
 
 // package.json
-var version = "0.8.0";
+var version = "0.9.0";
 
 // src/jsonrpc-process.ts
 var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;
@@ -1792,12 +1792,12 @@ function startJsonRpcProcess(options) {
       });
     }
   };
-  const handleLine = (line) => {
+  const handleLine = (line2) => {
     let message;
     try {
-      message = JSON.parse(line);
+      message = JSON.parse(line2);
     } catch {
-      if (line.trim()) for (const handler of nonJsonHandlers) safeCallback(() => handler(line));
+      if (line2.trim()) for (const handler of nonJsonHandlers) safeCallback(() => handler(line2));
       return;
     }
     if (!isRecord(message)) return;
@@ -2098,10 +2098,10 @@ function rawResponseOutputText(item) {
 function rawWebOutputUrl(item) {
   const output = rawResponseOutputText(item);
   if (!output) return void 0;
-  for (const line of output.split("\n")) {
-    const headerStart = line.search(/\(\s*https?:\/\//u);
-    if (headerStart < 0 || !line.trimEnd().endsWith(")")) continue;
-    const url = firstHttpUrl(line.slice(headerStart + 1));
+  for (const line2 of output.split("\n")) {
+    const headerStart = line2.search(/\(\s*https?:\/\//u);
+    if (headerStart < 0 || !line2.trimEnd().endsWith(")")) continue;
+    const url = firstHttpUrl(line2.slice(headerStart + 1));
     if (url) return url;
   }
   return void 0;
@@ -2424,8 +2424,8 @@ function agyAcpLaunch(options) {
   if (browser) env.BROWSER = browser;
   return { args, env };
 }
-function agyAuthLink(line) {
-  const trimmed = line.trim();
+function agyAuthLink(line2) {
+  const trimmed = line2.trim();
   if (trimmed.startsWith(AUTH_LINK_PREFIX)) return trimmed.slice(AUTH_LINK_PREFIX.length).trim() || void 0;
   const marker = trimmed.indexOf(BROWSER_MARKER);
   if (marker === -1) return void 0;
@@ -2487,8 +2487,8 @@ async function startAgyAcp(options) {
   });
   signInNeeded.catch(() => {
   });
-  const onLine = (line) => {
-    const url = agyAuthLink(line);
+  const onLine = (line2) => {
+    const url = agyAuthLink(line2);
     if (url) rejectSignIn?.(new AgyAuthError("agy needs you to sign in: run `agy` or `agy acp --login`", { url }));
   };
   const disposeStdout = client.onStdoutNonJson(onLine);
@@ -2497,7 +2497,7 @@ async function startAgyAcp(options) {
     stderrLine += chunk;
     const lines = stderrLine.split("\n");
     stderrLine = lines.pop() ?? "";
-    for (const line of lines) onLine(line);
+    for (const line2 of lines) onLine(line2);
   });
   const abort = () => client.close();
   options.signal?.addEventListener("abort", abort, { once: true });
@@ -4817,10 +4817,10 @@ async function runIsolatedCodex(opts) {
       timeoutMs: opts.timeoutMs,
       terminate: () => void terminateTree((signal) => signalProcessTree(child, signal), ended)
     });
-    const handleLine = (line) => {
+    const handleLine = (line2) => {
       let event;
       try {
-        event = JSON.parse(line);
+        event = JSON.parse(line2);
       } catch {
         return;
       }
@@ -5351,9 +5351,40 @@ function createModelCatalogService(config = {}, deps = {}) {
 }
 
 // src/agy-release.ts
-import { realpath } from "node:fs/promises";
+import { realpath as realpath2 } from "node:fs/promises";
 import { homedir as homedir2 } from "node:os";
-import { basename, dirname, join as join4, sep } from "node:path";
+import { basename, dirname, join as join4 } from "node:path";
+
+// src/homebrew.ts
+import { realpath } from "node:fs/promises";
+function homebrewCaskAt(path) {
+  const match = path.match(/^(.+)\/Caskroom\/([^/]+)\/[^/]+\//);
+  if (!match) return null;
+  return { cask: match[2], brew: `${match[1]}/bin/brew` };
+}
+async function resolveRealPath(executable, env) {
+  if (process.platform === "win32") return null;
+  const found = resolveExecutable(executable, env);
+  if (!found) return null;
+  return realpath(found).catch(() => null);
+}
+async function resolveHomebrewCask(executable, env) {
+  const real = await resolveRealPath(executable, env);
+  return real ? homebrewCaskAt(real) : null;
+}
+function homebrewCaskApiUrl(cask) {
+  return `https://formulae.brew.sh/api/cask/${cask}.json`;
+}
+function createBrewQueue() {
+  let tail = Promise.resolve();
+  return (task) => {
+    const run = tail.then(task, task);
+    tail = run.catch(() => void 0);
+    return run;
+  };
+}
+
+// src/agy-release.ts
 var AGY_MANIFEST_BASE = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests";
 var RELEASE_URL_PREFIX = "https://storage.googleapis.com/antigravity-public/antigravity-cli/";
 function antigravityCliTarget(platform = process.platform, arch = process.arch, musl = false) {
@@ -5385,20 +5416,88 @@ function parseAgyManifest(text3) {
   return version2;
 }
 async function resolveAgyInstall(executable, env) {
-  if (process.platform === "win32") return "unknown";
-  const found = resolveExecutable(executable, env);
-  if (!found) return "unknown";
-  let real;
-  try {
-    real = await realpath(found);
-  } catch {
-    return "unknown";
-  }
-  if (real.includes(`${sep}Caskroom${sep}antigravity-cli${sep}`)) return "homebrew";
+  const real = await resolveRealPath(executable, env);
+  if (!real) return { kind: "unknown" };
+  const cask = homebrewCaskAt(real);
+  if (cask) return cask.cask === "antigravity-cli" ? { kind: "homebrew", ...cask } : { kind: "unknown" };
   const home = env.HOME ?? homedir2();
-  const binDir = await realpath(join4(home, ".local", "bin")).catch(() => void 0);
-  if (binDir && basename(real) === "agy" && dirname(real) === binDir) return "native";
-  return "unknown";
+  const binDir = await realpath2(join4(home, ".local", "bin")).catch(() => void 0);
+  if (binDir && basename(real) === "agy" && dirname(real) === binDir) return { kind: "native" };
+  return { kind: "unknown" };
+}
+
+// src/claude-install.ts
+var CLAUDE_CASKS = {
+  "claude-code": "stable",
+  "claude-code@latest": "latest"
+};
+function line(output, label) {
+  const match = output.match(new RegExp(`^${label}:[ \\t]*(.+?)[ \\t]*$`, "im"));
+  return match?.[1] ?? null;
+}
+function parseClaudeDoctor(output) {
+  const running = line(output, "Running")?.split(/\s/)[0]?.toLowerCase() ?? null;
+  const configInstallMethod = line(output, "Config install method")?.split(/\s/)[0]?.toLowerCase() ?? null;
+  if (!running && !configInstallMethod) return null;
+  const rawChannel = line(output, "Auto-update channel")?.toLowerCase();
+  return {
+    running,
+    packageManager: line(output, "Package manager"),
+    path: line(output, "Path"),
+    invoked: line(output, "Invoked"),
+    configInstallMethod,
+    channel: rawChannel === "stable" || rawChannel === "latest" ? rawChannel : null
+  };
+}
+function globalPackageManager(path) {
+  const normalized = path.replaceAll("\\", "/").toLowerCase();
+  if (normalized.includes("/.bun/install/global/")) return "bun";
+  if (normalized.includes("/.pnpm/") || normalized.includes("/pnpm/global/")) return "pnpm";
+  if (normalized.includes("/yarn/global/") || normalized.includes("/yarn/data/global/")) return "yarn";
+  return null;
+}
+function classifyClaudeInstall(realPath, doctor) {
+  const paths = [realPath, doctor?.path, doctor?.invoked].filter((path) => Boolean(path));
+  for (const path of paths) {
+    const cask = homebrewCaskAt(path);
+    if (!cask) continue;
+    const channel2 = CLAUDE_CASKS[cask.cask];
+    return channel2 ? { kind: "homebrew", ...cask, channel: channel2 } : { kind: "other", manager: "homebrew" };
+  }
+  for (const path of paths) {
+    const manager = globalPackageManager(path);
+    if (manager) return { kind: "other", manager };
+  }
+  if (!doctor) return { kind: "unknown" };
+  const { channel } = doctor;
+  switch (doctor.running) {
+    case "native":
+      return { kind: "native", channel };
+    case "npm-global":
+    case "npm-local":
+      return { kind: "npm", channel };
+    case "package-manager":
+      return { kind: "other", manager: doctor.packageManager ?? "a package manager" };
+    case "development":
+      return { kind: "other", manager: "development" };
+    case null:
+      break;
+    default:
+      return { kind: "unknown" };
+  }
+  switch (doctor.configInstallMethod) {
+    case "native":
+      return { kind: "native", channel };
+    case "global":
+    case "local":
+      return { kind: "npm", channel };
+    default:
+      return { kind: "unknown" };
+  }
+}
+async function resolveClaudeInstall(executable, env, doctorOutput) {
+  const realPath = await resolveRealPath(executable, env);
+  return classifyClaudeInstall(realPath, doctorOutput === null ? null : parseClaudeDoctor(doctorOutput));
 }
 
 // src/provider-updates.ts
@@ -5406,7 +5505,12 @@ var CHECK_TIMEOUT_MS = 5e3;
 var CODEX_DOCTOR_TIMEOUT_MS = 3e4;
 var APPLY_TIMEOUT_MS = 10 * 60 * 1e3;
 var CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases";
+var CLAUDE_NPM_BASE_URL = "https://registry.npmjs.org/@anthropic-ai/claude-code";
 var AGY_MANIFEST_TIMEOUT_MS = 1e4;
+async function defaultResolveCodexInstall(executable, env) {
+  const cask = await resolveHomebrewCask(executable, env);
+  return cask?.cask === "codex" ? { kind: "homebrew", ...cask } : { kind: "other" };
+}
 async function defaultFetchText(url, options) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
@@ -5528,32 +5632,66 @@ function statusFromVersions(input2) {
     reason: null
   });
 }
-function parseClaudeDoctor(output) {
-  const installMethod = output.match(/^Config install method:\s*(\S+)\s*$/im)?.[1]?.toLowerCase();
-  if (!installMethod) return null;
-  const rawChannel = output.match(/^Auto-update channel:\s*(\S+)\s*$/im)?.[1]?.toLowerCase();
-  const channel = rawChannel === "stable" || rawChannel === "latest" ? rawChannel : null;
-  return { installMethod, channel };
-}
-function parseCodexLatestVersion(output) {
+function parseCodexDoctor(output) {
   let parsed;
   try {
     parsed = JSON.parse(output);
   } catch {
+    return { latest: null, updateAction: null };
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.checks)) return { latest: null, updateAction: null };
+  const updateCheck = parsed.checks["updates.status"];
+  if (!isRecord(updateCheck) || !isRecord(updateCheck.details)) return { latest: null, updateAction: null };
+  const latest = updateCheck.details["latest version"];
+  const updateAction = updateCheck.details["update action"];
+  return {
+    latest: typeof latest === "string" ? parseVersion2(latest) : null,
+    updateAction: typeof updateAction === "string" ? updateAction : null
+  };
+}
+function jsonVersion(text3) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text3);
+  } catch {
     return null;
   }
-  if (!isRecord(parsed) || !isRecord(parsed.checks)) return null;
-  const updateCheck = parsed.checks["updates.status"];
-  if (!isRecord(updateCheck) || !isRecord(updateCheck.details)) return null;
-  const latest = updateCheck.details["latest version"];
-  return typeof latest === "string" ? parseVersion2(latest) : null;
+  return isRecord(parsed) && typeof parsed.version === "string" ? parseVersion2(parsed.version) : null;
 }
+var CODEX_UNKNOWN_UPDATE_ACTION = "manual or unknown";
 function createProviderUpdateService(config = {}, deps = {}) {
   const runCommand = deps.runCommand ?? execCli;
   const fetchText = deps.fetchText ?? defaultFetchText;
   const now = deps.now ?? (() => /* @__PURE__ */ new Date());
   const baseEnv = config.env ?? process.env;
+  const claudeInstall = deps.resolveClaudeInstall ?? resolveClaudeInstall;
+  const codexInstall = deps.resolveCodexInstall ?? defaultResolveCodexInstall;
   const agyInstall = deps.resolveAgyInstall ?? resolveAgyInstall;
+  const brewQueue = createBrewQueue();
+  async function resolved(resolve, fallback) {
+    try {
+      return await resolve();
+    } catch {
+      return fallback;
+    }
+  }
+  async function latestFrom(url, parse, timeoutMs = CHECK_TIMEOUT_MS) {
+    try {
+      return parse(await fetchText(url, { timeoutMs }));
+    } catch {
+      return null;
+    }
+  }
+  function latestClaude(install, channel) {
+    switch (install.kind) {
+      case "native":
+        return latestFrom(`${CLAUDE_RELEASE_BASE_URL}/${channel}`, parseVersion2);
+      case "npm":
+        return latestFrom(`${CLAUDE_NPM_BASE_URL}/${channel}`, jsonVersion);
+      case "homebrew":
+        return latestFrom(homebrewCaskApiUrl(install.cask), jsonVersion);
+    }
+  }
   async function installedVersion(provider, executable, env, checkedAt) {
     let command;
     try {
@@ -5577,46 +5715,30 @@ function createProviderUpdateService(config = {}, deps = {}) {
       settle(runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS }))
     ]);
     if ("state" in installed) return installed;
-    if (!doctorResult.ok) {
+    const doctorOutput = doctorResult.ok ? combinedOutput(doctorResult.value.stdout, doctorResult.value.stderr) : null;
+    const install = await resolved(() => claudeInstall(executable, env, doctorOutput), { kind: "unknown" });
+    if (install.kind === "unknown") {
       return unknownStatus("claude", checkedAt, "check_failed", installed.version);
     }
-    const doctor = doctorResult.value;
-    const metadata = parseClaudeDoctor(combinedOutput(doctor.stdout, doctor.stderr));
-    if (!metadata) {
-      return unknownStatus("claude", checkedAt, "check_failed", installed.version);
+    if (install.kind === "other") {
+      return unknownStatus("claude", checkedAt, "unsupported_installation", installed.version);
     }
-    if (metadata.installMethod !== "native") {
-      return unknownStatus(
-        "claude",
-        checkedAt,
-        "unsupported_installation",
-        installed.version
-      );
-    }
-    if (!metadata.channel) {
+    const { channel } = install;
+    if (!channel) {
       return unknownStatus("claude", checkedAt, "version_unavailable", installed.version);
     }
-    let latest;
-    try {
-      const response = await fetchText(
-        `${CLAUDE_RELEASE_BASE_URL}/${metadata.channel}`,
-        { timeoutMs: CHECK_TIMEOUT_MS }
-      );
-      latest = parseVersion2(response);
-    } catch {
-      latest = null;
-    }
+    const latest = await latestClaude(install, channel);
     if (!latest) {
       return {
         ...unknownStatus("claude", checkedAt, "version_unavailable", installed.version),
-        channel: metadata.channel
+        channel
       };
     }
     return statusFromVersions({
       provider: "claude",
       installed,
       latest,
-      channel: metadata.channel,
+      channel,
       checkedAt
     });
   }
@@ -5631,8 +5753,12 @@ function createProviderUpdateService(config = {}, deps = {}) {
     if (!doctorResult.ok) {
       return unknownStatus("codex", checkedAt, "check_failed", installed.version);
     }
-    const doctor = doctorResult.value;
-    const latest = parseCodexLatestVersion(doctor.stdout);
+    const { latest: doctorLatest, updateAction } = parseCodexDoctor(doctorResult.value.stdout);
+    if (updateAction === CODEX_UNKNOWN_UPDATE_ACTION) {
+      return unknownStatus("codex", checkedAt, "unsupported_installation", installed.version);
+    }
+    const install = await resolved(() => codexInstall(executable, env), { kind: "other" });
+    const latest = install.kind === "homebrew" ? await latestFrom(homebrewCaskApiUrl(install.cask), jsonVersion) : doctorLatest;
     if (!latest) {
       return unknownStatus("codex", checkedAt, "version_unavailable", installed.version);
     }
@@ -5649,18 +5775,20 @@ function createProviderUpdateService(config = {}, deps = {}) {
     const env = childEnv("agy", baseEnv);
     const installed = await installedVersion("agy", executable, env, checkedAt);
     if ("state" in installed) return installed;
-    const method = await agyInstall(executable, env).catch(() => "unknown");
-    if (method === "homebrew") {
+    const install = await resolved(() => agyInstall(executable, env), { kind: "unknown" });
+    if (install.kind === "unknown" && process.platform !== "win32") {
       return unknownStatus("agy", checkedAt, "unsupported_installation", installed.version);
     }
-    const url = agyManifestUrl();
     let latest = null;
-    if (url) {
-      try {
-        const version2 = parseAgyManifest(await fetchText(url, { timeoutMs: AGY_MANIFEST_TIMEOUT_MS }));
-        latest = version2 ? parseVersion2(version2) : null;
-      } catch {
-        latest = null;
+    if (install.kind === "homebrew") {
+      latest = await latestFrom(homebrewCaskApiUrl(install.cask), jsonVersion);
+    } else {
+      const url = agyManifestUrl();
+      if (url) {
+        latest = await latestFrom(url, (text3) => {
+          const version2 = parseAgyManifest(text3);
+          return version2 ? parseVersion2(version2) : null;
+        }, AGY_MANIFEST_TIMEOUT_MS);
       }
     }
     if (!latest) return unknownStatus("agy", checkedAt, "version_unavailable", installed.version);
@@ -5712,80 +5840,15 @@ function createProviderUpdateService(config = {}, deps = {}) {
       reason: null
     };
   }
-  async function claudeInstallMethod(executable, env) {
-    const doctor = await runCommand(executable, ["doctor"], {
-      env,
-      timeoutMs: CHECK_TIMEOUT_MS
-    });
-    const output = combinedOutput(doctor.stdout, doctor.stderr);
-    return {
-      installMethod: parseClaudeDoctor(output)?.installMethod ?? null,
-      // Kept even on refusal: when the parse fails, the transcript that
-      // failed to parse is the one artifact that explains why.
-      output
-    };
-  }
-  const apply = async (provider) => {
-    const executable = executableFor(provider);
-    const env = childEnv(provider, baseEnv);
-    if (provider === "claude") {
-      let installMethod;
-      let doctorOutput;
-      try {
-        ({ installMethod, output: doctorOutput } = await claudeInstallMethod(executable, env));
-      } catch (error) {
-        return failureFromError(
-          provider,
-          executable,
-          { args: "doctor", timeoutMs: CHECK_TIMEOUT_MS },
-          error
-        );
-      }
-      if (installMethod === null) {
-        return refusal(
-          provider,
-          "install_method_unknown",
-          "Could not read how Claude Code was installed, so the updater was not run.",
-          doctorOutput
-        );
-      }
-      if (installMethod !== "native") {
-        return refusal(
-          provider,
-          "unsupported_installation",
-          `Claude Code was installed with ${installMethod}; update it with that package manager.`,
-          doctorOutput
-        );
-      }
-    }
-    if (provider === "agy") {
-      const method = await agyInstall(executable, env).catch(() => "unknown");
-      if (method === "homebrew") {
-        return refusal(
-          provider,
-          "unsupported_installation",
-          "agy was installed with Homebrew; update it with `brew upgrade --cask antigravity-cli`."
-        );
-      }
-      if (method === "unknown") {
-        return refusal(
-          provider,
-          "install_method_unknown",
-          "Could not tell how agy was installed, so its updater was not run."
-        );
-      }
-    }
+  async function runInstaller(provider, executable, args, env) {
     let command;
     try {
-      command = await runCommand(executable, ["update"], {
-        env,
-        timeoutMs: APPLY_TIMEOUT_MS
-      });
+      command = await runCommand(executable, args, { env, timeoutMs: APPLY_TIMEOUT_MS });
     } catch (error) {
       return failureFromError(
         provider,
         executable,
-        { args: "update", timeoutMs: APPLY_TIMEOUT_MS },
+        { args: args.join(" "), timeoutMs: APPLY_TIMEOUT_MS },
         error
       );
     }
@@ -5797,6 +5860,79 @@ function createProviderUpdateService(config = {}, deps = {}) {
       error: null,
       reason: null
     };
+  }
+  const upgradeCask = (provider, install, env) => brewQueue(() => runInstaller(provider, install.brew, ["upgrade", "--cask", install.cask], env));
+  async function applyClaude(executable, env) {
+    let doctorOutput = null;
+    let doctorError = null;
+    try {
+      const doctor = await runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS });
+      doctorOutput = combinedOutput(doctor.stdout, doctor.stderr);
+    } catch (error) {
+      doctorError = { error };
+    }
+    const install = await resolved(() => claudeInstall(executable, env, doctorOutput), { kind: "unknown" });
+    const output = doctorOutput ?? "";
+    switch (install.kind) {
+      case "unknown":
+        if (doctorError) {
+          return failureFromError(
+            "claude",
+            executable,
+            { args: "doctor", timeoutMs: CHECK_TIMEOUT_MS },
+            doctorError.error
+          );
+        }
+        return refusal(
+          "claude",
+          "install_method_unknown",
+          "Could not read how Claude Code was installed, so the updater was not run.",
+          output
+        );
+      case "other":
+        return refusal(
+          "claude",
+          "unsupported_installation",
+          install.manager === "development" ? "This is a development build of Claude Code, which can't be updated." : `Claude Code was installed with ${install.manager}; update it with that package manager.`,
+          output
+        );
+      case "homebrew":
+        return upgradeCask("claude", install, env);
+      case "native":
+      case "npm":
+        return runInstaller("claude", executable, ["update"], env);
+    }
+  }
+  async function applyAgy(executable, env) {
+    const install = await resolved(() => agyInstall(executable, env), { kind: "unknown" });
+    switch (install.kind) {
+      case "homebrew":
+        return upgradeCask("agy", install, env);
+      case "native":
+        return runInstaller("agy", executable, ["update"], env);
+      case "unknown":
+        return refusal(
+          "agy",
+          "install_method_unknown",
+          "Could not tell how agy was installed, so its updater was not run."
+        );
+    }
+  }
+  async function applyCodex(executable, env) {
+    const install = await resolved(() => codexInstall(executable, env), { kind: "other" });
+    return install.kind === "homebrew" ? upgradeCask("codex", install, env) : runInstaller("codex", executable, ["update"], env);
+  }
+  const apply = async (provider) => {
+    const executable = executableFor(provider);
+    const env = childEnv(provider, baseEnv);
+    switch (provider) {
+      case "claude":
+        return applyClaude(executable, env);
+      case "codex":
+        return applyCodex(executable, env);
+      case "agy":
+        return applyAgy(executable, env);
+    }
   };
   return {
     check,

@@ -5,9 +5,9 @@
  */
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, sep } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { isRecord } from "./internal.js";
-import { resolveExecutable } from "./process.js";
+import { homebrewCaskAt, resolveRealPath } from "./homebrew.js";
 
 export const AGY_MANIFEST_BASE =
   "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests";
@@ -54,26 +54,23 @@ export function parseAgyManifest(text: string): string | null {
   return version;
 }
 
-export type AgyInstallMethod = "native" | "homebrew" | "unknown";
+export type AgyInstall =
+  | { kind: "native" }
+  | { kind: "homebrew"; cask: string; brew: string }
+  | { kind: "unknown" };
 
-/** How the agy on PATH was installed: Homebrew's cask, the official
- * installer (`~/.local/bin/agy`), or something this library can't vouch for. */
-export async function resolveAgyInstall(executable: string, env: NodeJS.ProcessEnv): Promise<AgyInstallMethod> {
-  if (process.platform === "win32") return "unknown";
-  const found = resolveExecutable(executable, env);
-  if (!found) return "unknown";
-  let real: string;
-  try {
-    real = await realpath(found);
-  } catch {
-    return "unknown";
-  }
-  if (real.includes(`${sep}Caskroom${sep}antigravity-cli${sep}`)) return "homebrew";
-  // The official installer writes the binary itself to ~/.local/bin/agy;
-  // its --dir option puts it somewhere this library can't vouch for. Compare
-  // resolved folders: on macOS a home under /var is really /private/var.
+/** How the agy on PATH was installed: Homebrew's antigravity-cli cask, the
+ * official installer (`~/.local/bin/agy`), or something this library can't
+ * vouch for, such as a binary copied somewhere by hand. */
+export async function resolveAgyInstall(executable: string, env: NodeJS.ProcessEnv): Promise<AgyInstall> {
+  const real = await resolveRealPath(executable, env);
+  if (!real) return { kind: "unknown" };
+  const cask = homebrewCaskAt(real);
+  if (cask) return cask.cask === "antigravity-cli" ? { kind: "homebrew", ...cask } : { kind: "unknown" };
+  // The official installer writes the binary itself to ~/.local/bin/agy.
+  // Compare resolved folders: on macOS a home under /var is really /private/var.
   const home = env.HOME ?? homedir();
   const binDir = await realpath(join(home, ".local", "bin")).catch(() => undefined);
-  if (binDir && basename(real) === "agy" && dirname(real) === binDir) return "native";
-  return "unknown";
+  if (binDir && basename(real) === "agy" && dirname(real) === binDir) return { kind: "native" };
+  return { kind: "unknown" };
 }

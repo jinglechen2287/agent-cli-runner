@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { agyManifestUrl } from "../src/agy-release.js";
+import { classifyClaudeInstall, parseClaudeDoctor } from "../src/claude-install.js";
 import {
   createProviderUpdateService,
   type ProviderUpdateCommandResult,
@@ -41,22 +42,48 @@ function makeDeps(
       if (value instanceof Error) throw value;
       return value;
     }),
+    // The real resolvers follow the executable on this machine's PATH; these
+    // read only what doctor printed, so a test never depends on the host.
+    resolveClaudeInstall: claudeAt(null),
+    resolveCodexInstall: vi.fn(async () => ({ kind: "other" as const })),
+    resolveAgyInstall: vi.fn(async () => ({ kind: "unknown" as const })),
   };
 }
 
-function claudeDoctor(
-  installMethod = "native",
-  channel = "latest",
-): ProviderUpdateCommandResult {
-  return result(`
-Claude Code doctor
-
-Running: native (2.1.219)
-Config install method: ${installMethod}
-Auto-updates: enabled
-Auto-update channel: ${channel}
-  `);
+/** A Claude install resolver that sees the executable at `realPath`. */
+function claudeAt(realPath: string | null) {
+  return vi.fn(async (_executable: string, _env: NodeJS.ProcessEnv, doctorOutput: string | null) =>
+    classifyClaudeInstall(realPath, doctorOutput === null ? null : parseClaudeDoctor(doctorOutput)));
 }
+
+const CONFIG_INSTALL_METHOD: Record<string, string> = {
+  native: "native",
+  "npm-global": "global",
+  "npm-local": "local",
+};
+
+/** `claude doctor` output. `running` null leaves out the Running line, as
+ * builds before it did. */
+function claudeDoctor(
+  running: string | null = "native",
+  channel = "latest",
+  extra: { packageManager?: string; path?: string; configInstallMethod?: string } = {},
+): ProviderUpdateCommandResult {
+  const config = extra.configInstallMethod ?? CONFIG_INSTALL_METHOD[running ?? ""] ?? "unknown";
+  return result([
+    "Claude Code doctor",
+    "",
+    ...(running ? [`Running: ${running} (2.1.219)`] : []),
+    ...(extra.packageManager ? [`Package manager: ${extra.packageManager}`] : []),
+    ...(extra.path ? [`Path: ${extra.path}`] : []),
+    `Config install method: ${config}`,
+    "Auto-updates: enabled",
+    `Auto-update channel: ${channel}`,
+  ].join("\n"));
+}
+
+const commandsRun = (deps: ProviderUpdateServiceDeps) =>
+  vi.mocked(deps.runCommand!).mock.calls.map(([executable, args]) => commandKey(executable, args));
 
 function codexDoctor(
   latestVersion: string,
@@ -123,10 +150,10 @@ describe("provider update service", () => {
     });
   });
 
-  it("does not compare non-native Claude installations with native channels", async () => {
+  it("does not compare a Claude another package manager owns with any channel", async () => {
     const deps = makeDeps({
       "claude --version": result("2.1.219 (Claude Code)"),
-      "claude doctor": claudeDoctor("homebrew", "latest"),
+      "claude doctor": claudeDoctor("package-manager", "latest", { packageManager: "winget" }),
     });
 
     await expect(
@@ -341,28 +368,33 @@ describe("provider update service", () => {
     });
   });
 
-  it.each(["homebrew", "npm-global"])(
-    "refuses to run the installer for a %s Claude install",
-    async (installMethod) => {
-      const deps = makeDeps({ "claude doctor": claudeDoctor(installMethod) });
+  it.each(["winget", "apk", "mise", "asdf"])(
+    "refuses to run any installer for a Claude install %s owns",
+    async (manager) => {
+      const deps = makeDeps({ "claude doctor": claudeDoctor("package-manager", "stable", { packageManager: manager }) });
 
-      await expect(
-        createProviderUpdateService({}, deps).apply("claude"),
-      ).resolves.toMatchObject({
+      const refused = await createProviderUpdateService({}, deps).apply("claude");
+      expect(refused).toMatchObject({
         provider: "claude",
         ok: false,
         exitCode: null,
         reason: "unsupported_installation",
-        // Naming the manager is the whole point: it tells the user where to go.
-        error: `Claude Code was installed with ${installMethod}; update it with that package manager.`,
       });
-      expect(deps.runCommand).not.toHaveBeenCalledWith(
-        "claude",
-        ["update"],
-        expect.anything(),
-      );
+      // Naming the manager is the whole point: it tells the user where to go.
+      expect(refused.error).toContain(manager);
+      expect(commandsRun(deps)).toEqual(["claude doctor"]);
     },
   );
+
+  it("refuses to update a development build", async () => {
+    const deps = makeDeps({ "claude doctor": claudeDoctor("development") });
+
+    await expect(createProviderUpdateService({}, deps).apply("claude")).resolves.toMatchObject({
+      ok: false,
+      reason: "unsupported_installation",
+    });
+    expect(commandsRun(deps)).toEqual(["claude doctor"]);
+  });
 
   it("refuses without claiming a package manager when doctor cannot be parsed", async () => {
     const deps = makeDeps({ "claude doctor": result("Claude Code doctor") });
@@ -552,7 +584,7 @@ describe("provider update service", () => {
   it("uses five-second checks and strips provider nesting guards", async () => {
     const deps = makeDeps({
       "claude --version": result("2.1.219 (Claude Code)"),
-      "claude doctor": claudeDoctor("homebrew"),
+      "claude doctor": claudeDoctor("package-manager", "latest", { packageManager: "mise" }),
       "codex --version": result("codex-cli 0.145.0"),
       "codex doctor --json": codexDoctor("0.145.0"),
     });
@@ -637,13 +669,13 @@ describe("provider update service regressions", () => {
   });
 
   it("keeps the doctor transcript on an unsupported_installation refusal", async () => {
-    const deps = makeDeps({ "claude doctor": claudeDoctor("brew") });
+    const deps = makeDeps({ "claude doctor": claudeDoctor("package-manager", "latest", { packageManager: "mise" }) });
 
     await expect(
       createProviderUpdateService({}, deps).apply("claude"),
     ).resolves.toMatchObject({
       reason: "unsupported_installation",
-      output: expect.stringContaining("Config install method: brew"),
+      output: expect.stringContaining("Package manager: mise"),
     });
   });
 });
@@ -656,7 +688,11 @@ describe("agy updates", () => {
     ...overrides,
   });
   const manifestUrl = agyManifestUrl()!;
-  const install = (method: "native" | "homebrew" | "unknown") => vi.fn(async () => method);
+  const install = (kind: "native" | "homebrew" | "unknown") => vi.fn(async () => kind === "homebrew"
+    ? { kind, cask: "antigravity-cli", brew: "/opt/homebrew/bin/brew" }
+    : { kind });
+  const caskUrl = "https://formulae.brew.sh/api/cask/antigravity-cli.json";
+  const cask = (version: string) => JSON.stringify({ token: "antigravity-cli", version });
 
   it("reports an update from the auto-updater manifest on an official install", async () => {
     const deps = { ...makeDeps({ "agy --version": result("1.5.13") }, { [manifestUrl]: manifest("1.5.14") }), resolveAgyInstall: install("native") };
@@ -672,12 +708,26 @@ describe("agy updates", () => {
     expect(deps.fetchText).toHaveBeenCalledWith(manifestUrl, { timeoutMs: 10_000 });
   });
 
-  it("answers unsupported_installation for Homebrew without fetching", async () => {
-    const deps = { ...makeDeps({ "agy --version": result("1.5.13") }), resolveAgyInstall: install("homebrew") };
+  it("reports a Homebrew update from the cask, not the manifest", async () => {
+    const deps = {
+      ...makeDeps({ "agy --version": result("1.5.13") }, { [caskUrl]: cask("1.5.14,5302690847260672") }),
+      resolveAgyInstall: install("homebrew"),
+    };
     await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({
-      state: "unknown", reason: "unsupported_installation", installedVersion: "1.5.13",
+      state: "update_available", installedVersion: "1.5.13", latestVersion: "1.5.14", reason: null,
     });
-    expect(deps.fetchText).not.toHaveBeenCalled();
+    expect(vi.mocked(deps.fetchText!).mock.calls.map(([url]) => url)).toEqual([caskUrl]);
+  });
+
+  it("calls a Homebrew agy current while the cask has not caught up with the manifest", async () => {
+    const deps = {
+      ...makeDeps({ "agy --version": result("1.5.14") }, { [caskUrl]: cask("1.5.14,5302690847260672"), [manifestUrl]: manifest("1.5.15") }),
+      resolveAgyInstall: install("homebrew"),
+    };
+    await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({
+      state: "current", installedVersion: "1.5.14", latestVersion: "1.5.14",
+    });
+    expect(vi.mocked(deps.fetchText!).mock.calls.map(([url]) => url)).toEqual([caskUrl]);
   });
 
   it("answers version_unavailable for a bad manifest or a failed fetch", async () => {
@@ -705,23 +755,370 @@ describe("agy updates", () => {
     });
   });
 
-  it("runs agy update only on an official install", async () => {
+  it("runs agy update on an official install and brew on a Homebrew one", async () => {
     const native = { ...makeDeps({ "agy update": result("Updated to 1.5.14") }), resolveAgyInstall: install("native") };
     await expect(createProviderUpdateService({}, native).apply("agy")).resolves.toMatchObject({
       provider: "agy", ok: true, exitCode: 0, output: "Updated to 1.5.14",
     });
     expect(native.runCommand).toHaveBeenCalledWith("agy", ["update"], expect.objectContaining({ timeoutMs: 600_000 }));
 
-    const brew = { ...makeDeps({}), resolveAgyInstall: install("homebrew") };
-    const refused = await createProviderUpdateService({}, brew).apply("agy");
-    expect(refused).toMatchObject({ ok: false, exitCode: null, reason: "unsupported_installation" });
-    expect(refused.error).toContain("brew upgrade --cask antigravity-cli");
-    expect(brew.runCommand).not.toHaveBeenCalled();
+    const brew = {
+      ...makeDeps({ "/opt/homebrew/bin/brew upgrade --cask antigravity-cli": result("==> Upgrading antigravity-cli") }),
+      resolveAgyInstall: install("homebrew"),
+    };
+    await expect(createProviderUpdateService({}, brew).apply("agy")).resolves.toMatchObject({
+      provider: "agy", ok: true, exitCode: 0, output: "==> Upgrading antigravity-cli",
+    });
+    expect(brew.runCommand).toHaveBeenCalledWith(
+      "/opt/homebrew/bin/brew",
+      ["upgrade", "--cask", "antigravity-cli"],
+      expect.objectContaining({ timeoutMs: 600_000 }),
+    );
 
     const unknown = { ...makeDeps({}), resolveAgyInstall: install("unknown") };
     await expect(createProviderUpdateService({}, unknown).apply("agy")).resolves.toMatchObject({
       ok: false, reason: "install_method_unknown",
     });
     expect(unknown.runCommand).not.toHaveBeenCalled();
+  });
+});
+
+describe("Claude installed through npm", () => {
+  it("checks the npm dist-tag for the doctor's channel", async () => {
+    const deps = makeDeps(
+      {
+        "claude --version": result("2.1.219 (Claude Code)"),
+        "claude doctor": claudeDoctor("npm-global", "latest"),
+      },
+      {
+        "https://registry.npmjs.org/@anthropic-ai/claude-code/latest": JSON.stringify({ name: "@anthropic-ai/claude-code", version: "2.1.220" }),
+      },
+    );
+
+    await expect(createProviderUpdateService({}, deps).check("claude")).resolves.toMatchObject({
+      state: "update_available",
+      installedVersion: "2.1.219",
+      latestVersion: "2.1.220",
+      channel: "latest",
+      reason: null,
+    });
+  });
+
+  it("lets claude update run npm itself", async () => {
+    const deps = makeDeps({
+      "claude doctor": claudeDoctor("npm-local"),
+      "claude update": result("Successfully updated"),
+    });
+
+    await expect(createProviderUpdateService({}, deps).apply("claude")).resolves.toMatchObject({ ok: true, exitCode: 0 });
+    expect(commandsRun(deps)).toEqual(["claude doctor", "claude update"]);
+  });
+
+  it("treats an older build's global config install method as npm", async () => {
+    const deps = makeDeps(
+      {
+        "claude --version": result("2.1.100 (Claude Code)"),
+        "claude doctor": claudeDoctor(null, "stable", { configInstallMethod: "global" }),
+      },
+      { "https://registry.npmjs.org/@anthropic-ai/claude-code/stable": JSON.stringify({ version: "2.1.100" }) },
+    );
+
+    await expect(createProviderUpdateService({}, deps).check("claude")).resolves.toMatchObject({
+      state: "current",
+      channel: "stable",
+    });
+  });
+
+  it.each([
+    {
+      manager: "bun",
+      realPath: "/Users/u/.bun/install/global/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+      path: undefined,
+    },
+    {
+      manager: "pnpm",
+      realPath: "/Users/u/Library/pnpm/claude",
+      path: "/Users/u/Library/pnpm/global/5/.pnpm/@anthropic-ai+claude-code@2.1.219/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+    },
+  ])("refuses a $manager global install that doctor reports as npm-global", async ({ manager, realPath, path }) => {
+    const doctor = claudeDoctor("npm-global", "latest", path ? { path } : {});
+    const checking = { ...makeDeps({ "claude --version": result("2.1.219 (Claude Code)"), "claude doctor": doctor }), resolveClaudeInstall: claudeAt(realPath) };
+    await expect(createProviderUpdateService({}, checking).check("claude")).resolves.toMatchObject({
+      state: "unknown",
+      reason: "unsupported_installation",
+      installedVersion: "2.1.219",
+    });
+    expect(checking.fetchText).not.toHaveBeenCalled();
+
+    const applying = { ...makeDeps({ "claude doctor": doctor }), resolveClaudeInstall: claudeAt(realPath) };
+    const refused = await createProviderUpdateService({}, applying).apply("claude");
+    expect(refused).toMatchObject({ ok: false, reason: "unsupported_installation" });
+    expect(refused.error).toContain(manager);
+    expect(commandsRun(applying)).toEqual(["claude doctor"]);
+  });
+});
+
+describe("Claude installed through Homebrew", () => {
+  const brewDoctor = claudeDoctor("package-manager", "latest", { packageManager: "homebrew" });
+
+  it("checks the claude-code cask on the stable channel", async () => {
+    const deps = {
+      ...makeDeps(
+        { "claude --version": result("2.1.320 (Claude Code)"), "claude doctor": brewDoctor },
+        { "https://formulae.brew.sh/api/cask/claude-code.json": JSON.stringify({ token: "claude-code", version: "2.1.323" }) },
+      ),
+      resolveClaudeInstall: claudeAt("/opt/homebrew/Caskroom/claude-code/2.1.320/claude"),
+    };
+
+    await expect(createProviderUpdateService({}, deps).check("claude")).resolves.toMatchObject({
+      state: "update_available",
+      installedVersion: "2.1.320",
+      latestVersion: "2.1.323",
+      channel: "stable",
+      reason: null,
+    });
+  });
+
+  it("upgrades the cask with that prefix's brew", async () => {
+    const deps = {
+      ...makeDeps({
+        "claude doctor": brewDoctor,
+        "/opt/homebrew/bin/brew upgrade --cask claude-code": result("==> Upgrading 1 outdated package"),
+      }),
+      resolveClaudeInstall: claudeAt("/opt/homebrew/Caskroom/claude-code/2.1.320/claude"),
+    };
+
+    await expect(createProviderUpdateService({}, deps).apply("claude")).resolves.toMatchObject({ ok: true, exitCode: 0 });
+    expect(deps.runCommand).toHaveBeenCalledWith(
+      "/opt/homebrew/bin/brew",
+      ["upgrade", "--cask", "claude-code"],
+      expect.objectContaining({ timeoutMs: 600_000 }),
+    );
+    expect(commandsRun(deps)).toEqual(["claude doctor", "/opt/homebrew/bin/brew upgrade --cask claude-code"]);
+  });
+
+  it("checks and upgrades claude-code@latest on the latest channel", async () => {
+    const realPath = "/opt/homebrew/Caskroom/claude-code@latest/2.1.330/claude";
+    const checking = {
+      ...makeDeps(
+        { "claude --version": result("2.1.330 (Claude Code)"), "claude doctor": claudeDoctor("package-manager", "stable", { packageManager: "homebrew" }) },
+        { "https://formulae.brew.sh/api/cask/claude-code@latest.json": JSON.stringify({ version: "2.1.330" }) },
+      ),
+      resolveClaudeInstall: claudeAt(realPath),
+    };
+    await expect(createProviderUpdateService({}, checking).check("claude")).resolves.toMatchObject({
+      state: "current",
+      channel: "latest",
+    });
+
+    const applying = {
+      ...makeDeps({ "claude doctor": brewDoctor, "/opt/homebrew/bin/brew upgrade --cask claude-code@latest": result("") }),
+      resolveClaudeInstall: claudeAt(realPath),
+    };
+    await createProviderUpdateService({}, applying).apply("claude");
+    expect(commandsRun(applying)).toContain("/opt/homebrew/bin/brew upgrade --cask claude-code@latest");
+  });
+
+  it("still upgrades the cask when doctor itself fails", async () => {
+    const deps = {
+      ...makeDeps({
+        "claude doctor": new Error("doctor crashed"),
+        "/opt/homebrew/bin/brew upgrade --cask claude-code": result("done"),
+      }),
+      resolveClaudeInstall: claudeAt("/opt/homebrew/Caskroom/claude-code/2.1.320/claude"),
+    };
+
+    await expect(createProviderUpdateService({}, deps).apply("claude")).resolves.toMatchObject({ ok: true });
+  });
+
+  it("reports a missing brew as brew, not as claude", async () => {
+    const deps = {
+      ...makeDeps({
+        "claude doctor": brewDoctor,
+        "/opt/homebrew/bin/brew upgrade --cask claude-code": Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }),
+      }),
+      resolveClaudeInstall: claudeAt("/opt/homebrew/Caskroom/claude-code/2.1.320/claude"),
+    };
+
+    const failed = await createProviderUpdateService({}, deps).apply("claude");
+    expect(failed).toMatchObject({ ok: false, exitCode: null, reason: "cli_not_found" });
+    expect(failed.error).toContain("/opt/homebrew/bin/brew");
+  });
+
+  it("names the brew step and keeps what brew printed when it runs out of time", async () => {
+    const deps = {
+      ...makeDeps({
+        "claude doctor": brewDoctor,
+        "/opt/homebrew/bin/brew upgrade --cask claude-code": Object.assign(new Error("Command failed"), {
+          killed: true,
+          signal: "SIGTERM",
+          stdout: "==> Downloading claude-code 47%",
+        }),
+      }),
+      resolveClaudeInstall: claudeAt("/opt/homebrew/Caskroom/claude-code/2.1.320/claude"),
+    };
+
+    const failed = await createProviderUpdateService({}, deps).apply("claude");
+    expect(failed).toMatchObject({ ok: false, reason: "timed_out", output: "==> Downloading claude-code 47%" });
+    expect(failed.error).toContain("brew upgrade --cask claude-code");
+    expect(failed.error).toContain("10 minutes");
+  });
+});
+
+describe("Codex update actions", () => {
+  const doctorWith = (updateAction: string) => result(JSON.stringify({
+    checks: { "updates.status": { details: { "latest version": "0.171.0", "update action": updateAction } } },
+  }));
+
+  it("offers no update when Codex can't tell how it was installed", async () => {
+    const deps = makeDeps({
+      "codex --version": result("codex-cli 0.144.3"),
+      "codex doctor --json": doctorWith("manual or unknown"),
+    });
+
+    await expect(createProviderUpdateService({}, deps).check("codex")).resolves.toMatchObject({
+      state: "unknown",
+      reason: "unsupported_installation",
+      installedVersion: "0.144.3",
+    });
+  });
+
+  it.each(["npm install -g @openai/codex", "bun install -g @openai/codex", "brew upgrade --cask codex", "standalone installer"])(
+    "offers the update when Codex updates itself with %s",
+    async (updateAction) => {
+      const deps = makeDeps({
+        "codex --version": result("codex-cli 0.144.3"),
+        "codex doctor --json": doctorWith(updateAction),
+      });
+
+      await expect(createProviderUpdateService({}, deps).check("codex")).resolves.toMatchObject({
+        state: "update_available",
+        latestVersion: "0.171.0",
+      });
+    },
+  );
+});
+
+describe("Homebrew updates run one at a time", () => {
+  it("starts each brew run only after the one before it finishes", async () => {
+    const events: string[] = [];
+    const pending = new Map<string, () => void>();
+    const deps: ProviderUpdateServiceDeps = {
+      ...makeDeps({}),
+      runCommand: vi.fn(async (executable: string, args: readonly string[]) => {
+        const key = commandKey(executable, args);
+        if (key === "claude doctor") return claudeDoctor("package-manager", "latest", { packageManager: "homebrew" });
+        events.push(`start ${key}`);
+        await new Promise<void>((resolve) => pending.set(key, resolve));
+        events.push(`end ${key}`);
+        return result("done");
+      }),
+      resolveClaudeInstall: claudeAt("/opt/homebrew/Caskroom/claude-code/2.1.320/claude"),
+      resolveCodexInstall: vi.fn(async () => ({ kind: "homebrew" as const, cask: "codex", brew: "/opt/homebrew/bin/brew" })),
+      resolveAgyInstall: vi.fn(async () => ({ kind: "homebrew" as const, cask: "antigravity-cli", brew: "/opt/homebrew/bin/brew" })),
+    };
+    const service = createProviderUpdateService({}, deps);
+
+    const runs = Promise.all([service.apply("claude"), service.apply("codex"), service.apply("agy")]);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+    for (let step = 0; step < 3; step += 1) {
+      await settle();
+      // Exactly one run is in flight at every step: the next waits for it.
+      expect(pending.size).toBe(1);
+      const [key, finish] = [...pending.entries()][0]!;
+      pending.delete(key);
+      finish();
+    }
+    const results = await runs;
+
+    expect(results.every((outcome) => outcome.ok)).toBe(true);
+    expect(events.map((event) => event.split(" ")[0])).toEqual(["start", "end", "start", "end", "start", "end"]);
+    expect(new Set(events.map((event) => event.replace(/^(start|end) /, "")))).toEqual(new Set([
+      "/opt/homebrew/bin/brew upgrade --cask claude-code",
+      "/opt/homebrew/bin/brew upgrade --cask codex",
+      "/opt/homebrew/bin/brew upgrade --cask antigravity-cli",
+    ]));
+  });
+});
+
+describe("review follow-ups", () => {
+  it("offers no update for an agy whose install it can't vouch for, since apply would refuse it", async () => {
+    const manifestUrl = agyManifestUrl()!;
+    const deps = makeDeps({ "agy --version": result("1.5.13") }, { [manifestUrl]: "unused" });
+
+    await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({
+      state: "unknown",
+      reason: "unsupported_installation",
+      installedVersion: "1.5.13",
+    });
+  });
+
+  it("upgrades a Homebrew Codex with the brew that owns its cask, not whichever brew is on PATH", async () => {
+    const deps = {
+      ...makeDeps({ "/usr/local/bin/brew upgrade --cask codex": result("==> Upgrading codex") }),
+      resolveCodexInstall: vi.fn(async () => ({ kind: "homebrew" as const, cask: "codex", brew: "/usr/local/bin/brew" })),
+    };
+
+    await expect(createProviderUpdateService({}, deps).apply("codex")).resolves.toMatchObject({ ok: true, exitCode: 0 });
+    expect(commandsRun(deps)).toEqual(["/usr/local/bin/brew upgrade --cask codex"]);
+  });
+
+  it("treats a resolver that throws outright like one that rejects", async () => {
+    const boom = () => {
+      throw new Error("resolver exploded");
+    };
+    const deps: ProviderUpdateServiceDeps = {
+      ...makeDeps({
+        "claude --version": result("2.1.219 (Claude Code)"),
+        "claude doctor": claudeDoctor(),
+        "codex update": result("done"),
+      }),
+      resolveClaudeInstall: boom,
+      resolveCodexInstall: boom,
+      resolveAgyInstall: boom,
+    };
+    const service = createProviderUpdateService({}, deps);
+
+    await expect(service.check("claude")).resolves.toMatchObject({ state: "unknown", reason: "check_failed" });
+    await expect(service.apply("claude")).resolves.toMatchObject({ ok: false, reason: "install_method_unknown" });
+    await expect(service.apply("codex")).resolves.toMatchObject({ ok: true });
+    await expect(service.apply("agy")).resolves.toMatchObject({ ok: false, reason: "install_method_unknown" });
+  });
+
+  it("checks a Homebrew Codex against the cask, so it is offered only what brew can install", async () => {
+    const deps = {
+      ...makeDeps(
+        {
+          "codex --version": result("codex-cli 0.170.0"),
+          "codex doctor --json": codexDoctor("0.171.0"),
+        },
+        { "https://formulae.brew.sh/api/cask/codex.json": JSON.stringify({ version: "0.170.0" }) },
+      ),
+      resolveCodexInstall: vi.fn(async () => ({ kind: "homebrew" as const, cask: "codex", brew: "/opt/homebrew/bin/brew" })),
+    };
+
+    await expect(createProviderUpdateService({}, deps).check("codex")).resolves.toMatchObject({
+      state: "current",
+      installedVersion: "0.170.0",
+      latestVersion: "0.170.0",
+    });
+  });
+
+  it("keeps comparing agy with its manifest on Windows, where the install can't be placed", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "win32" });
+    try {
+      const url = agyManifestUrl()!;
+      const deps = makeDeps({ "agy --version": result("1.5.14") }, {
+        [url]: JSON.stringify({
+          version: "1.5.14",
+          url: "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.14-1/windows/agy.zip",
+          sha512: "a".repeat(128),
+        }),
+      });
+      await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({ state: "current" });
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
   });
 });

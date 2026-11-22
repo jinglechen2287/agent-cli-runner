@@ -1,4 +1,6 @@
-import { agyManifestUrl, parseAgyManifest, resolveAgyInstall, type AgyInstallMethod } from "./agy-release.js";
+import { agyManifestUrl, parseAgyManifest, resolveAgyInstall, type AgyInstall } from "./agy-release.js";
+import { resolveClaudeInstall, type ClaudeChannel, type ClaudeInstall } from "./claude-install.js";
+import { createBrewQueue, homebrewCaskApiUrl, resolveHomebrewCask } from "./homebrew.js";
 import { errorMessage, isRecord } from "./internal.js";
 import { childEnv, execCli, isMissingExecutable } from "./process.js";
 import type { AgentProvider } from "./providers.js";
@@ -11,6 +13,7 @@ const CODEX_DOCTOR_TIMEOUT_MS = 30_000;
  * a host's update state to "running" forever. */
 const APPLY_TIMEOUT_MS = 10 * 60 * 1_000;
 const CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases";
+const CLAUDE_NPM_BASE_URL = "https://registry.npmjs.org/@anthropic-ai/claude-code";
 const AGY_MANIFEST_TIMEOUT_MS = 10_000;
 
 export type ProviderUpdateProvider = AgentProvider;
@@ -102,8 +105,26 @@ export interface ProviderUpdateServiceDeps {
   ) => Promise<ProviderUpdateCommandResult>;
   fetchText?: (url: string, options: ProviderUpdateFetchOptions) => Promise<string>;
   now?: () => Date;
+  /** How the Claude Code at this path was installed. `doctorOutput` is null
+   * when `claude doctor` could not be run. */
+  resolveClaudeInstall?: (
+    executable: string,
+    env: NodeJS.ProcessEnv,
+    doctorOutput: string | null,
+  ) => Promise<ClaudeInstall>;
+  /** Whether the Codex at this path is a Homebrew cask, which brew upgrades directly. */
+  resolveCodexInstall?: (executable: string, env: NodeJS.ProcessEnv) => Promise<CodexInstall>;
   /** How the agy at this path was installed. */
-  resolveAgyInstall?: (executable: string, env: NodeJS.ProcessEnv) => Promise<AgyInstallMethod>;
+  resolveAgyInstall?: (executable: string, env: NodeJS.ProcessEnv) => Promise<AgyInstall>;
+}
+
+export type CodexInstall =
+  | { kind: "homebrew"; cask: string; brew: string }
+  | { kind: "other" };
+
+async function defaultResolveCodexInstall(executable: string, env: NodeJS.ProcessEnv): Promise<CodexInstall> {
+  const cask = await resolveHomebrewCask(executable, env);
+  return cask?.cask === "codex" ? { kind: "homebrew", ...cask } : { kind: "other" };
 }
 
 interface ParsedSemver {
@@ -283,29 +304,39 @@ function statusFromVersions(input: {
   });
 }
 
-function parseClaudeDoctor(
-  output: string,
-): { installMethod: string; channel: "stable" | "latest" | null } | null {
-  const installMethod = output.match(/^Config install method:\s*(\S+)\s*$/im)?.[1]?.toLowerCase();
-  if (!installMethod) return null;
-  const rawChannel = output.match(/^Auto-update channel:\s*(\S+)\s*$/im)?.[1]?.toLowerCase();
-  const channel = rawChannel === "stable" || rawChannel === "latest" ? rawChannel : null;
-  return { installMethod, channel };
-}
-
-function parseCodexLatestVersion(output: string): ParsedSemver | null {
+/** What `codex doctor --json` says about updates: the latest version, and the
+ * command `codex update` would run, which older builds don't report. */
+function parseCodexDoctor(output: string): { latest: ParsedSemver | null; updateAction: string | null } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(output);
   } catch {
+    return { latest: null, updateAction: null };
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.checks)) return { latest: null, updateAction: null };
+  const updateCheck = parsed.checks["updates.status"];
+  if (!isRecord(updateCheck) || !isRecord(updateCheck.details)) return { latest: null, updateAction: null };
+  const latest = updateCheck.details["latest version"];
+  const updateAction = updateCheck.details["update action"];
+  return {
+    latest: typeof latest === "string" ? parseVersion(latest) : null,
+    updateAction: typeof updateAction === "string" ? updateAction : null,
+  };
+}
+
+/** The `version` field of a JSON document, as the npm registry and Homebrew's cask API both answer. */
+function jsonVersion(text: string): ParsedSemver | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
     return null;
   }
-  if (!isRecord(parsed) || !isRecord(parsed.checks)) return null;
-  const updateCheck = parsed.checks["updates.status"];
-  if (!isRecord(updateCheck) || !isRecord(updateCheck.details)) return null;
-  const latest = updateCheck.details["latest version"];
-  return typeof latest === "string" ? parseVersion(latest) : null;
+  return isRecord(parsed) && typeof parsed.version === "string" ? parseVersion(parsed.version) : null;
 }
+
+/** What Codex's doctor reports when it can't tell how it was installed, so `codex update` has nothing to run. */
+const CODEX_UNKNOWN_UPDATE_ACTION = "manual or unknown";
 
 export function createProviderUpdateService(
   config: ProviderUpdateServiceConfig = {},
@@ -315,7 +346,46 @@ export function createProviderUpdateService(
   const fetchText = deps.fetchText ?? defaultFetchText;
   const now = deps.now ?? (() => new Date());
   const baseEnv = config.env ?? process.env;
+  const claudeInstall = deps.resolveClaudeInstall ?? resolveClaudeInstall;
+  const codexInstall = deps.resolveCodexInstall ?? defaultResolveCodexInstall;
   const agyInstall = deps.resolveAgyInstall ?? resolveAgyInstall;
+  const brewQueue = createBrewQueue();
+
+  /** A resolver's answer, or `fallback` when it throws or rejects. */
+  async function resolved<T>(resolve: () => Promise<T>, fallback: T): Promise<T> {
+    try {
+      return await resolve();
+    } catch {
+      return fallback;
+    }
+  }
+
+  /** A latest version from a URL, or null when the fetch or the parse fails. */
+  async function latestFrom(
+    url: string,
+    parse: (text: string) => ParsedSemver | null,
+    timeoutMs = CHECK_TIMEOUT_MS,
+  ): Promise<ParsedSemver | null> {
+    try {
+      return parse(await fetchText(url, { timeoutMs }));
+    } catch {
+      return null;
+    }
+  }
+
+  function latestClaude(
+    install: Extract<ClaudeInstall, { kind: "native" | "npm" | "homebrew" }>,
+    channel: ClaudeChannel,
+  ): Promise<ParsedSemver | null> {
+    switch (install.kind) {
+      case "native":
+        return latestFrom(`${CLAUDE_RELEASE_BASE_URL}/${channel}`, parseVersion);
+      case "npm":
+        return latestFrom(`${CLAUDE_NPM_BASE_URL}/${channel}`, jsonVersion);
+      case "homebrew":
+        return latestFrom(homebrewCaskApiUrl(install.cask), jsonVersion);
+    }
+  }
 
   async function installedVersion(
     provider: ProviderUpdateProvider,
@@ -350,47 +420,34 @@ export function createProviderUpdateService(
       settle(runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS })),
     ]);
     if ("state" in installed) return installed;
-    if (!doctorResult.ok) {
+    const doctorOutput = doctorResult.ok
+      ? combinedOutput(doctorResult.value.stdout, doctorResult.value.stderr)
+      : null;
+    const install = await resolved<ClaudeInstall>(() => claudeInstall(executable, env, doctorOutput), { kind: "unknown" });
+    if (install.kind === "unknown") {
       return unknownStatus("claude", checkedAt, "check_failed", installed.version);
     }
-    const doctor = doctorResult.value;
-    const metadata = parseClaudeDoctor(combinedOutput(doctor.stdout, doctor.stderr));
-    if (!metadata) {
-      return unknownStatus("claude", checkedAt, "check_failed", installed.version);
+    // Another manager owns it; comparing it with any channel would offer an
+    // update this service can't run.
+    if (install.kind === "other") {
+      return unknownStatus("claude", checkedAt, "unsupported_installation", installed.version);
     }
-    if (metadata.installMethod !== "native") {
-      return unknownStatus(
-        "claude",
-        checkedAt,
-        "unsupported_installation",
-        installed.version,
-      );
-    }
-    if (!metadata.channel) {
+    const { channel } = install;
+    if (!channel) {
       return unknownStatus("claude", checkedAt, "version_unavailable", installed.version);
     }
-
-    let latest: ParsedSemver | null;
-    try {
-      const response = await fetchText(
-        `${CLAUDE_RELEASE_BASE_URL}/${metadata.channel}`,
-        { timeoutMs: CHECK_TIMEOUT_MS },
-      );
-      latest = parseVersion(response);
-    } catch {
-      latest = null;
-    }
+    const latest = await latestClaude(install, channel);
     if (!latest) {
       return {
         ...unknownStatus("claude", checkedAt, "version_unavailable", installed.version),
-        channel: metadata.channel,
+        channel,
       };
     }
     return statusFromVersions({
       provider: "claude",
       installed,
       latest,
-      channel: metadata.channel,
+      channel,
       checkedAt,
     });
   }
@@ -406,8 +463,16 @@ export function createProviderUpdateService(
     if (!doctorResult.ok) {
       return unknownStatus("codex", checkedAt, "check_failed", installed.version);
     }
-    const doctor = doctorResult.value;
-    const latest = parseCodexLatestVersion(doctor.stdout);
+    const { latest: doctorLatest, updateAction } = parseCodexDoctor(doctorResult.value.stdout);
+    // `codex update` has nothing to run for an install Codex can't place.
+    if (updateAction === CODEX_UNKNOWN_UPDATE_ACTION) {
+      return unknownStatus("codex", checkedAt, "unsupported_installation", installed.version);
+    }
+    // A cask is upgraded by brew, so it is offered only the version the cask has.
+    const install = await resolved<CodexInstall>(() => codexInstall(executable, env), { kind: "other" });
+    const latest = install.kind === "homebrew"
+      ? await latestFrom(homebrewCaskApiUrl(install.cask), jsonVersion)
+      : doctorLatest;
     if (!latest) {
       return unknownStatus("codex", checkedAt, "version_unavailable", installed.version);
     }
@@ -421,25 +486,28 @@ export function createProviderUpdateService(
   }
 
   /** agy publishes one release line through its auto-updater manifest. A
-   * Homebrew cask can lag that manifest, so a Homebrew install reports
-   * unsupported_installation instead of an update brew can't yet install. */
+   * Homebrew cask can lag that manifest, so a Homebrew install reads the cask's
+   * own version instead, and is offered only what brew can install. */
   async function checkAgy(checkedAt: string): Promise<ProviderUpdateStatus> {
     const executable = executableFor("agy");
     const env = childEnv("agy", baseEnv);
     const installed = await installedVersion("agy", executable, env, checkedAt);
     if ("state" in installed) return installed;
-    const method = await agyInstall(executable, env).catch((): AgyInstallMethod => "unknown");
-    if (method === "homebrew") {
+    const install = await resolved<AgyInstall>(() => agyInstall(executable, env), { kind: "unknown" });
+    // apply refuses an install it can't vouch for, so offering it an update would only fail. Windows installs can't be placed at all, so they keep the manifest comparison for their status.
+    if (install.kind === "unknown" && process.platform !== "win32") {
       return unknownStatus("agy", checkedAt, "unsupported_installation", installed.version);
     }
-    const url = agyManifestUrl();
     let latest: ParsedSemver | null = null;
-    if (url) {
-      try {
-        const version = parseAgyManifest(await fetchText(url, { timeoutMs: AGY_MANIFEST_TIMEOUT_MS }));
-        latest = version ? parseVersion(version) : null;
-      } catch {
-        latest = null;
+    if (install.kind === "homebrew") {
+      latest = await latestFrom(homebrewCaskApiUrl(install.cask), jsonVersion);
+    } else {
+      const url = agyManifestUrl();
+      if (url) {
+        latest = await latestFrom(url, (text) => {
+          const version = parseAgyManifest(text);
+          return version ? parseVersion(version) : null;
+        }, AGY_MANIFEST_TIMEOUT_MS);
       }
     }
     if (!latest) return unknownStatus("agy", checkedAt, "version_unavailable", installed.version);
@@ -511,96 +579,22 @@ export function createProviderUpdateService(
     };
   }
 
-  /** Read how Claude Code was installed. Only native installs own their own
-   * binary: a Homebrew or npm install belongs to that package manager and
-   * `claude update` cannot drive it, so `apply` refuses before spawning
-   * anything — mirroring what `check` already reports. */
-  async function claudeInstallMethod(
-    executable: string,
-    env: NodeJS.ProcessEnv,
-  ): Promise<{ installMethod: string | null; output: string }> {
-    const doctor = await runCommand(executable, ["doctor"], {
-      env,
-      timeoutMs: CHECK_TIMEOUT_MS,
-    });
-    const output = combinedOutput(doctor.stdout, doctor.stderr);
-    return {
-      installMethod: parseClaudeDoctor(output)?.installMethod ?? null,
-      // Kept even on refusal: when the parse fails, the transcript that
-      // failed to parse is the one artifact that explains why.
-      output,
-    };
-  }
-
-  const apply = async (
+  /** Run one installer step with the long apply timeout, reporting a failure
+   * under the command that actually ran. */
+  async function runInstaller(
     provider: ProviderUpdateProvider,
-  ): Promise<ProviderUpdateApplyResult> => {
-    const executable = executableFor(provider);
-    const env = childEnv(provider, baseEnv);
-
-    if (provider === "claude") {
-      let installMethod: string | null;
-      let doctorOutput: string;
-      try {
-        ({ installMethod, output: doctorOutput } = await claudeInstallMethod(executable, env));
-      } catch (error) {
-        return failureFromError(
-          provider,
-          executable,
-          { args: "doctor", timeoutMs: CHECK_TIMEOUT_MS },
-          error,
-        );
-      }
-      // Both cases refuse, but only one of them is a fact about the install:
-      // claiming "not native" when doctor was simply unreadable would send the
-      // user off to a package manager that may not own this binary at all.
-      if (installMethod === null) {
-        return refusal(
-          provider,
-          "install_method_unknown",
-          "Could not read how Claude Code was installed, so the updater was not run.",
-          doctorOutput,
-        );
-      }
-      if (installMethod !== "native") {
-        return refusal(
-          provider,
-          "unsupported_installation",
-          `Claude Code was installed with ${installMethod}; update it with that package manager.`,
-          doctorOutput,
-        );
-      }
-    }
-
-    if (provider === "agy") {
-      const method = await agyInstall(executable, env).catch((): AgyInstallMethod => "unknown");
-      if (method === "homebrew") {
-        return refusal(
-          provider,
-          "unsupported_installation",
-          "agy was installed with Homebrew; update it with `brew upgrade --cask antigravity-cli`.",
-        );
-      }
-      if (method === "unknown") {
-        return refusal(
-          provider,
-          "install_method_unknown",
-          "Could not tell how agy was installed, so its updater was not run.",
-        );
-      }
-    }
-
+    executable: string,
+    args: readonly string[],
+    env: NodeJS.ProcessEnv,
+  ): Promise<ProviderUpdateApplyResult> {
     let command: ProviderUpdateCommandResult;
     try {
-      command = await runCommand(executable, ["update"], {
-        env,
-        timeoutMs: APPLY_TIMEOUT_MS,
-      });
+      command = await runCommand(executable, args, { env, timeoutMs: APPLY_TIMEOUT_MS });
     } catch (error) {
       return failureFromError(
         provider,
         executable,
-        { args: "update", timeoutMs: APPLY_TIMEOUT_MS },
+        { args: args.join(" "), timeoutMs: APPLY_TIMEOUT_MS },
         error,
       );
     }
@@ -612,6 +606,108 @@ export function createProviderUpdateService(
       error: null,
       reason: null,
     };
+  }
+
+  /** Upgrade a cask with its own prefix's brew, one brew run at a time. */
+  const upgradeCask = (
+    provider: ProviderUpdateProvider,
+    install: { cask: string; brew: string },
+    env: NodeJS.ProcessEnv,
+  ) => brewQueue(() => runInstaller(provider, install.brew, ["upgrade", "--cask", install.cask], env));
+
+  /** Native and npm installs go to `claude update`, which runs npm itself for
+   * npm. A cask Claude publishes is upgraded with brew, since `claude update`
+   * only prints advice for one. Anything else belongs to a manager this
+   * service doesn't drive, and is refused before anything runs. */
+  async function applyClaude(executable: string, env: NodeJS.ProcessEnv): Promise<ProviderUpdateApplyResult> {
+    let doctorOutput: string | null = null;
+    let doctorError: { error: unknown } | null = null;
+    try {
+      const doctor = await runCommand(executable, ["doctor"], { env, timeoutMs: CHECK_TIMEOUT_MS });
+      doctorOutput = combinedOutput(doctor.stdout, doctor.stderr);
+    } catch (error) {
+      doctorError = { error };
+    }
+    const install = await resolved<ClaudeInstall>(() => claudeInstall(executable, env, doctorOutput), { kind: "unknown" });
+    // The transcript is kept on every refusal: when the parse fails, the
+    // output that failed to parse is the one artifact that explains why.
+    const output = doctorOutput ?? "";
+    switch (install.kind) {
+      case "unknown":
+        if (doctorError) {
+          return failureFromError(
+            "claude",
+            executable,
+            { args: "doctor", timeoutMs: CHECK_TIMEOUT_MS },
+            doctorError.error,
+          );
+        }
+        // Not a fact about the install: claiming a package manager when
+        // doctor was simply unreadable would send the user off to one that
+        // may not own this binary at all.
+        return refusal(
+          "claude",
+          "install_method_unknown",
+          "Could not read how Claude Code was installed, so the updater was not run.",
+          output,
+        );
+      case "other":
+        return refusal(
+          "claude",
+          "unsupported_installation",
+          install.manager === "development"
+            ? "This is a development build of Claude Code, which can't be updated."
+            : `Claude Code was installed with ${install.manager}; update it with that package manager.`,
+          output,
+        );
+      case "homebrew":
+        return upgradeCask("claude", install, env);
+      case "native":
+      case "npm":
+        return runInstaller("claude", executable, ["update"], env);
+    }
+  }
+
+  async function applyAgy(executable: string, env: NodeJS.ProcessEnv): Promise<ProviderUpdateApplyResult> {
+    const install = await resolved<AgyInstall>(() => agyInstall(executable, env), { kind: "unknown" });
+    switch (install.kind) {
+      case "homebrew":
+        return upgradeCask("agy", install, env);
+      case "native":
+        return runInstaller("agy", executable, ["update"], env);
+      case "unknown":
+        return refusal(
+          "agy",
+          "install_method_unknown",
+          "Could not tell how agy was installed, so its updater was not run.",
+        );
+    }
+  }
+
+  /** `codex update` runs whatever its own install needs: npm, bun, pnpm or
+   * the standalone installer. A cask is upgraded with the brew that owns it
+   * instead, so a different brew earlier on PATH can't upgrade its own copy
+   * and report success, and the brew queue holds until brew itself exits. */
+  async function applyCodex(executable: string, env: NodeJS.ProcessEnv): Promise<ProviderUpdateApplyResult> {
+    const install = await resolved<CodexInstall>(() => codexInstall(executable, env), { kind: "other" });
+    return install.kind === "homebrew"
+      ? upgradeCask("codex", install, env)
+      : runInstaller("codex", executable, ["update"], env);
+  }
+
+  const apply = async (
+    provider: ProviderUpdateProvider,
+  ): Promise<ProviderUpdateApplyResult> => {
+    const executable = executableFor(provider);
+    const env = childEnv(provider, baseEnv);
+    switch (provider) {
+      case "claude":
+        return applyClaude(executable, env);
+      case "codex":
+        return applyCodex(executable, env);
+      case "agy":
+        return applyAgy(executable, env);
+    }
   };
 
   return {

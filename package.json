@@ -1,6 +1,6 @@
 {
   "name": "agent-cli-runner",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Stream Claude Code, Codex app-server and the Antigravity CLI (agy) from Node or Bun: session resume, tools, usage, and abort/timeout handling.",
   "type": "module",
   "main": "./dist/index.js",

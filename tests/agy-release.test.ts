@@ -41,16 +41,28 @@ describe.skipIf(process.platform === "win32")("resolveAgyInstall", () => {
     executable(cask);
     mkdirSync(join(root, "brew-bin"));
     symlinkSync(cask, join(root, "brew-bin", "agy"));
-    expect(await resolveAgyInstall("agy", { PATH: join(root, "brew-bin"), HOME: root })).toBe("homebrew");
+    const brew = await resolveAgyInstall("agy", { PATH: join(root, "brew-bin"), HOME: root });
+    expect(brew).toMatchObject({ kind: "homebrew", cask: "antigravity-cli" });
+    expect(brew.kind === "homebrew" && brew.brew.endsWith("/bin/brew")).toBe(true);
 
     executable(join(root, ".local", "bin", "agy"));
-    expect(await resolveAgyInstall("agy", { PATH: join(root, ".local", "bin"), HOME: root })).toBe("native");
+    expect(await resolveAgyInstall("agy", { PATH: join(root, ".local", "bin"), HOME: root })).toEqual({ kind: "native" });
 
     executable(join(root, ".local", "tools", "agy"));
-    expect(await resolveAgyInstall("agy", { PATH: join(root, ".local", "tools"), HOME: root })).toBe("unknown");
+    expect(await resolveAgyInstall("agy", { PATH: join(root, ".local", "tools"), HOME: root })).toEqual({ kind: "unknown" });
 
     executable(join(root, "elsewhere", "agy"));
-    expect(await resolveAgyInstall("agy", { PATH: join(root, "elsewhere"), HOME: root })).toBe("unknown");
-    expect(await resolveAgyInstall("agy", { PATH: join(root, "nothing"), HOME: root })).toBe("unknown");
+    expect(await resolveAgyInstall("agy", { PATH: join(root, "elsewhere"), HOME: root })).toEqual({ kind: "unknown" });
+    expect(await resolveAgyInstall("agy", { PATH: join(root, "nothing"), HOME: root })).toEqual({ kind: "unknown" });
+  });
+
+  it("does not vouch for a cask other than antigravity-cli", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agy-install-"));
+    dirs.push(root);
+    const cask = join(root, "Caskroom", "someones-agy", "1.0.0", "agy");
+    executable(cask);
+    mkdirSync(join(root, "brew-bin"));
+    symlinkSync(cask, join(root, "brew-bin", "agy"));
+    expect(await resolveAgyInstall("agy", { PATH: join(root, "brew-bin"), HOME: root })).toEqual({ kind: "unknown" });
   });
 });

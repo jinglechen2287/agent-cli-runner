@@ -102,11 +102,30 @@ const all = await updates.checkAll(); // Claude, Codex and agy concurrently
 
 Every check reports `current`, `update_available`, `not_installed`, or `unknown`, together with the installed/latest versions and a stable reason when detection is unavailable. Expected command, parsing, and network failures are returned as status data rather than thrown.
 
-Claude detection is intentionally definitive only for native installations. It reads the installation method and `stable` / `latest` channel from `claude doctor`, then compares against that channel at `downloads.claude.ai`; package-manager installations return `unknown` instead of risking a cross-channel false positive. Codex reads the latest version from `codex doctor --json` and accepts its JSON even when unrelated diagnostics make the command exit nonzero. Older Codex versions without update metadata return `unknown`; there is no npm fallback. agy reads its installed version from `agy --version` and the latest from the manifest agy's own auto-updater uses (`antigravity-cli-auto-updater-…run.app/manifests/<platform>.json`), accepting it only when it points at Google's release bucket. A Homebrew install returns `unknown` with `unsupported_installation`, because the cask can lag the manifest.
+Each CLI is checked and updated the way its install expects:
 
-Checks use five-second command and network timeouts — thirty seconds for `codex doctor --json`, which checks the whole installation, network and database included — and strip the same provider nesting-guard environment variables as agent runs. They never invoke `claude update`, `codex update`, `agy update`, or a package manager, and they do not cache results.
+| CLI and install | Recognised by | Latest version from | `apply` runs |
+| --- | --- | --- | --- |
+| Claude, native | `claude doctor` prints `Running: native` | `downloads.claude.ai/claude-code-releases/<channel>` | `claude update` |
+| Claude, npm global or local | `Running: npm-global` or `npm-local`, and the real path is not under bun, pnpm or yarn | `registry.npmjs.org/@anthropic-ai/claude-code/<channel>` | `claude update`, which runs npm itself |
+| Claude, Homebrew | real path under `<prefix>/Caskroom/claude-code` (stable) or `claude-code@latest` (latest) | `formulae.brew.sh/api/cask/<cask>.json` | `<prefix>/bin/brew upgrade --cask <cask>` |
+| Claude, anything else | bun, pnpm or yarn global directories, another cask, or `Running: package-manager` / `development` | none: `unknown` with `unsupported_installation` | nothing: refused with `unsupported_installation`, naming the manager |
+| Codex, Homebrew | real path under `<prefix>/Caskroom/codex` | `formulae.brew.sh/api/cask/codex.json` | `<prefix>/bin/brew upgrade --cask codex` |
+| Codex, any other install | `codex doctor --json` | its `updates.status` `latest version` | `codex update`, which runs npm, bun, pnpm or its standalone installer itself |
+| agy, official installer | real path is `~/.local/bin/agy` | agy's auto-updater manifest (`antigravity-cli-auto-updater-…run.app/manifests/<platform>.json`) | `agy update` |
+| agy, Homebrew | real path under `<prefix>/Caskroom/antigravity-cli` | `formulae.brew.sh/api/cask/antigravity-cli.json` | `<prefix>/bin/brew upgrade --cask antigravity-cli` |
 
-`apply("agy")` runs `agy update` only for an install from the official installer, which puts it at `~/.local/bin/agy`. It refuses a Homebrew install with `unsupported_installation`, pointing at `brew upgrade --cask antigravity-cli`, and refuses any other install with `install_method_unknown`.
+The channel for native and npm installs is the `Auto-update channel` doctor reports; a Homebrew install's channel comes from its cask. Claude's own detection calls a bun, pnpm or yarn global install `npm-global`, and `claude update` would then run npm and leave that copy alone, so the real path is checked first. Builds whose doctor has no `Running:` line fall back to its `Config install method`. When doctor can't be read and the path says nothing, the check returns `unknown` with `check_failed`, and `apply` refuses with `install_method_unknown`, or reports doctor's own failure when doctor could not run at all.
+
+Codex reads the latest version from `codex doctor --json` and accepts its JSON even when unrelated diagnostics make the command exit nonzero. When doctor's `update action` is `manual or unknown`, `codex update` has nothing to run, so the check returns `unknown` with `unsupported_installation`. Older Codex versions without update metadata return `unknown`; there is no npm fallback.
+
+A Homebrew install of Claude, Codex or agy reads its latest version from Homebrew's cask API, the one brew itself reads, so it is never offered a release the cask hasn't picked up yet. agy's manifest is accepted only when it points at Google's release bucket. An agy anywhere other than `~/.local/bin/agy` or the antigravity-cli cask is checked as `unknown` with `unsupported_installation`, and `apply` refuses it with `install_method_unknown`.
+
+Checks use five-second command and network timeouts (thirty seconds for `codex doctor --json`, which checks the whole installation, network and database included; ten for agy's manifest) and strip the same provider nesting-guard environment variables as agent runs. They never invoke `claude update`, `codex update`, `agy update`, or an installer, and they do not cache results. `codex doctor --json` may itself query npm (`npm root -g`) on an npm install.
+
+`apply` runs installers with a ten-minute timeout. Brew runs from one service go one at a time, since two `brew upgrade` runs at once contend for brew's lock. Each cask is upgraded with the brew of the prefix it is installed under, not whichever brew comes first on `PATH`.
+
+`ProviderUpdateServiceDeps.resolveAgyInstall` now resolves to an `AgyInstall` object (`{ kind: "native" }`, `{ kind: "homebrew", cask, brew }` or `{ kind: "unknown" }`) instead of a string; 0.9.0 is the release that changed it.
 
 ### Claude-specific
 
