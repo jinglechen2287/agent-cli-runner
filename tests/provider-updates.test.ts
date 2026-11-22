@@ -1041,15 +1041,27 @@ describe("Homebrew updates run one at a time", () => {
   });
 });
 
+/** Run `body` as if on `platform`, for behaviour that differs on Windows. */
+async function onPlatform(platform: NodeJS.Platform, body: () => Promise<void>): Promise<void> {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: platform });
+  try {
+    await body();
+  } finally {
+    Object.defineProperty(process, "platform", original);
+  }
+}
+
 describe("review follow-ups", () => {
   it("offers no update for an agy whose install it can't vouch for, since apply would refuse it", async () => {
-    const manifestUrl = agyManifestUrl()!;
-    const deps = makeDeps({ "agy --version": result("1.5.13") }, { [manifestUrl]: "unused" });
+    await onPlatform("darwin", async () => {
+      const deps = makeDeps({ "agy --version": result("1.5.13") });
 
-    await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({
-      state: "unknown",
-      reason: "unsupported_installation",
-      installedVersion: "1.5.13",
+      await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({
+        state: "unknown",
+        reason: "unsupported_installation",
+        installedVersion: "1.5.13",
+      });
     });
   });
 
@@ -1105,9 +1117,7 @@ describe("review follow-ups", () => {
   });
 
   it("keeps comparing agy with its manifest on Windows, where the install can't be placed", async () => {
-    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-    Object.defineProperty(process, "platform", { value: "win32" });
-    try {
+    await onPlatform("win32", async () => {
       const url = agyManifestUrl()!;
       const deps = makeDeps({ "agy --version": result("1.5.14") }, {
         [url]: JSON.stringify({
@@ -1117,8 +1127,6 @@ describe("review follow-ups", () => {
         }),
       });
       await expect(createProviderUpdateService({}, deps).check("agy")).resolves.toMatchObject({ state: "current" });
-    } finally {
-      Object.defineProperty(process, "platform", platform);
-    }
+    });
   });
 });
