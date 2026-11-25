@@ -366,16 +366,15 @@ function qualifyModel(model, sessionModel) {
   if (!sessionModel) return model;
   return baseModelId(sessionModel) === baseModelId(model) ? sessionModel : model;
 }
-function pickPrimaryModel(modelUsage, preferred) {
-  if (!modelUsage) return void 0;
-  const entries = Object.entries(modelUsage);
-  if (entries.length === 0) return void 0;
+function pickPrimaryModel(modelUsage, preferred, allowFallback) {
+  const entries = Object.entries(modelUsage ?? {}).filter(([, entry]) => isRecord(entry));
   if (preferred) {
     const base = baseModelId(preferred);
     const match = entries.find(([key]) => key === preferred) ?? entries.find(([key]) => baseModelId(key) === base);
     if (match) return { model: match[0], contextWindow: toContextWindow(match[1].contextWindow) };
   }
   let best = entries[0];
+  if (!allowFallback || !best) return void 0;
   for (const entry of entries) {
     if ((toContextWindow(entry[1].contextWindow) ?? 0) > (toContextWindow(best[1].contextWindow) ?? 0)) {
       best = entry;
@@ -638,7 +637,7 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
       lastAssistantText = text3;
       safeCallback(() => callbacks.onAssistantText?.(text3));
     }
-    if (parsed.parent_tool_use_id) return;
+    if (parsed.parent_tool_use_id || message.model === "<synthetic>") return;
     const model = qualifyModel(message.model, session.model);
     if (model) lastAssistantModel = model;
     if (message.usage) {
@@ -695,10 +694,11 @@ function createClaudeTurnTranslator(callbacks, options = {}) {
     }
     isError = resultFailed(parsed);
     errors = Array.isArray(parsed.errors) ? parsed.errors.filter((entry) => typeof entry === "string") : [];
-    const occupancy = lastMessageUsage ?? (!compacted && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : void 0);
+    const preferred = lastAssistantModel ?? session.model;
+    const primary = pickPrimaryModel(parsed.modelUsage, preferred, !isError);
+    const occupancy = lastMessageUsage ?? (!compacted && (!isError || primary) && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : void 0);
     if (occupancy) {
-      const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? session.model);
-      const model = primary?.model ?? lastAssistantModel;
+      const model = primary?.model ?? (isError ? preferred : lastAssistantModel);
       const contextWindow = primary?.contextWindow ?? knownContextWindow(session, model);
       emitUsage(toClaudeUsage(occupancy, model, contextWindow));
     }

@@ -865,6 +865,103 @@ describe("createClaudeTurnTranslator", () => {
     expect(t.finish().usage).toMatchObject({ model: "claude-opus-5-5[1m]", contextWindow: 1_000_000 });
   });
 
+  it.each([
+    {
+      name: "the parent model's window is reported beside Haiku's",
+      sessionModel: "claude-sonnet-5-5",
+      assistantModel: "claude-sonnet-5-5",
+      modelUsage: { "claude-haiku-5-5": { contextWindow: 200_000 }, "claude-sonnet-5-5": { contextWindow: 200_000 } },
+      expectedModel: "claude-sonnet-5-5",
+      expectedWindow: 200_000,
+    },
+    {
+      name: "only helper usage is reported",
+      sessionModel: "claude-opus-5-5[1m]",
+      assistantModel: "claude-opus-5-5",
+      modelUsage: { "claude-haiku-5-5": { contextWindow: 200_000 } },
+      expectedModel: "claude-opus-5-5[1m]",
+      expectedWindow: 1_000_000,
+    },
+    {
+      name: "the parent model has a qualified ID only in the totals",
+      sessionModel: "claude-opus-5-5",
+      assistantModel: "claude-opus-5-5",
+      modelUsage: { "claude-haiku-5-5": { contextWindow: 200_000 }, "claude-opus-5-5[1m]": { contextWindow: 1_000_000 } },
+      expectedModel: "claude-opus-5-5[1m]",
+      expectedWindow: 1_000_000,
+    },
+    {
+      name: "Haiku is the parent model",
+      sessionModel: "claude-opus-5-5[1m]",
+      assistantModel: "claude-haiku-5-5",
+      modelUsage: { "claude-opus-5-5[1m]": { contextWindow: 1_000_000 }, "claude-haiku-5-5": { contextWindow: 200_000 } },
+      expectedModel: "claude-haiku-5-5",
+      expectedWindow: 200_000,
+    },
+  ])("keeps real assistant usage after a synthetic limit notice when $name", ({ sessionModel, assistantModel, modelUsage, expectedModel, expectedWindow }) => {
+    const notice = "You've hit your weekly limit";
+    const onAssistantText = vi.fn();
+    const onUsage = vi.fn();
+    const t = feed({ onAssistantText, onUsage }, [
+      { type: "system", subtype: "init", model: sessionModel },
+      {
+        type: "assistant",
+        message: {
+          model: assistantModel,
+          content: [{ type: "tool_use", id: "t", name: "Read", input: { file_path: "a.ts" } }],
+          usage: { input_tokens: 4, cache_read_input_tokens: 142_520, output_tokens: 265 },
+        },
+      },
+      {
+        type: "assistant",
+        error: "rate_limit",
+        message: {
+          model: "<synthetic>",
+          content: [{ type: "text", text: notice }],
+          usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 },
+        },
+      },
+      { type: "result", subtype: "success", is_error: true, result: notice, modelUsage },
+    ]);
+    const expectedUsage = {
+      model: expectedModel,
+      contextWindow: expectedWindow,
+      contextTokens: 142_524,
+      inputTokens: 4,
+      cachedInputTokens: 142_520,
+      outputTokens: 265,
+    };
+    expect(t.finish()).toMatchObject({ isError: true, text: expect.stringContaining("weekly limit"), usage: expectedUsage });
+    expect(onAssistantText).toHaveBeenCalledWith(expect.stringContaining("weekly limit"));
+    expect(onUsage.mock.calls.map(([usage]) => usage.contextTokens)).toEqual([142_524, 142_524]);
+    expect(onUsage).toHaveBeenLastCalledWith(expectedUsage);
+  });
+
+  it("does not attribute helper-only totals to a parent rejected before it could reply", () => {
+    const onUsage = vi.fn();
+    const t = feed({ onUsage }, [
+      { type: "system", subtype: "init", model: "claude-sonnet-5-5" },
+      {
+        type: "assistant",
+        error: "rate_limit",
+        message: {
+          model: "<synthetic>",
+          content: [{ type: "text", text: "You've hit your weekly limit" }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      },
+      {
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        usage: { input_tokens: 12, output_tokens: 3 },
+        modelUsage: { "claude-haiku-5-5": { contextWindow: 200_000 } },
+      },
+    ]);
+    expect(t.finish()).toMatchObject({ isError: true, text: expect.stringContaining("weekly limit") });
+    expect(onUsage).not.toHaveBeenCalled();
+  });
+
   it("prefers the exact session model over a same-base variant listed first", () => {
     const t = feed({}, [
       { type: "system", subtype: "init", session_id: "s", model: "claude-opus-5-5[1m]" },

@@ -249,16 +249,15 @@ function qualifyModel(
   return baseModelId(sessionModel) === baseModelId(model) ? sessionModel : model;
 }
 
-/** Pick the turn's main model from the `result` event's per-model rollup: the
- * one that produced the final assistant message when identifiable, else the one
- * with the largest context window (a sub-agent model has a smaller window). */
+/** Match the responding model in the result's per-model rollup. On success
+ * we can fall back to the largest window when the model is unknown. A failed
+ * result can list only helper calls, so it requires a match. */
 function pickPrimaryModel(
   modelUsage: Record<string, ClaudeModelUsage> | undefined,
   preferred: string | undefined,
+  allowFallback: boolean,
 ): { model: string; contextWindow: number | undefined } | undefined {
-  if (!modelUsage) return undefined;
-  const entries = Object.entries(modelUsage);
-  if (entries.length === 0) return undefined;
+  const entries = Object.entries(modelUsage ?? {}).filter(([, entry]) => isRecord(entry));
   if (preferred) {
     // Exact first: the bare id and its `[1m]` variant can both be listed.
     const base = baseModelId(preferred);
@@ -266,7 +265,8 @@ function pickPrimaryModel(
       ?? entries.find(([key]) => baseModelId(key) === base);
     if (match) return { model: match[0], contextWindow: toContextWindow(match[1].contextWindow) };
   }
-  let best = entries[0]!;
+  let best = entries[0];
+  if (!allowFallback || !best) return undefined;
   for (const entry of entries) {
     if ((toContextWindow(entry[1].contextWindow) ?? 0) > (toContextWindow(best[1].contextWindow) ?? 0)) {
       best = entry;
@@ -714,9 +714,9 @@ export function createClaudeTurnTranslator(
       lastAssistantText = text;
       safeCallback(() => callbacks.onAssistantText?.(text));
     }
-    // A subagent also runs on its own context window; its usage says
-    // nothing about how full this turn's is.
-    if (parsed.parent_tool_use_id) return;
+    // Subagent usage describes its own context. Synthetic notices, such as
+    // usage limits, carry no model output and would overwrite real usage.
+    if (parsed.parent_tool_use_id || message.model === "<synthetic>") return;
     const model = qualifyModel(message.model, session.model);
     // Track the responding model even on messages without usage, so the
     // result event can attribute usage to it rather than the largest-window
@@ -800,17 +800,15 @@ export function createClaudeTurnTranslator(
     // per-message usage does. Take only the authoritative model/window
     // from here, falling back to the summed counts when no message carried
     // usage (then the turn had a single request and they coincide).
-    // A result with no reply before it — a turn stopped before any output —
-    // counts nothing, and reporting that would zero the host's occupancy.
-    // Nor after a compaction: summed across it, they describe nothing.
+    // Skip zero totals and totals across a compaction. A failure can count
+    // helper calls even when the parent never ran. Require a matching
+    // per-model entry before using its totals.
+    const preferred = lastAssistantModel ?? session.model;
+    const primary = pickPrimaryModel(parsed.modelUsage, preferred, !isError);
     const occupancy = lastMessageUsage
-      ?? (!compacted && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : undefined);
+      ?? (!compacted && (!isError || primary) && parsed.usage && countsTokens(parsed.usage) ? parsed.usage : undefined);
     if (occupancy) {
-      // Without a reply to name the model, the session's own beats the
-      // largest-window guess: Claude Code's helper calls (Haiku) appear in
-      // modelUsage too, first, and can tie on window.
-      const primary = pickPrimaryModel(parsed.modelUsage, lastAssistantModel ?? session.model);
-      const model = primary?.model ?? lastAssistantModel;
+      const model = primary?.model ?? (isError ? preferred : lastAssistantModel);
       const contextWindow =
         primary?.contextWindow ?? knownContextWindow(session, model);
       emitUsage(toClaudeUsage(occupancy, model, contextWindow));
