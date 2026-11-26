@@ -9,7 +9,7 @@ import { lstat, mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { agyRequestError, startAgyAcp, type AgyAgentInfo } from "./agy-client.js";
-import { listAgyChildIds, readAgyChildren } from "./agy-children.js";
+import { listAgyChildIds, readAgyChildren, type AgyChildState } from "./agy-children.js";
 import {
   agyFinalUsage,
   agyPlanToolUse,
@@ -64,6 +64,10 @@ const REPLY_QUIET_MS = 3_000;
 const OPEN_REPLY_QUIET_MS = 120_000;
 /** How often a held turn checks for subagents agy left no record of. */
 const HOLD_CHECK_MS = 30_000;
+/** How often a running prompt reads agy's files for its subagents' reports.
+ * agy sends nothing when a subagent finishes, and one can finish while the
+ * prompt that launched it is still running. */
+const PROMPT_AGENT_CHECK_MS = 5_000;
 /** A subagent still missing from agy's files this long after its launch is
  * given up on, so a changed file layout cannot hold a turn forever. */
 const LOST_AGENT_MS = 120_000;
@@ -332,6 +336,8 @@ interface AgentEntry {
   owner: Run;
   /** Whether agy's files have shown this subagent. */
   seen: boolean;
+  /** The end agy's files showed while the prompt still ran, as shown. */
+  preview?: BackgroundAgentInfo;
 }
 
 export async function createAgySession(options: CreateAgySessionOptions): Promise<AgySession> {
@@ -449,6 +455,7 @@ async function openSession(context: OpenContext): Promise<AgySession> {
   let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
   let replyTimer: ReturnType<typeof setTimeout> | undefined;
   let holdTimer: ReturnType<typeof setTimeout> | undefined;
+  let promptAgentTimer: ReturnType<typeof setTimeout> | undefined;
   let commandHoldTimer: ReturnType<typeof setTimeout> | undefined;
 
   const currentModel = (): string | undefined => {
@@ -491,6 +498,14 @@ async function openSession(context: OpenContext): Promise<AgySession> {
     safeCallback(() => target.callbacks.onBackgroundAgentUpdate?.(snapshot));
   };
 
+  const endedInfo = (entry: AgentEntry, child: AgyChildState, now: number): BackgroundAgentInfo => ({
+    ...entry.info,
+    status: child.state === "killed" ? "interrupted" : "completed",
+    ...(child.summary ? { summary: child.summary } : {}),
+    updatedAt: now,
+    endedAt: child.reportedAt ?? now,
+  });
+
   const refreshAgents = async (): Promise<void> => {
     const ids = runningAgents().map((entry) => entry.info.id);
     if (ids.length === 0 || !sessionId) return;
@@ -501,21 +516,61 @@ async function openSession(context: OpenContext): Promise<AgySession> {
       if (!entry || entry.info.status !== "running") continue;
       entry.seen = true;
       if (child.state === "running") continue;
-      entry.info = {
-        ...entry.info,
-        status: child.state === "killed" ? "interrupted" : "completed",
-        ...(child.summary ? { summary: child.summary } : {}),
-        updatedAt: now,
-        endedAt: child.reportedAt ?? now,
-      };
+      entry.info = endedInfo(entry, child, now);
       emitAgent(entry);
     }
+  };
+
+  const prompting = (target: Run): boolean => run === target && !target.done.settled && target.outstanding > 0;
+
+  /** Show the subagents agy's files say have ended while the prompt that
+   * launched them still runs. Display only: what the turn waits on changes
+   * when agy answers, as before, and that later read has the last word.
+   * Ended means reported, as everywhere here: agy marks no other end, and a
+   * subagent can still be tidying up for a while after its report. */
+  const previewAgents = async (target: Run): Promise<void> => {
+    const ids = runningAgents().map((entry) => entry.info.id);
+    if (ids.length === 0 || !sessionId) return;
+    const children = await readAgyChildren(root, sessionId, ids);
+    if (!prompting(target)) return;
+    const now = Date.now();
+    for (const [toolCallId, child] of children) {
+      const entry = agents.get(toolCallId);
+      if (!entry || entry.info.status !== "running" || child.state === "running") continue;
+      const shown = endedInfo(entry, child, now);
+      if (entry.preview?.status === shown.status && entry.preview.summary === shown.summary) continue;
+      entry.preview = shown;
+      safeCallback(() => target.callbacks.onBackgroundAgentUpdate?.({ ...shown }));
+    }
+  };
+
+  /** Read the subagents' reports every `PROMPT_AGENT_CHECK_MS` while
+   * `target`'s prompt runs and someone is listening. */
+  const armPromptAgentCheck = (): void => {
+    const target = run;
+    if (promptAgentTimer || closed || !target || !target.callbacks.onBackgroundAgentUpdate) return;
+    if (!prompting(target) || runningAgents().length === 0) return;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          if (!closed && prompting(target)) await previewAgents(target);
+        } finally {
+          if (promptAgentTimer === timer) promptAgentTimer = undefined;
+          armPromptAgentCheck();
+        }
+      })();
+    }, PROMPT_AGENT_CHECK_MS);
+    promptAgentTimer = timer;
+    timer.unref?.();
   };
 
   const interruptAgents = (): void => {
     const now = Date.now();
     for (const entry of runningAgents()) {
-      entry.info = { ...entry.info, status: "interrupted", updatedAt: now, endedAt: now };
+      // One already shown ended keeps that end: it was not cut short.
+      entry.info = entry.preview
+        ? { ...entry.preview, updatedAt: now }
+        : { ...entry.info, status: "interrupted", updatedAt: now, endedAt: now };
       emitAgent(entry);
     }
   };
@@ -574,6 +629,9 @@ async function openSession(context: OpenContext): Promise<AgySession> {
     }
     if (holdTimer) clearTimeout(holdTimer);
     holdTimer = undefined;
+    // The next run reads on its own schedule.
+    if (promptAgentTimer) clearTimeout(promptAgentTimer);
+    promptAgentTimer = undefined;
     if (commandHoldTimer) clearTimeout(commandHoldTimer);
     commandHoldTimer = undefined;
     for (const id of target.agents) {
@@ -809,6 +867,7 @@ async function openSession(context: OpenContext): Promise<AgySession> {
   const sendPrompt = (target: Run, blocks: Array<Record<string, unknown>>, steer?: Deferred<void>): void => {
     target.outstanding += 1;
     quietUntilPrompt = false;
+    armPromptAgentCheck();
     const previous = target.outstanding > 1;
     client.request("session/prompt", { sessionId, prompt: blocks }, null).then(
       (response) => {
@@ -905,6 +964,7 @@ async function openSession(context: OpenContext): Promise<AgySession> {
         agents.set(id, entry);
         target.agents.add(id);
         emitAgent(entry);
+        armPromptAgentCheck();
       }
     }
     if (isTerminalToolStatus(merged.status)) {

@@ -587,6 +587,192 @@ describe("background work", () => {
     await session.close();
   });
 
+  it("reports a subagent done while agy's prompt is still running", async () => {
+    const dir = home();
+    const root = join(dir, ".gemini", "antigravity-cli");
+    let promptId: RpcMessage["id"] | undefined;
+    const agy = setup({
+      onPrompt(message, fake) {
+        promptId = message.id;
+        fake.update({ sessionUpdate: "tool_call", ...subagentCall("call_1", "Auditor"), status: "in_progress" });
+        fake.update({ sessionUpdate: "tool_call_update", ...subagentCall("call_1", "Auditor"), status: "completed" });
+        writeSubagent(root, SESSION, "child-1", { role: "Auditor" });
+        writeLaunchMessage(root, SESSION, "child-1", "call_1");
+      },
+    });
+    const session = await open(agy, { env: { HOME: dir } });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const updates: BackgroundAgentInfo[] = [];
+    const turn = session.runTurn({ prompt: "go", onBackgroundAgentUpdate: (info) => updates.push(info) });
+    await vi.waitFor(() => expect(updates).toHaveLength(1));
+
+    writeReport(root, SESSION, "child-1", "m1", "audit-done", "2026-11-20T22:04:22.957Z");
+    await advanceUntil(() => updates.some((info) => info.status === "completed"));
+    expect(updates.at(-1)).toMatchObject({ id: "call_1", status: "completed", summary: "audit-done" });
+
+    vi.useRealTimers();
+    agy.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "All audits are in." } });
+    agy.respond(promptId!, { stopReason: "end_turn" });
+    expect((await turn).text).toBe("All audits are in.");
+    await session.close();
+  }, ADVANCING_TEST_MS);
+
+  /** Reading reports during the prompt must not change how the turn ends:
+   * each case is something that went wrong when it did. */
+  describe("with subagent reports read during the prompt", () => {
+    const realTimeout = setTimeout;
+    /** Real time for the session's file reads, with the clock faked. */
+    const disk = () => new Promise<void>((resolve) => realTimeout(resolve, 40));
+    const command = { toolCallId: "call_2", name: "run_command", kind: "execute", rawInput: { CommandLine: "sleep 8" } };
+
+    it.each(["command hold", "late launch", "inactivity", "latest report"] as const)("%s", async (scenario) => {
+      const dir = home();
+      const root = join(dir, ".gemini", "antigravity-cli");
+      const agentCall = subagentCall("call_1", "Worker");
+      const launch = () => {
+        writeSubagent(root, SESSION, "child-1");
+        writeLaunchMessage(root, SESSION, "child-1", "call_1");
+      };
+      const agy = setup({
+        onPrompt(message, fake) {
+          fake.update({ sessionUpdate: "tool_call", ...agentCall, status: "in_progress" });
+          if (scenario === "late launch") {
+            fake.ask("approve", "session/request_permission", {
+              sessionId: SESSION, toolCall: agentCall, options: [{ optionId: "allow", kind: "allow_once" }],
+            });
+            return;
+          }
+          fake.update({ sessionUpdate: "tool_call_update", ...agentCall, status: "completed" });
+          launch();
+          if (scenario === "command hold") {
+            fake.update({ sessionUpdate: "tool_call", ...command, status: "in_progress" });
+            fake.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Starting work." } });
+            fake.respond(message.id, { stopReason: "end_turn" });
+          }
+        },
+      });
+      const session = await open(agy, {
+        env: { HOME: dir },
+        ...(scenario === "command hold" ? { commandHoldMs: 100 } : {}),
+        ...(scenario === "inactivity" ? { inactivityTimeoutMs: 1270 } : {}),
+      });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      const updates: BackgroundAgentInfo[] = [];
+      let approve!: (answer: string) => void;
+      const decision = new Promise<string>((resolve) => { approve = resolve; });
+      const turn = session.runTurn({ prompt: "go", onBackgroundAgentUpdate: (info) => updates.push(info), onPermissionRequest: () => decision });
+      const outcome = turn.catch((error: unknown) => error);
+      try {
+        await disk();
+        expect(updates.map((info) => info.status)).toEqual(["running"]);
+        if (scenario === "late launch") {
+          // The launch waits on approval far past the time a lost subagent is given up on.
+          for (let step = 0; step < 25; step++) {
+            await vi.advanceTimersByTimeAsync(5_000);
+            await disk();
+          }
+          approve("allow");
+          await tick();
+          launch();
+          agy.update({ sessionUpdate: "tool_call_update", ...agentCall, status: "completed" });
+          agy.respond(agy.prompts()[0]!.id, { stopReason: "end_turn" });
+          await disk();
+          writeReport(root, SESSION, "child-1", "m1", "done", "2026-11-20T22:04:22.957Z");
+        } else if (scenario === "command hold") {
+          // The prompt has answered: the turn holds once its files are read, and only agy's reply ends it.
+          for (let wait = 0; wait < 8; wait++) await disk();
+          writeReport(root, SESSION, "child-1", "m1", "done", "2026-11-20T22:04:22.957Z");
+          await vi.advanceTimersByTimeAsync(5_000);
+          await disk();
+          await vi.advanceTimersByTimeAsync(120);
+          await disk();
+        } else {
+          writeReport(root, SESSION, "child-1", "m1", "done", "2026-11-20T22:04:22.957Z");
+          await advanceUntil(() => updates.some((info) => info.status === "completed"));
+          // Past the inactivity limit after the report shows, with agy still working on it.
+          await vi.advanceTimersByTimeAsync(1_500);
+          await disk();
+        }
+        if (scenario === "command hold") {
+          agy.update({ sessionUpdate: "tool_call_update", ...command, status: "completed", rawOutput: { output: "slept", exit_code: 0 } });
+        }
+        agy.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Follow-up after the report." } });
+        agy.update({ sessionUpdate: "usage_update", used: 50, size: 1_048_576 });
+        if (scenario === "latest report") {
+          writeReport(root, SESSION, "child-1", "m2", "final results", "2026-11-20T22:05:22.957Z");
+        }
+        if (scenario === "inactivity" || scenario === "latest report") agy.respond(agy.prompts()[0]!.id, { stopReason: "end_turn" });
+        await tick();
+        await vi.advanceTimersByTimeAsync(40);
+        await disk();
+        expect(await outcome).toMatchObject({ text: "Follow-up after the report." });
+        expect(updates.at(-1)).toMatchObject({ status: "completed", ...(scenario === "latest report" ? { summary: "final results" } : {}) });
+      } finally {
+        vi.useRealTimers();
+        await session.close();
+      }
+    }, ADVANCING_TEST_MS);
+
+    it("reports a kill that follows a report shown early", async () => {
+      const dir = home();
+      const root = join(dir, ".gemini", "antigravity-cli");
+      let promptId: RpcMessage["id"] | undefined;
+      const agy = setup({
+        onPrompt(message, fake) {
+          promptId = message.id;
+          fake.update({ sessionUpdate: "tool_call", ...subagentCall("call_1", "Worker"), status: "in_progress" });
+          fake.update({ sessionUpdate: "tool_call_update", ...subagentCall("call_1", "Worker"), status: "completed" });
+          writeSubagent(root, SESSION, "child-1");
+          writeLaunchMessage(root, SESSION, "child-1", "call_1");
+        },
+      });
+      const session = await open(agy, { env: { HOME: dir } });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const updates: BackgroundAgentInfo[] = [];
+      const turn = session.runTurn({ prompt: "go", onBackgroundAgentUpdate: (info) => updates.push(info) });
+      try {
+        await vi.waitFor(() => expect(updates).toHaveLength(1));
+        writeReport(root, SESSION, "child-1", "m1", "partial", "2026-11-20T22:04:22.957Z");
+        await advanceUntil(() => updates.some((info) => info.status === "completed"));
+        writeSubagent(root, SESSION, "child-1", { state: "SUBAGENT_STATE_KILLED" });
+      } finally {
+        vi.useRealTimers();
+      }
+      agy.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Stopped it." } });
+      agy.respond(promptId!, { stopReason: "end_turn" });
+      expect((await turn).text).toBe("Stopped it.");
+      expect(updates.at(-1)).toMatchObject({ id: "call_1", status: "interrupted" });
+      await session.close();
+    }, ADVANCING_TEST_MS);
+
+    it("keeps a report shown early when the session closes before agy answers", async () => {
+      const dir = home();
+      const root = join(dir, ".gemini", "antigravity-cli");
+      const agy = setup({
+        onPrompt(_message, fake) {
+          fake.update({ sessionUpdate: "tool_call", ...subagentCall("call_1", "Worker"), status: "in_progress" });
+          fake.update({ sessionUpdate: "tool_call_update", ...subagentCall("call_1", "Worker"), status: "completed" });
+          writeSubagent(root, SESSION, "child-1");
+          writeLaunchMessage(root, SESSION, "child-1", "call_1");
+        },
+      });
+      const session = await open(agy, { env: { HOME: dir } });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const updates: BackgroundAgentInfo[] = [];
+      const turn = session.runTurn({ prompt: "go", onBackgroundAgentUpdate: (info) => updates.push(info) });
+      try {
+        await vi.waitFor(() => expect(updates).toHaveLength(1));
+        writeReport(root, SESSION, "child-1", "m1", "all done", "2026-11-20T22:04:22.957Z");
+        await advanceUntil(() => updates.some((info) => info.status === "completed"));
+      } finally {
+        vi.useRealTimers();
+      }
+      await session.close();
+      await turn.catch(() => {});
+      expect(updates.at(-1)).toMatchObject({ id: "call_1", status: "completed", summary: "all done" });
+    }, ADVANCING_TEST_MS);
+  });
+
   it("resolves at once when the subagent had already reported", async () => {
     const dir = home();
     const root = join(dir, ".gemini", "antigravity-cli");
