@@ -3003,6 +3003,7 @@ var ISOLATED_MAX_OUTPUT_CHARS = 128e3;
 var REPLY_QUIET_MS = 3e3;
 var OPEN_REPLY_QUIET_MS = 12e4;
 var HOLD_CHECK_MS = 3e4;
+var PROMPT_AGENT_CHECK_MS = 5e3;
 var LOST_AGENT_MS = 12e4;
 var IMAGE_TYPES = {
   ".bmp": "image/bmp",
@@ -3187,6 +3188,7 @@ async function openSession(context) {
   let inactivityTimer;
   let replyTimer;
   let holdTimer;
+  let promptAgentTimer;
   let commandHoldTimer;
   const currentModel = () => {
     const option = findOption(configOptions, "model");
@@ -3217,6 +3219,13 @@ async function openSession(context) {
     const target = run ?? entry.owner;
     safeCallback(() => target.callbacks.onBackgroundAgentUpdate?.(snapshot));
   };
+  const endedInfo = (entry, child, now) => ({
+    ...entry.info,
+    status: child.state === "killed" ? "interrupted" : "completed",
+    ...child.summary ? { summary: child.summary } : {},
+    updatedAt: now,
+    endedAt: child.reportedAt ?? now
+  });
   const refreshAgents = async () => {
     const ids = runningAgents().map((entry) => entry.info.id);
     if (ids.length === 0 || !sessionId) return;
@@ -3227,20 +3236,47 @@ async function openSession(context) {
       if (!entry || entry.info.status !== "running") continue;
       entry.seen = true;
       if (child.state === "running") continue;
-      entry.info = {
-        ...entry.info,
-        status: child.state === "killed" ? "interrupted" : "completed",
-        ...child.summary ? { summary: child.summary } : {},
-        updatedAt: now,
-        endedAt: child.reportedAt ?? now
-      };
+      entry.info = endedInfo(entry, child, now);
       emitAgent(entry);
     }
+  };
+  const prompting = (target) => run === target && !target.done.settled && target.outstanding > 0;
+  const previewAgents = async (target) => {
+    const ids = runningAgents().map((entry) => entry.info.id);
+    if (ids.length === 0 || !sessionId) return;
+    const children = await readAgyChildren(root, sessionId, ids);
+    if (!prompting(target)) return;
+    const now = Date.now();
+    for (const [toolCallId, child] of children) {
+      const entry = agents.get(toolCallId);
+      if (!entry || entry.info.status !== "running" || child.state === "running") continue;
+      const shown = endedInfo(entry, child, now);
+      if (entry.preview?.status === shown.status && entry.preview.summary === shown.summary) continue;
+      entry.preview = shown;
+      safeCallback(() => target.callbacks.onBackgroundAgentUpdate?.({ ...shown }));
+    }
+  };
+  const armPromptAgentCheck = () => {
+    const target = run;
+    if (promptAgentTimer || closed || !target || !target.callbacks.onBackgroundAgentUpdate) return;
+    if (!prompting(target) || runningAgents().length === 0) return;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          if (!closed && prompting(target)) await previewAgents(target);
+        } finally {
+          if (promptAgentTimer === timer) promptAgentTimer = void 0;
+          armPromptAgentCheck();
+        }
+      })();
+    }, PROMPT_AGENT_CHECK_MS);
+    promptAgentTimer = timer;
+    timer.unref?.();
   };
   const interruptAgents = () => {
     const now = Date.now();
     for (const entry of runningAgents()) {
-      entry.info = { ...entry.info, status: "interrupted", updatedAt: now, endedAt: now };
+      entry.info = entry.preview ? { ...entry.preview, updatedAt: now } : { ...entry.info, status: "interrupted", updatedAt: now, endedAt: now };
       emitAgent(entry);
     }
   };
@@ -3289,6 +3325,8 @@ async function openSession(context) {
     }
     if (holdTimer) clearTimeout(holdTimer);
     holdTimer = void 0;
+    if (promptAgentTimer) clearTimeout(promptAgentTimer);
+    promptAgentTimer = void 0;
     if (commandHoldTimer) clearTimeout(commandHoldTimer);
     commandHoldTimer = void 0;
     for (const id of target.agents) {
@@ -3494,6 +3532,7 @@ async function openSession(context) {
   const sendPrompt = (target, blocks, steer) => {
     target.outstanding += 1;
     quietUntilPrompt = false;
+    armPromptAgentCheck();
     const previous = target.outstanding > 1;
     client.request("session/prompt", { sessionId, prompt: blocks }, null).then(
       (response) => {
@@ -3581,6 +3620,7 @@ async function openSession(context) {
         agents.set(id, entry);
         target.agents.add(id);
         emitAgent(entry);
+        armPromptAgentCheck();
       }
     }
     if (isTerminalToolStatus(merged.status)) {
